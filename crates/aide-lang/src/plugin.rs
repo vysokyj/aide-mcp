@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::Path;
 
 use aide_install::ToolSpec;
@@ -73,6 +74,14 @@ pub trait LanguagePlugin: Send + Sync {
     fn package_manager(&self) -> PackageManager;
     fn runner(&self) -> Runner;
     fn test_runner(&self) -> TestRunner;
+
+    /// Command arguments (without the executable itself) for running the
+    /// SCIP indexer over `workdir` and writing the index to `output`.
+    /// Only meaningful when [`Self::scip`] returns `Some`.
+    fn scip_args(&self, workdir: &Path, output: &Path) -> Vec<OsString> {
+        let _ = (workdir, output);
+        Vec::new()
+    }
 
     /// Tools that `project.setup` should install for this language.
     ///

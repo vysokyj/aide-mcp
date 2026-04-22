@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 aide-core.workspace = true
+aide-lang.workspace = true
 aide-proto.workspace = true
 anyhow.workspace = true
 serde = { workspace = true }

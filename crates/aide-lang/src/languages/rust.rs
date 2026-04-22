@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::Path;
 
 use aide_install::{ArchiveFormat, Source, TargetAsset, ToolSpec};
@@ -28,10 +29,22 @@ impl LanguagePlugin for RustPlugin {
     }
 
     fn scip(&self) -> Option<ScipSpec> {
+        // rust-analyzer ships a built-in `scip` subcommand that emits a full
+        // SCIP index for a workspace, so we reuse the same binary instead of
+        // maintaining a separate scip-rust tool.
         Some(ScipSpec {
-            name: "scip-rust",
-            executable: "scip-rust",
+            name: "rust-analyzer",
+            executable: "rust-analyzer",
         })
+    }
+
+    fn scip_args(&self, workdir: &Path, output: &Path) -> Vec<OsString> {
+        vec![
+            "scip".into(),
+            workdir.as_os_str().to_os_string(),
+            "--output".into(),
+            output.as_os_str().to_os_string(),
+        ]
     }
 
     fn dap(&self) -> Option<DapSpec> {

@@ -7,12 +7,12 @@ use aide_proto::{Request, Response};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
 
-use crate::state::Store;
+use crate::state::{EnqueueOutcome, Store};
+use crate::worker::Job;
 
-pub async fn run(socket: &Path, state_path: &Path) -> Result<()> {
-    let store = Store::load(state_path).context("loading indexer state")?;
-
+pub async fn run(socket: &Path, store: Store, jobs: mpsc::UnboundedSender<Job>) -> Result<()> {
     if socket.exists() {
         tracing::warn!(path = %socket.display(), "removing stale socket");
         std::fs::remove_file(socket).context("removing stale socket")?;
@@ -25,15 +25,20 @@ pub async fn run(socket: &Path, state_path: &Path) -> Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;
         let store = store.clone();
+        let jobs = jobs.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(stream, store).await {
+            if let Err(e) = serve_connection(stream, store, jobs).await {
                 tracing::warn!(error = %e, "connection ended with error");
             }
         });
     }
 }
 
-async fn serve_connection(stream: UnixStream, store: Store) -> Result<()> {
+async fn serve_connection(
+    stream: UnixStream,
+    store: Store,
+    jobs: mpsc::UnboundedSender<Job>,
+) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -42,7 +47,7 @@ async fn serve_connection(stream: UnixStream, store: Store) -> Result<()> {
         let Some(request) = request else {
             break;
         };
-        let response = dispatch(request, &store).await;
+        let response = dispatch(request, &store, &jobs).await;
         write_message(&mut write_half, &response).await?;
     }
 
@@ -50,23 +55,35 @@ async fn serve_connection(stream: UnixStream, store: Store) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch(request: Request, store: &Store) -> Response {
+async fn dispatch(request: Request, store: &Store, jobs: &mpsc::UnboundedSender<Job>) -> Response {
     match request {
         Request::Ping => Response::Pong,
         Request::Enqueue { repo_root, sha } => match store.enqueue(&repo_root, &sha).await {
-            Ok(()) => Response::Ok,
+            Ok(EnqueueOutcome::NeedsIndexing) => {
+                if let Err(e) = jobs.send(Job {
+                    repo_root: repo_root.clone(),
+                    sha: sha.clone(),
+                }) {
+                    return Response::Error {
+                        message: format!("worker channel closed: {e}"),
+                    };
+                }
+                Response::Ok
+            }
+            Ok(EnqueueOutcome::AlreadyQueued | EnqueueOutcome::AlreadyReady) => Response::Ok,
             Err(e) => Response::Error {
                 message: e.to_string(),
             },
         },
         Request::IndexStatus { repo_root, sha } => {
             match store.status(&repo_root, sha.as_deref()).await {
-                Some((resolved_sha, info)) => Response::IndexStatus {
+                Some(info) => Response::IndexStatus {
                     repo_root,
-                    sha: resolved_sha,
+                    sha: info.sha.clone(),
                     state: info.state,
                     enqueued_at_unix: info.enqueued_at_unix,
                     indexed_at_unix: info.indexed_at_unix,
+                    index_path: info.index_path,
                 },
                 None => Response::NoCommit { repo_root },
             }
@@ -85,21 +102,31 @@ mod tests {
     use aide_proto::{IndexState, Request, Response};
     use tempfile::TempDir;
 
-    async fn spawn_daemon(socket: &Path, state_path: &Path) -> tokio::task::JoinHandle<()> {
+    struct Daemon {
+        handle: tokio::task::JoinHandle<()>,
+        /// Kept alive so the channel stays open while the server runs.
+        /// The worker is not actually executed; jobs just queue here.
+        #[allow(dead_code, reason = "keeps the mpsc channel open")]
+        rx: mpsc::UnboundedReceiver<Job>,
+    }
+
+    async fn spawn_daemon(socket: &Path, state_path: &Path) -> (Daemon, Store) {
         let socket = socket.to_path_buf();
         let state_path = state_path.to_path_buf();
+        let store = Store::load(&state_path).unwrap();
+        let store_for_daemon = store.clone();
         let daemon_socket = socket.clone();
+        let (jobs, rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
-            let _ = run(&daemon_socket, &state_path).await;
+            let _ = run(&daemon_socket, store_for_daemon, jobs).await;
         });
-        // wait until the socket appears
         for _ in 0..50 {
             if socket.exists() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        handle
+        (Daemon { handle, rx }, store)
     }
 
     async fn request(socket: &Path, req: &Request) -> Response {
@@ -118,7 +145,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("indexer.sock");
         let state = dir.path().join("state.json");
-        let daemon = spawn_daemon(&socket, &state).await;
+        let (daemon, _store) = spawn_daemon(&socket, &state).await;
 
         assert_eq!(request(&socket, &Request::Ping).await, Response::Pong);
 
@@ -132,6 +159,7 @@ mod tests {
         .await;
         assert_eq!(enq, Response::Ok);
 
+        // With no worker running, a freshly enqueued commit stays Pending.
         let status = request(
             &socket,
             &Request::IndexStatus {
@@ -143,7 +171,7 @@ mod tests {
         match status {
             Response::IndexStatus { sha, state, .. } => {
                 assert_eq!(sha, "deadbeef");
-                assert_eq!(state, IndexState::Ready);
+                assert_eq!(state, IndexState::Pending);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -159,7 +187,7 @@ mod tests {
             Response::LastKnownState { commit, .. } => {
                 let c = commit.expect("expected commit info");
                 assert_eq!(c.sha, "deadbeef");
-                assert_eq!(c.state, IndexState::Ready);
+                assert_eq!(c.state, IndexState::Pending);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -179,6 +207,6 @@ mod tests {
             }
         );
 
-        daemon.abort();
+        daemon.handle.abort();
     }
 }

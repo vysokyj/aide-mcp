@@ -542,12 +542,14 @@ impl AideServer {
                 state,
                 enqueued_at_unix,
                 indexed_at_unix,
+                index_path,
             }) => to_json(&serde_json::json!({
                 "repo_root": repo_root,
                 "sha": sha,
                 "state": state,
                 "enqueued_at_unix": enqueued_at_unix,
                 "indexed_at_unix": indexed_at_unix,
+                "index_path": index_path,
             })),
             Ok(Response::NoCommit { repo_root }) => to_json(&serde_json::json!({
                 "repo_root": repo_root,

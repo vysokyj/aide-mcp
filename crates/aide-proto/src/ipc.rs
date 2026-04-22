@@ -31,6 +31,7 @@ pub enum Response {
         state: IndexState,
         enqueued_at_unix: i64,
         indexed_at_unix: Option<i64>,
+        index_path: Option<String>,
     },
     NoCommit {
         repo_root: String,
@@ -63,6 +64,9 @@ pub struct CommitInfo {
     pub state: IndexState,
     pub enqueued_at_unix: i64,
     pub indexed_at_unix: Option<i64>,
+    /// Filesystem path to the `.scip` index produced for this commit.
+    /// Populated only once [`IndexState::Ready`] is reached.
+    pub index_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -89,11 +93,26 @@ mod tests {
             state: IndexState::Ready,
             enqueued_at_unix: 100,
             indexed_at_unix: Some(200),
+            index_path: Some("/p/abc.scip".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""state":"ready""#));
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn commit_info_roundtrip_with_index_path() {
+        let info = CommitInfo {
+            sha: "abc".into(),
+            state: IndexState::Ready,
+            enqueued_at_unix: 1,
+            indexed_at_unix: Some(2),
+            index_path: Some("/home/u/.aide/scip/r/abc.scip".into()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: CommitInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, info);
     }
 
     #[test]

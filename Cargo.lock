@@ -42,6 +42,7 @@ name = "aide-indexer"
 version = "0.1.0"
 dependencies = [
  "aide-core",
+ "aide-lang",
  "aide-proto",
  "anyhow",
  "serde",
