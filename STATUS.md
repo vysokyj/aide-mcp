@@ -38,9 +38,13 @@ decisions, roadmap, current state — is mirrored here.
 
 ```
 crates/
-  aide-core/      AidePaths (~/.aide/bin/scip/sock/queue/logs/config.toml), AIDE_HOME override
-  aide-install/   ToolSpec, GitHub-release downloader, gzip decode, manifest.json
-  aide-lang/      LanguagePlugin trait + Registry; built-ins: RustPlugin, JavaMavenPlugin
+  aide-core/      AidePaths (~/.aide/bin/scip/sock/queue/logs/config.toml),
+                  AIDE_HOME override, Config (TOML) for scip/exec/dap
+                  tunables
+  aide-install/   ToolSpec, GitHub-release downloader, gzip/tar.gz/zip
+                  extract, manifest.json
+  aide-lang/      LanguagePlugin trait + Registry; built-ins: RustPlugin,
+                  JavaMavenPlugin, JavaGradlePlugin
   aide-lsp/       LspClient (spawn takes plugin-supplied args), LspPool,
                   ops (hover/def/refs/symbols/diagnostics)
   aide-dap/       DapClient speaking Debug Adapter Protocol over stdio
@@ -120,14 +124,19 @@ crates/
 | `run_project(path?, extra_args?, timeout_secs?)` | Invoke plugin.runner (e.g. `cargo run`); capture stdout/stderr/exit. |
 | `run_tests(path?, filter?, extra_args?, timeout_secs?)` | Invoke plugin.test_runner (e.g. `cargo test [filter]`). |
 | `install_package(path?, packages, timeout_secs?)` | Invoke plugin.package_manager (e.g. `cargo add <pkg>`). |
-| `dap_launch(path?, program, args?, stop_on_entry?, env?)` | Start a DAP session via plugin.dap (Rust = codelldb). Full initialize → launch → configurationDone handshake; returns initial StoppedInfo. |
-| `dap_set_breakpoints(source, lines)` | Set line breakpoints on `source` for the active session. |
-| `dap_continue(thread_id?)` | Resume the paused thread and wait for next stop. |
-| `dap_stack_trace(thread_id?)` | Current call stack (up to 50 frames). |
-| `dap_scopes(frame_id)` | Scopes for a frame (Locals, Registers, …). |
-| `dap_variables(variables_reference)` | Read variables for a scope / composite variable. |
-| `dap_evaluate(expression, frame_id?)` | Evaluate an expression in the debuggee. |
-| `dap_terminate()` | Disconnect from the adapter. |
+| `read_exec_log(path, offset?, max_bytes?)` | Read a chunk of an exec log file; poll to stream output. |
+| `dap_launch(path?, program, args?, stop_on_entry?, env?, session?)` | Start a DAP session via plugin.dap (Rust = codelldb). Full initialize → launch → configurationDone handshake; returns `{ session, stopped }`. |
+| `dap_set_breakpoints(source, lines, session?)` | Set line breakpoints on `source` for the named session. |
+| `dap_continue(thread_id?, session?)` | Resume the paused thread and wait for next stop. |
+| `dap_stack_trace(thread_id?, session?)` | Current call stack (up to 50 frames). |
+| `dap_scopes(frame_id, session?)` | Scopes for a frame (Locals, Registers, …). |
+| `dap_variables(variables_reference, session?)` | Read variables for a scope / composite variable. |
+| `dap_evaluate(expression, frame_id?, session?)` | Evaluate an expression in the debuggee. |
+| `dap_terminate(session?)` | Disconnect the named session. |
+| `dap_step_over(thread_id?, session?)` | Step to the next source line in the same frame. |
+| `dap_step_in(thread_id?, session?)` | Enter a call at the current line. |
+| `dap_step_out(thread_id?, session?)` | Run until the current frame returns. |
+| `dap_pause(thread_id, session?)` | Suspend a running thread. |
 
 Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 `"head-to-index"`.
@@ -153,26 +162,21 @@ Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 
 ## What to build next
 
-Core roadmap (v0.1 through v0.6) is complete. Remaining ideas, in
-roughly diminishing value:
+Core roadmap (v0.1 through v0.6) and the first polish round are
+complete. Remaining open ideas:
 
-- **Step-over/step-in/step-out DAP ops** — `next`, `stepIn`, `stepOut`
-  and `pause` requests. Trivial given the existing wrapper; scoped out
-  of the first DAP cut only to keep the diff small.
-- **Config file (`~/.aide/config.toml`)** — expose retention count,
-  default timeouts, DAP timeouts, log retention.
-- **Auto-install for codelldb / JDT-LS / scip-java** — the current
-  `ToolSpec` pipeline handles single-binary releases; these three are
-  multi-file tarballs. Extending `aide-install` to unpack
-  `tar.gz` / `zip` archives unlocks all of them.
-- **Gradle flavour of the Java plugin** — sibling `JavaGradlePlugin`
-  claiming `build.gradle(.kts)` and using `./gradlew` / `gradle`.
-- **True streaming exec output via MCP notifications** — log files
-  cover post-mortem, but live progress for long builds still requires
-  the MCP `notifications/progress` mechanism.
-- **Multi-session DAP** — currently one debug session per MCP server;
-  agents that want to compare two programs side-by-side would need
-  keyed sessions.
+- **JDT-LS auto-install** — needs a wrapper script to launch the
+  Eclipse JDT server under a JRE with the correct classpath. Tricky
+  enough to defer until a concrete agent needs LSP on Java.
+- **scip-java auto-install** — Sourcegraph distributes via coursier
+  rather than a standalone tarball. Needs a bootstrap step to drop
+  a launcher.
+- **True streaming exec output via MCP notifications** — `read_exec_log`
+  already covers polling; live `notifications/progress` would avoid
+  the polling round-trip.
+- **Config auto-reload** — Config is loaded once at MCP startup;
+  restart to pick up changes. Watching the file would spare the
+  restart.
 
 ## Build & test
 

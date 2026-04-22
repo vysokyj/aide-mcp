@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use aide_core::AidePaths;
@@ -28,6 +28,8 @@ pub enum InstallError {
     Io(#[from] std::io::Error),
     #[error("archive decode error: {0}")]
     Decode(String),
+    #[error("archive extracted but expected entry `{entry}` not found under {dir}")]
+    MissingEntry { entry: String, dir: PathBuf },
 }
 
 /// Result of an install attempt.
@@ -47,12 +49,16 @@ impl InstallOutcome {
     }
 }
 
-/// Install `spec` into `paths.bin()`, updating the manifest at `paths.bin()/manifest.json`.
+/// Install `spec` into `paths.bin()`, updating the manifest at
+/// `paths.bin()/manifest.json`.
 ///
-/// If the manifest already records the requested version and the binary is on disk,
-/// this is a no-op returning [`InstallOutcome::AlreadyInstalled`]. Otherwise the
-/// binary is downloaded, decoded, written to `~/.aide/bin/<executable>`, and the
-/// manifest is updated atomically.
+/// Single-file formats (`Raw`, `Gzip`) write one binary to
+/// `~/.aide/bin/<executable>`. Multi-file formats (`TarGz`, `Zip`)
+/// extract into `~/.aide/bin/<name>-<version>/` and drop a symlink at
+/// `~/.aide/bin/<executable>` pointing at the archive's entry path.
+///
+/// Re-installing the same version when the binary is on disk is a
+/// no-op returning [`InstallOutcome::AlreadyInstalled`].
 pub async fn install_tool(
     paths: &AidePaths,
     spec: &ToolSpec,
@@ -79,8 +85,23 @@ pub async fn install_tool(
     let url = build_url(&spec.source, &asset.filename);
     tracing::info!(tool = %spec, url = %url, "downloading");
     let bytes = http_get(&url).await?;
-    let binary = decode(&bytes, asset.archive)?;
-    write_executable(&install_path, &binary)?;
+
+    match asset.archive {
+        ArchiveFormat::Raw | ArchiveFormat::Gzip => {
+            let binary = decode_single(&bytes, &asset.archive)?;
+            write_executable(&install_path, &binary)?;
+        }
+        ArchiveFormat::TarGz { entry_path } => {
+            let extract_dir = bin_dir.join(format!("{}-{}", spec.name, spec.version));
+            extract_tar_gz(&bytes, &extract_dir)?;
+            link_entry(&extract_dir, entry_path, &install_path)?;
+        }
+        ArchiveFormat::Zip { entry_path } => {
+            let extract_dir = bin_dir.join(format!("{}-{}", spec.name, spec.version));
+            extract_zip(&bytes, &extract_dir)?;
+            link_entry(&extract_dir, entry_path, &install_path)?;
+        }
+    }
 
     manifest.record(
         &spec.name,
@@ -134,7 +155,7 @@ async fn http_get(url: &str) -> Result<Vec<u8>, InstallError> {
     Ok(response.bytes().await?.to_vec())
 }
 
-fn decode(bytes: &[u8], format: ArchiveFormat) -> Result<Vec<u8>, InstallError> {
+fn decode_single(bytes: &[u8], format: &ArchiveFormat) -> Result<Vec<u8>, InstallError> {
     match format {
         ArchiveFormat::Raw => Ok(bytes.to_vec()),
         ArchiveFormat::Gzip => {
@@ -145,7 +166,71 @@ fn decode(bytes: &[u8], format: ArchiveFormat) -> Result<Vec<u8>, InstallError> 
                 .map_err(|e| InstallError::Decode(e.to_string()))?;
             Ok(out)
         }
+        ArchiveFormat::TarGz { .. } | ArchiveFormat::Zip { .. } => Err(InstallError::Decode(
+            "decode_single() called with multi-file archive".into(),
+        )),
     }
+}
+
+fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), InstallError> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)?;
+    }
+    std::fs::create_dir_all(dest)?;
+    let gz = GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_permissions(true);
+    archive
+        .unpack(dest)
+        .map_err(|e| InstallError::Decode(format!("tar.gz: {e}")))?;
+    Ok(())
+}
+
+fn extract_zip(bytes: &[u8], dest: &Path) -> Result<(), InstallError> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)?;
+    }
+    std::fs::create_dir_all(dest)?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| InstallError::Decode(format!("zip open: {e}")))?;
+    archive
+        .extract(dest)
+        .map_err(|e| InstallError::Decode(format!("zip extract: {e}")))?;
+    Ok(())
+}
+
+fn link_entry(
+    extract_dir: &Path,
+    entry_path: &str,
+    install_path: &Path,
+) -> Result<(), InstallError> {
+    let target = extract_dir.join(entry_path);
+    if !target.exists() {
+        return Err(InstallError::MissingEntry {
+            entry: entry_path.to_string(),
+            dir: extract_dir.to_path_buf(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&target)?.permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        std::fs::set_permissions(&target, perms)?;
+    }
+    // Replace an existing symlink / file so the new version takes over.
+    if install_path.exists() || install_path.is_symlink() {
+        std::fs::remove_file(install_path)?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, install_path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(&target, install_path)?;
+    }
+    Ok(())
 }
 
 fn write_executable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -168,11 +253,12 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
+    use tempfile::TempDir;
 
     #[test]
     fn decode_raw_is_identity() {
         let bytes = b"hello";
-        let out = decode(bytes, ArchiveFormat::Raw).unwrap();
+        let out = decode_single(bytes, &ArchiveFormat::Raw).unwrap();
         assert_eq!(out, bytes);
     }
 
@@ -181,7 +267,45 @@ mod tests {
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(b"rust-analyzer-fake-binary").unwrap();
         let gz = enc.finish().unwrap();
-        let out = decode(&gz, ArchiveFormat::Gzip).unwrap();
+        let out = decode_single(&gz, &ArchiveFormat::Gzip).unwrap();
         assert_eq!(out, b"rust-analyzer-fake-binary");
+    }
+
+    #[test]
+    fn extract_tar_gz_unpacks_files() {
+        // Build a tar.gz with one file in memory.
+        let mut tar_buf: Vec<u8> = Vec::new();
+        {
+            let gz = GzEncoder::new(&mut tar_buf, Compression::default());
+            let mut builder = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("bin/scip-java").unwrap();
+            let payload = b"fake-scip-java-binary";
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, &payload[..]).unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let dir = TempDir::new().unwrap();
+        extract_tar_gz(&tar_buf, dir.path()).unwrap();
+        let extracted = std::fs::read(dir.path().join("bin/scip-java")).unwrap();
+        assert_eq!(extracted, b"fake-scip-java-binary");
+    }
+
+    #[test]
+    fn link_entry_creates_symlink_and_errors_on_missing() {
+        let dir = TempDir::new().unwrap();
+        let extract = dir.path().join("pkg-1.0");
+        std::fs::create_dir_all(extract.join("bin")).unwrap();
+        std::fs::write(extract.join("bin/tool"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let install = dir.path().join("tool");
+        link_entry(&extract, "bin/tool", &install).unwrap();
+        #[cfg(unix)]
+        assert!(install.is_symlink());
+        assert!(install.exists());
+
+        let err = link_entry(&extract, "bin/missing", &install).unwrap_err();
+        assert!(matches!(err, InstallError::MissingEntry { .. }));
     }
 }

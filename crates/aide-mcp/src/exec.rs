@@ -26,10 +26,6 @@ use tokio::time::timeout;
 /// the response (but still written to the log file when one is in use).
 pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
 
-/// Default wall-clock budget for a tool invocation (5 minutes). Callers
-/// can override via the tool's `timeout_secs` arg.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecResult {
     /// The fully-rendered command line (best-effort lossy UTF-8).

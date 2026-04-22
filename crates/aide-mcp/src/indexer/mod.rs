@@ -11,7 +11,7 @@ mod worker;
 
 use std::path::{Path, PathBuf};
 
-use aide_core::AidePaths;
+use aide_core::{AidePaths, ScipConfig};
 use aide_git::resolve_head;
 use aide_proto::CommitInfo;
 use anyhow::Result;
@@ -30,11 +30,11 @@ impl Indexer {
     /// Spin up the indexer: load (or create) the state file, spawn the
     /// background worker, and re-enqueue anything that was Pending or
     /// `InProgress` when the previous MCP instance exited.
-    pub fn start(paths: &AidePaths) -> Result<Self> {
+    pub fn start(paths: &AidePaths, scip_cfg: &ScipConfig) -> Result<Self> {
         std::fs::create_dir_all(paths.queue())?;
         std::fs::create_dir_all(paths.scip())?;
         let state_path: PathBuf = paths.queue().join("indexer_state.json");
-        let store = Store::load(&state_path)?;
+        let store = Store::load(&state_path, scip_cfg.retention_ready)?;
         let jobs = worker::spawn(paths.clone(), store.clone());
 
         let resume_store = store.clone();

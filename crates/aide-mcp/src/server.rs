@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aide_core::AidePaths;
+use aide_core::{AidePaths, Config};
 use aide_dap::DapClient;
 use aide_git::diff::DiffMode;
 use aide_install::{install_tool, InstallOutcome};
@@ -19,7 +20,7 @@ use rmcp::{
 };
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::exec::{self, DEFAULT_TIMEOUT_SECS};
+use crate::exec;
 use crate::indexer::Indexer;
 
 pub async fn run() -> Result<()> {
@@ -274,6 +275,22 @@ pub struct InstallPackageArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReadExecLogArgs {
+    /// Absolute path to the log file — typically `stdout_log` or
+    /// `stderr_log` from a `run_project` / `run_tests` /
+    /// `install_package` response.
+    pub path: String,
+    /// Byte offset to start reading from. Defaults to 0 (start of file).
+    /// Poll a still-running tool's output by advancing this offset
+    /// across calls.
+    #[serde(default)]
+    pub offset: u64,
+    /// Maximum bytes to return per call. Defaults to 64 KiB.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DapLaunchArgs {
     /// Project root. If omitted, falls back to the server cwd.
     #[serde(default)]
@@ -291,6 +308,10 @@ pub struct DapLaunchArgs {
     /// `env` launch field (shape is adapter-specific).
     #[serde(default)]
     pub env: Option<serde_json::Value>,
+    /// Session identifier. Use different names to debug two programs
+    /// concurrently. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -299,6 +320,9 @@ pub struct DapSetBreakpointsArgs {
     pub source: String,
     /// 1-indexed line numbers for the breakpoints.
     pub lines: Vec<i64>,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -307,6 +331,30 @@ pub struct DapContinueArgs {
     /// recent `stopped` event.
     #[serde(default)]
     pub thread_id: Option<i64>,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapStepArgs {
+    /// Thread to step. Defaults to the thread reported by the most
+    /// recent `stopped` event.
+    #[serde(default)]
+    pub thread_id: Option<i64>,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapPauseArgs {
+    /// Thread to pause. Must be explicit — when the debuggee is
+    /// running there is no "current stopped thread" to default to.
+    pub thread_id: i64,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -315,17 +363,26 @@ pub struct DapStackTraceArgs {
     /// recent `stopped` event.
     #[serde(default)]
     pub thread_id: Option<i64>,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DapScopesArgs {
     pub frame_id: i64,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DapVariablesArgs {
     /// `variablesReference` from a scope or variable returned earlier.
     pub variables_reference: i64,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -336,20 +393,39 @@ pub struct DapEvaluateArgs {
     /// Frame to evaluate in. Omit to evaluate in the "global" context.
     #[serde(default)]
     pub frame_id: Option<i64>,
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct DapTerminateArgs {}
+pub struct DapTerminateArgs {
+    /// Session identifier. Defaults to `"default"`.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+#[derive(Copy, Clone)]
+enum StepKind {
+    Over,
+    In,
+    Out,
+}
+
+const DEFAULT_DAP_SESSION: &str = "default";
 
 #[derive(Clone)]
 pub struct AideServer {
     registry: Registry,
     paths: AidePaths,
+    config: Arc<Config>,
     pool: Arc<LspPool>,
     indexer: Indexer,
-    /// The currently active DAP session, if any. At most one session is
-    /// supported at a time; consumers guard access with the mutex.
-    dap_session: Arc<AsyncMutex<Option<Arc<DapClient>>>>,
+    /// Active DAP sessions keyed by a user-chosen name (default
+    /// `"default"`). A fresh launch uses the name supplied in the
+    /// request; existing names are refused until the caller explicitly
+    /// terminates the session.
+    dap_sessions: Arc<AsyncMutex<HashMap<String, Arc<DapClient>>>>,
     #[allow(
         dead_code,
         reason = "field is read via #[tool_handler] macro expansion"
@@ -360,26 +436,64 @@ pub struct AideServer {
 impl AideServer {
     pub fn new() -> anyhow::Result<Self> {
         let paths = AidePaths::from_home()?;
-        let indexer = Indexer::start(&paths)?;
+        let config = Config::load(&paths.config_file())?;
+        let indexer = Indexer::start(&paths, &config.scip)?;
         Ok(Self {
             registry: Registry::builtin(),
             paths,
+            config: Arc::new(config),
             pool: Arc::new(LspPool::new()),
             indexer,
-            dap_session: Arc::new(AsyncMutex::new(None)),
+            dap_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         })
     }
 
-    /// Clone the Arc to the active DAP client out of the session slot,
-    /// returning an error JSON string when no session is active.
-    async fn dap_client(&self) -> Result<Arc<DapClient>, String> {
-        self.dap_session
+    /// Clone the Arc to the DAP client for `session` (default `"default"`).
+    async fn dap_client(&self, session: Option<&str>) -> Result<Arc<DapClient>, String> {
+        let name = session.unwrap_or(DEFAULT_DAP_SESSION);
+        self.dap_sessions
             .lock()
             .await
-            .as_ref()
+            .get(name)
             .cloned()
-            .ok_or_else(|| "no DAP session is active; call dap_launch first".to_string())
+            .ok_or_else(|| {
+                format!("no DAP session named `{name}`; call dap_launch with `session` first")
+            })
+    }
+
+    async fn run_step(
+        &self,
+        session: Option<&str>,
+        thread_id: Option<i64>,
+        kind: StepKind,
+    ) -> String {
+        let client = match self.dap_client(session).await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        let thread_id = match thread_id {
+            Some(t) => t,
+            None => match client.current_stopped().await.and_then(|s| s.thread_id) {
+                Some(t) => t,
+                None => return error_json("no stopped thread; pass thread_id explicitly"),
+            },
+        };
+        let op = match kind {
+            StepKind::Over => client.next(thread_id).await,
+            StepKind::In => client.step_in(thread_id).await,
+            StepKind::Out => client.step_out(thread_id).await,
+        };
+        if let Err(e) = op {
+            return error_json(e.to_string());
+        }
+        match client
+            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
+            .await
+        {
+            Ok(info) => to_json(&info),
+            Err(e) => error_json(format!("no stop after step: {e}")),
+        }
     }
 
     /// Select a language plugin that claims `root`, together with the
@@ -835,7 +949,10 @@ impl AideServer {
         let runner = plugin.runner();
         let mut argv: Vec<OsString> = runner.args.iter().map(OsString::from).collect();
         argv.extend(args.extra_args.into_iter().map(OsString::from));
-        let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let duration = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(self.config.exec.default_timeout_secs),
+        );
 
         match exec::run(
             runner.executable,
@@ -865,7 +982,10 @@ impl AideServer {
             argv.push(OsString::from(filter));
         }
         argv.extend(args.extra_args.into_iter().map(OsString::from));
-        let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let duration = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(self.config.exec.default_timeout_secs),
+        );
 
         match exec::run(
             runner.executable,
@@ -895,7 +1015,10 @@ impl AideServer {
         let pm = plugin.package_manager();
         let mut argv: Vec<OsString> = pm.install_args.iter().map(OsString::from).collect();
         argv.extend(args.packages.into_iter().map(OsString::from));
-        let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let duration = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(self.config.exec.default_timeout_secs),
+        );
 
         match exec::run(
             pm.executable,
@@ -912,7 +1035,53 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Start a DAP debug session for `program` using the language plugin's debug adapter (Rust = codelldb). Runs the full initialize → launch → configurationDone → first-stop handshake and returns the initial StoppedInfo. Only one session at a time — call dap_terminate to end it."
+        description = "Read `max_bytes` from an exec log file starting at `offset`. Returns `{bytes_read, eof, content, next_offset, total_size}`. Poll a running tool by advancing `offset = next_offset` across calls; stop when `eof` is true AND the producing tool has returned."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    async fn read_exec_log(&self, Parameters(args): Parameters<ReadExecLogArgs>) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        let cap = args.max_bytes.unwrap_or(64 * 1024).max(1);
+        let path = PathBuf::from(&args.path);
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => return error_json(format!("open {}: {e}", path.display())),
+        };
+        let total_size = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(e) => return error_json(format!("stat {}: {e}", path.display())),
+        };
+        if args.offset > total_size {
+            return to_json(&serde_json::json!({
+                "bytes_read": 0,
+                "eof": true,
+                "content": "",
+                "next_offset": total_size,
+                "total_size": total_size,
+            }));
+        }
+        if let Err(e) = file.seek(SeekFrom::Start(args.offset)) {
+            return error_json(format!("seek {}: {e}", path.display()));
+        }
+        let mut buf = vec![0u8; cap];
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => return error_json(format!("read {}: {e}", path.display())),
+        };
+        buf.truncate(n);
+        let next_offset = args.offset.saturating_add(n as u64);
+        let eof = next_offset >= total_size;
+        let content = String::from_utf8_lossy(&buf).into_owned();
+        to_json(&serde_json::json!({
+            "bytes_read": n,
+            "eof": eof,
+            "content": content,
+            "next_offset": next_offset,
+            "total_size": total_size,
+        }))
+    }
+
+    #[tool(
+        description = "Start a DAP debug session for `program` under an optional `session` name (default `\"default\"`). Launch multiple debuggees concurrently by passing distinct session names. Runs the full initialize → launch → configurationDone → first-stop handshake and returns `{ session, stopped }`."
     )]
     async fn dap_launch(&self, Parameters(args): Parameters<DapLaunchArgs>) -> String {
         let root = resolve_root(args.path);
@@ -936,9 +1105,17 @@ impl AideServer {
             PathBuf::from(dap_spec.executable)
         };
 
-        let mut session_guard = self.dap_session.lock().await;
-        if session_guard.is_some() {
-            return error_json("a DAP session is already active; call dap_terminate first");
+        let session_name = args
+            .session
+            .unwrap_or_else(|| DEFAULT_DAP_SESSION.to_string());
+
+        {
+            let sessions = self.dap_sessions.lock().await;
+            if sessions.contains_key(&session_name) {
+                return error_json(format!(
+                    "session `{session_name}` already exists; call dap_terminate first"
+                ));
+            }
         }
 
         let client = match DapClient::spawn(&adapter_path, &[], &root).await {
@@ -986,7 +1163,10 @@ impl AideServer {
             return error_json(format!("launch: {e}"));
         }
 
-        let stopped = match client.wait_for_stopped(Duration::from_mins(1)).await {
+        let stopped = match client
+            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
+            .await
+        {
             Ok(info) => info,
             Err(e) => {
                 let _ = client.disconnect().await;
@@ -994,8 +1174,14 @@ impl AideServer {
             }
         };
 
-        *session_guard = Some(client);
-        to_json(&stopped)
+        self.dap_sessions
+            .lock()
+            .await
+            .insert(session_name.clone(), client);
+        to_json(&serde_json::json!({
+            "session": session_name,
+            "stopped": stopped,
+        }))
     }
 
     #[tool(
@@ -1005,7 +1191,7 @@ impl AideServer {
         &self,
         Parameters(args): Parameters<DapSetBreakpointsArgs>,
     ) -> String {
-        let client = match self.dap_client().await {
+        let client = match self.dap_client(args.session.as_deref()).await {
             Ok(c) => c,
             Err(e) => return error_json(e),
         };
@@ -1019,7 +1205,7 @@ impl AideServer {
         description = "Resume a paused thread and wait for the next stop. Defaults to the thread reported by the most recent `stopped` event. Returns the new StoppedInfo once the debuggee pauses again (or errors on timeout / program exit)."
     )]
     async fn dap_continue(&self, Parameters(args): Parameters<DapContinueArgs>) -> String {
-        let client = match self.dap_client().await {
+        let client = match self.dap_client(args.session.as_deref()).await {
             Ok(c) => c,
             Err(e) => return error_json(e),
         };
@@ -1033,9 +1219,54 @@ impl AideServer {
         if let Err(e) = client.continue_thread(thread_id).await {
             return error_json(e.to_string());
         }
-        match client.wait_for_stopped(Duration::from_mins(1)).await {
+        match client
+            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
+            .await
+        {
             Ok(info) => to_json(&info),
             Err(e) => error_json(format!("no stop after continue: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Step over: run until the next source line in the same frame, then stop. Returns the new StoppedInfo."
+    )]
+    async fn dap_step_over(&self, Parameters(args): Parameters<DapStepArgs>) -> String {
+        self.run_step(args.session.as_deref(), args.thread_id, StepKind::Over)
+            .await
+    }
+
+    #[tool(
+        description = "Step in: if the current line contains a call, enter it; otherwise step to the next line."
+    )]
+    async fn dap_step_in(&self, Parameters(args): Parameters<DapStepArgs>) -> String {
+        self.run_step(args.session.as_deref(), args.thread_id, StepKind::In)
+            .await
+    }
+
+    #[tool(description = "Step out: run until the current frame returns, then stop.")]
+    async fn dap_step_out(&self, Parameters(args): Parameters<DapStepArgs>) -> String {
+        self.run_step(args.session.as_deref(), args.thread_id, StepKind::Out)
+            .await
+    }
+
+    #[tool(
+        description = "Pause a running thread. Returns the StoppedInfo the adapter publishes once it suspends."
+    )]
+    async fn dap_pause(&self, Parameters(args): Parameters<DapPauseArgs>) -> String {
+        let client = match self.dap_client(args.session.as_deref()).await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        if let Err(e) = client.pause(args.thread_id).await {
+            return error_json(e.to_string());
+        }
+        match client
+            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
+            .await
+        {
+            Ok(info) => to_json(&info),
+            Err(e) => error_json(format!("no stop after pause: {e}")),
         }
     }
 
@@ -1043,7 +1274,7 @@ impl AideServer {
         description = "Return the current call stack for `thread_id` (defaults to the last-stopped thread). Up to 50 frames."
     )]
     async fn dap_stack_trace(&self, Parameters(args): Parameters<DapStackTraceArgs>) -> String {
-        let client = match self.dap_client().await {
+        let client = match self.dap_client(args.session.as_deref()).await {
             Ok(c) => c,
             Err(e) => return error_json(e),
         };
@@ -1064,7 +1295,7 @@ impl AideServer {
         description = "List scopes (e.g. Locals, Registers) for a stack frame. Use the `variables_reference` returned here with `dap_variables` to read actual values."
     )]
     async fn dap_scopes(&self, Parameters(args): Parameters<DapScopesArgs>) -> String {
-        let client = match self.dap_client().await {
+        let client = match self.dap_client(args.session.as_deref()).await {
             Ok(c) => c,
             Err(e) => return error_json(e),
         };
@@ -1078,7 +1309,7 @@ impl AideServer {
         description = "Read variables for a `variables_reference` (from a scope or a structured variable). Useful for expanding composite values."
     )]
     async fn dap_variables(&self, Parameters(args): Parameters<DapVariablesArgs>) -> String {
-        let client = match self.dap_client().await {
+        let client = match self.dap_client(args.session.as_deref()).await {
             Ok(c) => c,
             Err(e) => return error_json(e),
         };
@@ -1092,7 +1323,7 @@ impl AideServer {
         description = "Evaluate an expression in the debuggee. When `frame_id` is given, the expression resolves in that frame's scope."
     )]
     async fn dap_evaluate(&self, Parameters(args): Parameters<DapEvaluateArgs>) -> String {
-        let client = match self.dap_client().await {
+        let client = match self.dap_client(args.session.as_deref()).await {
             Ok(c) => c,
             Err(e) => return error_json(e),
         };
@@ -1102,17 +1333,23 @@ impl AideServer {
         }
     }
 
-    #[tool(description = "Disconnect from the DAP adapter and tear down the session.")]
-    async fn dap_terminate(&self, Parameters(_args): Parameters<DapTerminateArgs>) -> String {
-        let mut session = self.dap_session.lock().await;
-        match session.take() {
+    #[tool(
+        description = "Disconnect from the DAP adapter and tear down the named session (default `\"default\"`)."
+    )]
+    async fn dap_terminate(&self, Parameters(args): Parameters<DapTerminateArgs>) -> String {
+        let name = args
+            .session
+            .unwrap_or_else(|| DEFAULT_DAP_SESSION.to_string());
+        let mut sessions = self.dap_sessions.lock().await;
+        match sessions.remove(&name) {
             None => to_json(&serde_json::json!({
                 "terminated": false,
-                "reason": "no active session",
+                "session": name,
+                "reason": "no such session",
             })),
             Some(client) => {
                 let _ = client.disconnect().await;
-                to_json(&serde_json::json!({ "terminated": true }))
+                to_json(&serde_json::json!({ "terminated": true, "session": name }))
             }
         }
     }

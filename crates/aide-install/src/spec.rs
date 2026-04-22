@@ -43,10 +43,25 @@ pub struct TargetAsset {
 }
 
 /// How the downloaded bytes are packaged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveFormat {
     /// Raw executable bytes — write directly.
     Raw,
     /// Single gzip-compressed file — decompress, then write.
     Gzip,
+    /// Tar archive (possibly gzip-compressed) containing many files.
+    /// Extract to `~/.aide/bin/<tool-name>-<version>/` and symlink
+    /// `~/.aide/bin/<executable>` to the entry below.
+    TarGz {
+        /// Path of the main executable inside the archive, relative
+        /// to the extract root (e.g. `"bin/scip-java"`).
+        entry_path: &'static str,
+    },
+    /// Zip archive (covers `.vsix` — it's zip under the hood).
+    /// Same extraction + symlink flow as [`Self::TarGz`].
+    Zip {
+        /// Path of the main executable inside the archive, relative
+        /// to the extract root (e.g. `"extension/adapter/codelldb"`).
+        entry_path: &'static str,
+    },
 }

@@ -23,11 +23,6 @@ pub enum StateError {
     Json(#[from] serde_json::Error),
 }
 
-/// How many Ready commits per repo we keep on disk. SCIP indexes are
-/// fat, so the default is just the latest — agents nearly always query
-/// the current HEAD. Bump this when a config file lands.
-const RETENTION_READY: usize = 1;
-
 /// Result of a single `enqueue` call — tells the worker whether there is
 /// fresh work to do or whether the commit was already known.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +70,7 @@ impl CommitEntry {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Mutex<StoreInner>>,
+    retention_ready: usize,
 }
 
 struct StoreInner {
@@ -83,7 +79,9 @@ struct StoreInner {
 }
 
 impl Store {
-    pub fn load(path: impl Into<PathBuf>) -> Result<Self, StateError> {
+    /// Load state from `path`. `retention_ready` is the number of Ready
+    /// commits to keep per repo — older ones get evicted on `mark_ready`.
+    pub fn load(path: impl Into<PathBuf>, retention_ready: usize) -> Result<Self, StateError> {
         let path = path.into();
         let state = if path.exists() {
             let bytes = std::fs::read(&path)?;
@@ -93,6 +91,7 @@ impl Store {
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(StoreInner { state, path })),
+            retention_ready: retention_ready.max(1),
         })
     }
 
@@ -166,7 +165,7 @@ impl Store {
                 entry.index_path = Some(path_str);
             }
 
-            // Keep the `RETENTION_READY` most recently enqueued Ready
+            // Keep `self.retention_ready` most recently enqueued Ready
             // commits; evict the rest. Sort by `enqueued_at_unix` desc
             // so "latest HEAD" wins even when a slow older build
             // finishes after a newer one.
@@ -178,7 +177,7 @@ impl Store {
                 .collect();
             ready.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
-            for (evict_sha, _) in ready.into_iter().skip(RETENTION_READY) {
+            for (evict_sha, _) in ready.into_iter().skip(self.retention_ready) {
                 if let Some(entry) = repo.commits.remove(&evict_sha) {
                     if let Some(p) = entry.index_path {
                         evicted.push(PathBuf::from(p));
@@ -294,7 +293,7 @@ mod tests {
     async fn new_enqueue_lands_as_pending() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
 
         let outcome = store.enqueue("/repo", "abc").await.unwrap();
         assert_eq!(outcome, EnqueueOutcome::NeedsIndexing);
@@ -308,7 +307,7 @@ mod tests {
     async fn mark_ready_sets_index_path_and_timestamp() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
         store.enqueue("/repo", "abc").await.unwrap();
         store.mark_in_progress("/repo", "abc").await.unwrap();
         store
@@ -326,7 +325,7 @@ mod tests {
     async fn re_enqueue_of_ready_commit_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
         store.enqueue("/repo", "abc").await.unwrap();
         store
             .mark_ready("/repo", "abc", PathBuf::from("/out.scip"))
@@ -341,7 +340,7 @@ mod tests {
     async fn re_enqueue_of_failed_commit_retries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
         store.enqueue("/repo", "abc").await.unwrap();
         store
             .mark_failed("/repo", "abc", "boom".into())
@@ -359,14 +358,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
         {
-            let store = Store::load(&path).unwrap();
+            let store = Store::load(&path, 1).unwrap();
             store.enqueue("/repo", "abc").await.unwrap();
             store
                 .mark_ready("/repo", "abc", PathBuf::from("/x.scip"))
                 .await
                 .unwrap();
         }
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
         let last = store.last_known("/repo").await.unwrap();
         assert_eq!(last.sha, "abc");
         assert_eq!(last.state, IndexState::Ready);
@@ -377,7 +376,7 @@ mod tests {
     async fn last_ready_picks_latest_indexed() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
 
         store.enqueue("/repo", "older").await.unwrap();
         store
@@ -406,7 +405,7 @@ mod tests {
     async fn retention_evicts_older_ready_commits() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
 
         // First Ready commit — nothing to evict.
         store.enqueue("/repo", "first").await.unwrap();
@@ -436,7 +435,7 @@ mod tests {
     async fn last_ready_returns_none_when_nothing_is_ready() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
         store.enqueue("/repo", "pending").await.unwrap();
         assert!(store.last_ready("/repo").await.is_none());
     }
@@ -445,7 +444,7 @@ mod tests {
     async fn recoverable_jobs_reports_pending_and_in_progress() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
-        let store = Store::load(&path).unwrap();
+        let store = Store::load(&path, 1).unwrap();
         store.enqueue("/repo", "pending").await.unwrap();
         store.enqueue("/repo", "running").await.unwrap();
         store.mark_in_progress("/repo", "running").await.unwrap();

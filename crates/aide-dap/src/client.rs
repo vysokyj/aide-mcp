@@ -123,7 +123,10 @@ impl DapClient {
     /// Spawn `adapter_path` with `adapter_args`. `cwd` becomes the
     /// adapter's working directory. Call [`initialize`](Self::initialize)
     /// right after to complete the DAP handshake.
-    #[allow(clippy::unused_async, reason = "kept async for symmetry with LspClient::spawn")]
+    #[allow(
+        clippy::unused_async,
+        reason = "kept async for symmetry with LspClient::spawn"
+    )]
     pub async fn spawn(
         adapter_path: &Path,
         adapter_args: &[OsString],
@@ -292,6 +295,39 @@ impl DapClient {
         let mut guard = self.state.lock().await;
         guard.stopped = None;
         drop(guard);
+        Ok(())
+    }
+
+    /// Step to the next source line in `thread_id` (DAP `next`, a.k.a.
+    /// step-over).
+    pub async fn next(&self, thread_id: i64) -> Result<(), DapClientError> {
+        self.request("next", json!({ "threadId": thread_id }))
+            .await?;
+        self.state.lock().await.stopped = None;
+        Ok(())
+    }
+
+    /// Step into the function call at the current line.
+    pub async fn step_in(&self, thread_id: i64) -> Result<(), DapClientError> {
+        self.request("stepIn", json!({ "threadId": thread_id }))
+            .await?;
+        self.state.lock().await.stopped = None;
+        Ok(())
+    }
+
+    /// Step out of the current function.
+    pub async fn step_out(&self, thread_id: i64) -> Result<(), DapClientError> {
+        self.request("stepOut", json!({ "threadId": thread_id }))
+            .await?;
+        self.state.lock().await.stopped = None;
+        Ok(())
+    }
+
+    /// Pause a running thread. The next `stopped` event will arrive
+    /// with `reason == "pause"`.
+    pub async fn pause(&self, thread_id: i64) -> Result<(), DapClientError> {
+        self.request("pause", json!({ "threadId": thread_id }))
+            .await?;
         Ok(())
     }
 
