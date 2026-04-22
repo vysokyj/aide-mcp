@@ -200,6 +200,19 @@ impl Store {
         Some(entry.to_info(sha))
     }
 
+    /// The most recently indexed commit for this repo that reached
+    /// `Ready` state. Used by SCIP query tools to pick the "current"
+    /// index when the caller does not pin an explicit SHA.
+    pub async fn last_ready(&self, repo_root: &str) -> Option<CommitInfo> {
+        let guard = self.inner.lock().await;
+        let repo = guard.state.repos.get(repo_root)?;
+        repo.commits
+            .iter()
+            .filter(|(_, e)| matches!(e.state, IndexState::Ready))
+            .max_by_key(|(_, e)| e.indexed_at_unix.unwrap_or(0))
+            .map(|(sha, entry)| entry.to_info(sha.clone()))
+    }
+
     /// Return every (`repo_root`, sha) pair that is still `Pending` or
     /// `InProgress`. Called on start-up so that commits interrupted by
     /// an earlier crash get retried.
@@ -320,6 +333,44 @@ mod tests {
         assert_eq!(last.sha, "abc");
         assert_eq!(last.state, IndexState::Ready);
         assert_eq!(last.index_path.as_deref(), Some("/x.scip"));
+    }
+
+    #[tokio::test]
+    async fn last_ready_picks_latest_indexed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::load(&path).unwrap();
+
+        store.enqueue("/repo", "older").await.unwrap();
+        store
+            .mark_ready("/repo", "older", PathBuf::from("/older.scip"))
+            .await
+            .unwrap();
+
+        // Sleep to get a different unix-second stamp for the second mark.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        store.enqueue("/repo", "newer").await.unwrap();
+        store
+            .mark_ready("/repo", "newer", PathBuf::from("/newer.scip"))
+            .await
+            .unwrap();
+
+        // An extra pending commit must not override the latest Ready one.
+        store.enqueue("/repo", "pending").await.unwrap();
+
+        let info = store.last_ready("/repo").await.unwrap();
+        assert_eq!(info.sha, "newer");
+        assert_eq!(info.index_path.as_deref(), Some("/newer.scip"));
+    }
+
+    #[tokio::test]
+    async fn last_ready_returns_none_when_nothing_is_ready() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::load(&path).unwrap();
+        store.enqueue("/repo", "pending").await.unwrap();
+        assert!(store.last_ready("/repo").await.is_none());
     }
 
     #[tokio::test]

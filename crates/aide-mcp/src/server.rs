@@ -188,6 +188,44 @@ pub struct WorkLastKnownStateArgs {
     pub path: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScipDocumentsArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Commit SHA whose index to query. Defaults to the most recently
+    /// indexed Ready commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScipSymbolsArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Case-insensitive substring against `display_name` or the symbol id.
+    /// Empty string returns every symbol in the index.
+    pub query: String,
+    /// Commit SHA whose index to query. Defaults to the most recently
+    /// indexed Ready commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScipReferencesArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Exact SCIP symbol id (from `scip_symbols`).
+    pub symbol: String,
+    /// Commit SHA whose index to query. Defaults to the most recently
+    /// indexed Ready commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AideServer {
     registry: Registry,
@@ -220,6 +258,36 @@ impl AideServer {
         let plugin = self.registry.detect(root).into_iter().next()?;
         let binary = self.paths.bin().join(plugin.lsp().executable);
         Some((plugin, binary))
+    }
+
+    /// Find the `.scip` file to query for `repo_root`, preferring the
+    /// explicit `sha` when given, else the most recently indexed Ready
+    /// commit. Returns a human-readable error message if no Ready index
+    /// is available yet (e.g. the worker is still indexing).
+    async fn resolve_scip_path(
+        &self,
+        repo_root: &str,
+        sha: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        let info = match sha {
+            Some(s) => self
+                .indexer
+                .status(repo_root, Some(s))
+                .await
+                .ok_or_else(|| format!("no indexer state for {repo_root}@{s}"))?,
+            None => self
+                .indexer
+                .last_ready(repo_root)
+                .await
+                .ok_or_else(|| format!("no ready index for {repo_root}"))?,
+        };
+        match info.state {
+            aide_proto::IndexState::Ready => info
+                .index_path
+                .map(PathBuf::from)
+                .ok_or_else(|| "ready commit is missing an index_path".to_string()),
+            other => Err(format!("index for {} is {:?}, not Ready", info.sha, other)),
+        }
     }
 }
 
@@ -561,6 +629,63 @@ impl AideServer {
         match self.indexer.last_known(&repo_root).await {
             Some(info) => to_json(&info),
             None => "null".to_string(),
+        }
+    }
+
+    #[tool(
+        description = "List every document (file path relative to the repo root) covered by the SCIP index for a commit. Defaults to the most recently indexed Ready commit."
+    )]
+    async fn scip_documents(&self, Parameters(args): Parameters<ScipDocumentsArgs>) -> String {
+        let root = resolve_root(args.path);
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        match aide_scip::load(&index_path) {
+            Ok(idx) => to_json(&aide_scip::documents(&idx)),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Fuzzy-search SCIP symbols by display name or symbol id (case-insensitive substring). Empty query returns everything. Queries the most recently indexed Ready commit by default."
+    )]
+    async fn scip_symbols(&self, Parameters(args): Parameters<ScipSymbolsArgs>) -> String {
+        let root = resolve_root(args.path);
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        match aide_scip::load(&index_path) {
+            Ok(idx) => to_json(&aide_scip::find_symbols(&idx, &args.query)),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Every occurrence of a SCIP symbol id across the index, with `is_definition` flag. Pair with `scip_symbols` to discover the symbol id first."
+    )]
+    async fn scip_references(&self, Parameters(args): Parameters<ScipReferencesArgs>) -> String {
+        let root = resolve_root(args.path);
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        match aide_scip::load(&index_path) {
+            Ok(idx) => to_json(&aide_scip::references(&idx, &args.symbol)),
+            Err(e) => error_json(e.to_string()),
         }
     }
 }

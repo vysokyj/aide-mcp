@@ -17,6 +17,7 @@ aide-install.workspace = true
 aide-lang.workspace = true
 aide-lsp.workspace = true
 aide-proto.workspace = true
+aide-scip.workspace = true
 
 anyhow.workspace = true
 rmcp = { workspace = true }

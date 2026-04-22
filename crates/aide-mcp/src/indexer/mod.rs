@@ -98,4 +98,8 @@ impl Indexer {
     pub async fn last_known(&self, repo_root: &str) -> Option<CommitInfo> {
         self.store.last_known(repo_root).await
     }
+
+    pub async fn last_ready(&self, repo_root: &str) -> Option<CommitInfo> {
+        self.store.last_ready(repo_root).await
+    }
 }
