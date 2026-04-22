@@ -38,24 +38,29 @@ decisions, roadmap, current state — is mirrored here.
 
 ```
 crates/
-  aide-core/      AidePaths (~/.aide/bin/scip/sock/queue/config.toml), AIDE_HOME override
+  aide-core/      AidePaths (~/.aide/bin/scip/sock/queue/logs/config.toml), AIDE_HOME override
   aide-install/   ToolSpec, GitHub-release downloader, gzip decode, manifest.json
-  aide-lang/      LanguagePlugin trait + Registry; first impl: RustPlugin
-  aide-lsp/       framing, LspClient, LspPool, ops (hover/def/refs/symbols/diagnostics)
+  aide-lang/      LanguagePlugin trait + Registry; built-ins: RustPlugin, JavaMavenPlugin
+  aide-lsp/       framing, LspClient (spawn takes plugin-supplied args),
+                  LspPool, ops (hover/def/refs/symbols/diagnostics)
   aide-git/       libgit2-backed status/log/diff/blame + export_commit + resolve_head
   aide-proto/     Shared schema (IndexState, CommitInfo) for indexer tool responses
+  aide-scip/      scip protobuf loader + query helpers (documents/symbols/refs)
   aide-mcp/       MCP stdio server exposing every tool via rmcp 1.5. Owns the
-                  in-process SCIP indexer (src/indexer/: state + worker).
+                  in-process SCIP indexer (src/indexer/: state + worker) and
+                  the shared exec runner (src/exec.rs).
 ```
 
 ## Key decisions
 
 1. **SDK** = `rmcp` 1.5 (official Anthropic Rust MCP SDK, Tier 2 stable).
 2. **Transport** = stdio only.
-3. **First language** = Rust (dogfood). More languages added via
+3. **Languages** = Rust (dogfood) + Java (Maven). Added via the
    `LanguagePlugin` trait; each declares its LSP / SCIP / DAP / package
    manager / runner, plus the full command line for its SCIP indexer
-   (`scip_args`).
+   (`scip_args`) and optional LSP launch flags (`lsp_spawn_args`).
+   Java's jdtls and scip-java are expected on `$PATH` (system install);
+   only Rust uses the auto-download pipeline today.
 4. **Execution model** = MCP tools operate directly against the user's
    working tree. SCIP is built against a commit snapshot exported to a
    TempDir — never against the dirty working tree.
@@ -75,9 +80,16 @@ crates/
    already Ready), and agents can force a refresh via `index_commit`.
 10. **SCIP** is produced by `rust-analyzer scip` — the same binary that
     serves LSP — so no second tool to download per language.
-11. **Retention** of SCIP indexes: default 1 (latest HEAD only),
-    configurable. Not yet implemented — files accumulate under
-    `~/.aide/scip/<slug>/` for now.
+11. **Retention** of SCIP indexes: default 1 (latest HEAD only by
+    `enqueued_at_unix`). Enforced inside `Store::mark_ready` — older
+    Ready commits are evicted from state and their `.scip` files are
+    deleted by the worker. Configurable retention count will land when
+    `~/.aide/config.toml` exists.
+12. **Exec logs**: `run_project` / `run_tests` / `install_package` tee
+    their full stdout/stderr to
+    `~/.aide/logs/<ts>-<bin>.{stdout,stderr}.log`. The JSON response
+    still caps each stream at 1 MB in memory; the log files hold the
+    complete output for post-mortem when `*_truncated` is true.
 
 ## Tools implemented
 
@@ -141,13 +153,16 @@ Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 
 Nice-to-have polish (no milestone, add when useful):
 
-- **SCIP retention** — when a new commit reaches Ready, prune older
-  `.scip` files for that repo; configurable via `~/.aide/config.toml`.
-- **Streaming exec output** — currently `run_*` tools buffer to 1 MB.
-  For long builds the agent would benefit from incremental progress;
-  likely requires an MCP resource/notification mechanism.
-- **Second language plugin** — Python or Go — to validate the
-  `LanguagePlugin` abstraction beyond Rust.
+- **Config file (`~/.aide/config.toml`)** — expose retention count,
+  default timeouts, log retention, etc.
+- **Gradle flavour of the Java plugin** — sibling `JavaGradlePlugin`
+  that claims `build.gradle(.kts)` and uses `./gradlew` / `gradle`.
+- **Auto-install for JDT-LS + scip-java** — currently Java expects
+  both on `$PATH`; the ToolSpec pipeline needs multi-file tarball
+  support to download JDT-LS directly.
+- **True streaming exec output via MCP notifications** — log files
+  cover post-mortem, but live progress for long builds still requires
+  the MCP `notifications/progress` mechanism.
 
 ## Build & test
 

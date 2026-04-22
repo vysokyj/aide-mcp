@@ -38,13 +38,15 @@ impl LspPool {
         }
     }
 
-    /// Return a handle to the LSP client for `(language, root)`, spawning one
-    /// at `server_binary` if none is cached yet.
+    /// Return a handle to the LSP client for `(language, root)`, spawning
+    /// one at `server_binary` if none is cached yet. `server_args` are
+    /// plugin-supplied launch flags (see `LanguagePlugin::lsp_spawn_args`).
     pub async fn get_or_spawn(
         &self,
         language: &str,
         root: &Path,
         server_binary: &Path,
+        server_args: &[std::ffi::OsString],
     ) -> Result<Arc<LspClient>, LspPoolError> {
         let key = Key {
             language: language.to_string(),
@@ -59,7 +61,7 @@ impl LspPool {
             return Err(LspPoolError::ServerMissing(server_binary.to_path_buf()));
         }
 
-        let client = Arc::new(LspClient::spawn(server_binary, root).await?);
+        let client = Arc::new(LspClient::spawn(server_binary, server_args, root).await?);
         self.clients.lock().await.insert(key, client.clone());
         Ok(client)
     }

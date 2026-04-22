@@ -23,6 +23,11 @@ pub enum StateError {
     Json(#[from] serde_json::Error),
 }
 
+/// How many Ready commits per repo we keep on disk. SCIP indexes are
+/// fat, so the default is just the latest — agents nearly always query
+/// the current HEAD. Bump this when a config file lands.
+const RETENTION_READY: usize = 1;
+
 /// Result of a single `enqueue` call — tells the worker whether there is
 /// fresh work to do or whether the commit was already known.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,20 +143,53 @@ impl Store {
         .await
     }
 
+    /// Flip `sha` to `Ready` with the produced index path, then evict
+    /// older Ready commits per retention policy (default: keep only the
+    /// most recently enqueued one). Returns the on-disk paths of
+    /// evicted `.scip` files so the caller can delete them.
     pub async fn mark_ready(
         &self,
         repo_root: &str,
         sha: &str,
         index_path: PathBuf,
-    ) -> Result<(), StateError> {
+    ) -> Result<Vec<PathBuf>, StateError> {
         let now = now_unix();
         let path_str = index_path.display().to_string();
-        self.mutate(repo_root, sha, |entry| {
-            entry.state = IndexState::Ready;
-            entry.indexed_at_unix = Some(now);
-            entry.index_path = Some(path_str.clone());
-        })
-        .await
+
+        let mut guard = self.inner.lock().await;
+        let mut evicted: Vec<PathBuf> = Vec::new();
+
+        if let Some(repo) = guard.state.repos.get_mut(repo_root) {
+            if let Some(entry) = repo.commits.get_mut(sha) {
+                entry.state = IndexState::Ready;
+                entry.indexed_at_unix = Some(now);
+                entry.index_path = Some(path_str);
+            }
+
+            // Keep the `RETENTION_READY` most recently enqueued Ready
+            // commits; evict the rest. Sort by `enqueued_at_unix` desc
+            // so "latest HEAD" wins even when a slow older build
+            // finishes after a newer one.
+            let mut ready: Vec<(String, i64)> = repo
+                .commits
+                .iter()
+                .filter(|(_, e)| matches!(e.state, IndexState::Ready))
+                .map(|(s, e)| (s.clone(), e.enqueued_at_unix))
+                .collect();
+            ready.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+
+            for (evict_sha, _) in ready.into_iter().skip(RETENTION_READY) {
+                if let Some(entry) = repo.commits.remove(&evict_sha) {
+                    if let Some(p) = entry.index_path {
+                        evicted.push(PathBuf::from(p));
+                    }
+                }
+            }
+        }
+
+        let path = guard.path.clone();
+        flush(&guard.state, &path)?;
+        Ok(evicted)
     }
 
     pub async fn mark_failed(
@@ -362,6 +400,36 @@ mod tests {
         let info = store.last_ready("/repo").await.unwrap();
         assert_eq!(info.sha, "newer");
         assert_eq!(info.index_path.as_deref(), Some("/newer.scip"));
+    }
+
+    #[tokio::test]
+    async fn retention_evicts_older_ready_commits() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::load(&path).unwrap();
+
+        // First Ready commit — nothing to evict.
+        store.enqueue("/repo", "first").await.unwrap();
+        let evicted = store
+            .mark_ready("/repo", "first", PathBuf::from("/first.scip"))
+            .await
+            .unwrap();
+        assert!(evicted.is_empty());
+
+        // Second Ready commit — the first one should get evicted.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.enqueue("/repo", "second").await.unwrap();
+        let evicted = store
+            .mark_ready("/repo", "second", PathBuf::from("/second.scip"))
+            .await
+            .unwrap();
+        assert_eq!(evicted, vec![PathBuf::from("/first.scip")]);
+
+        // The old commit is no longer tracked; the new one remains Ready.
+        assert!(store.status("/repo", Some("first")).await.is_none());
+        let latest = store.status("/repo", Some("second")).await.unwrap();
+        assert_eq!(latest.state, IndexState::Ready);
+        assert_eq!(latest.index_path.as_deref(), Some("/second.scip"));
     }
 
     #[tokio::test]

@@ -54,13 +54,24 @@ async fn process(paths: &AidePaths, registry: &Registry, store: &Store, job: &Jo
     let index_path = index_file_path(paths, &job.repo_root, &job.sha);
     match build_index(paths, registry, job, &index_path).await {
         Ok(()) => {
-            if let Err(e) = store
+            match store
                 .mark_ready(&job.repo_root, &job.sha, index_path.clone())
                 .await
             {
-                tracing::warn!(error = %e, "could not mark ready");
-            } else {
-                tracing::info!(index = %index_path.display(), "ready");
+                Ok(evicted) => {
+                    tracing::info!(index = %index_path.display(), "ready");
+                    for old in evicted {
+                        match std::fs::remove_file(&old) {
+                            Ok(()) => {
+                                tracing::info!(path = %old.display(), "evicted older index");
+                            }
+                            Err(e) => {
+                                tracing::warn!(path = %old.display(), error = %e, "failed to delete evicted index");
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "could not mark ready"),
             }
         }
         Err(e) => {

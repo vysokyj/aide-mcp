@@ -13,8 +13,9 @@ pub enum PathsError {
 /// All directories live under `~/.aide/`:
 /// - `bin/`     — downloaded LSP servers, SCIP indexers, debug adapters.
 /// - `scip/`    — `<repo-id>/<sha>.scip` per-repo indexes.
-/// - `sock/`    — unix-domain sockets for IPC (indexer daemon etc.).
+/// - `sock/`    — unix-domain sockets for IPC.
 /// - `queue/`   — durable queue for pending indexer work.
+/// - `logs/`    — captured stdout/stderr of `run_*` / `install_package`.
 /// - `config.toml` — user-wide configuration.
 #[derive(Debug, Clone)]
 pub struct AidePaths {
@@ -59,6 +60,10 @@ impl AidePaths {
         self.root.join("queue")
     }
 
+    pub fn logs(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.root.join("config.toml")
     }
@@ -76,6 +81,7 @@ mod tests {
         assert_eq!(paths.scip(), Path::new("/tmp/aide-test/scip"));
         assert_eq!(paths.sock(), Path::new("/tmp/aide-test/sock"));
         assert_eq!(paths.queue(), Path::new("/tmp/aide-test/queue"));
+        assert_eq!(paths.logs(), Path::new("/tmp/aide-test/logs"));
         assert_eq!(paths.config_file(), Path::new("/tmp/aide-test/config.toml"));
     }
 }

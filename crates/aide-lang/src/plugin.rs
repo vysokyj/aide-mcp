@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+use aide_core::AidePaths;
 use aide_install::ToolSpec;
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,15 @@ pub trait LanguagePlugin: Send + Sync {
     fn lsp(&self) -> LspSpec;
     fn scip(&self) -> Option<ScipSpec>;
     fn dap(&self) -> Option<DapSpec>;
+
+    /// Arguments to pass to the LSP executable when spawning it for
+    /// `workspace_root`. `paths` lets the plugin reserve a cache dir
+    /// under `~/.aide/` (e.g. JDT-LS requires a per-workspace
+    /// `-data <dir>`). Default: no extra arguments.
+    fn lsp_spawn_args(&self, workspace_root: &Path, paths: &AidePaths) -> Vec<OsString> {
+        let _ = (workspace_root, paths);
+        Vec::new()
+    }
 
     fn package_manager(&self) -> PackageManager;
     fn runner(&self) -> Runner;

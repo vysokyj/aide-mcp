@@ -298,12 +298,17 @@ impl AideServer {
         })
     }
 
-    /// Select a language plugin that claims `root`, together with the path to
-    /// its LSP binary in `~/.aide/bin/`.
-    fn language_for(&self, root: &std::path::Path) -> Option<(Arc<dyn LanguagePlugin>, PathBuf)> {
+    /// Select a language plugin that claims `root`, together with the
+    /// path to its LSP binary in `~/.aide/bin/` and the plugin-supplied
+    /// launch args (empty for servers that take no arguments).
+    fn language_for(
+        &self,
+        root: &std::path::Path,
+    ) -> Option<(Arc<dyn LanguagePlugin>, PathBuf, Vec<OsString>)> {
         let plugin = self.registry.detect(root).into_iter().next()?;
         let binary = self.paths.bin().join(plugin.lsp().executable);
-        Some((plugin, binary))
+        let args = plugin.lsp_spawn_args(root, &self.paths);
+        Some((plugin, binary, args))
     }
 
     /// Find the `.scip` file to query for `repo_root`, preferring the
@@ -420,13 +425,13 @@ impl AideServer {
     async fn lsp_hover(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary)) = self.language_for(&root) else {
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
 
         let client = match self
             .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
             .await
         {
             Ok(c) => c,
@@ -446,13 +451,13 @@ impl AideServer {
     async fn lsp_definition(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary)) = self.language_for(&root) else {
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
 
         let client = match self
             .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
             .await
         {
             Ok(c) => c,
@@ -471,13 +476,13 @@ impl AideServer {
     async fn lsp_diagnostics(&self, Parameters(args): Parameters<LspFileArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary)) = self.language_for(&root) else {
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
 
         let client = match self
             .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
             .await
         {
             Ok(c) => c,
@@ -496,13 +501,13 @@ impl AideServer {
     async fn lsp_references(&self, Parameters(args): Parameters<LspReferencesArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary)) = self.language_for(&root) else {
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
 
         let client = match self
             .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
             .await
         {
             Ok(c) => c,
@@ -529,13 +534,13 @@ impl AideServer {
     async fn lsp_document_symbols(&self, Parameters(args): Parameters<LspFileArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary)) = self.language_for(&root) else {
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
 
         let client = match self
             .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
             .await
         {
             Ok(c) => c,
@@ -556,13 +561,13 @@ impl AideServer {
         Parameters(args): Parameters<LspWorkspaceSymbolsArgs>,
     ) -> String {
         let root = resolve_root(args.root);
-        let Some((plugin, binary)) = self.language_for(&root) else {
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
 
         let client = match self
             .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
             .await
         {
             Ok(c) => c,
@@ -748,7 +753,15 @@ impl AideServer {
         argv.extend(args.extra_args.into_iter().map(OsString::from));
         let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
-        match exec::run(runner.executable, &argv, &root, duration).await {
+        match exec::run(
+            runner.executable,
+            &argv,
+            &root,
+            duration,
+            Some(&self.paths.logs()),
+        )
+        .await
+        {
             Ok(result) => to_json(&result),
             Err(e) => error_json(format!("failed to spawn {}: {e}", runner.executable)),
         }
@@ -770,7 +783,15 @@ impl AideServer {
         argv.extend(args.extra_args.into_iter().map(OsString::from));
         let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
-        match exec::run(runner.executable, &argv, &root, duration).await {
+        match exec::run(
+            runner.executable,
+            &argv,
+            &root,
+            duration,
+            Some(&self.paths.logs()),
+        )
+        .await
+        {
             Ok(result) => to_json(&result),
             Err(e) => error_json(format!("failed to spawn {}: {e}", runner.executable)),
         }
@@ -792,7 +813,15 @@ impl AideServer {
         argv.extend(args.packages.into_iter().map(OsString::from));
         let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
-        match exec::run(pm.executable, &argv, &root, duration).await {
+        match exec::run(
+            pm.executable,
+            &argv,
+            &root,
+            duration,
+            Some(&self.paths.logs()),
+        )
+        .await
+        {
             Ok(result) => to_json(&result),
             Err(e) => error_json(format!("failed to spawn {}: {e}", pm.executable)),
         }

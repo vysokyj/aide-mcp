@@ -75,10 +75,18 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    /// Spawn `server_path` (e.g. a rust-analyzer binary) and run the LSP
-    /// initialize handshake against `workspace_root`.
-    pub async fn spawn(server_path: &Path, workspace_root: &Path) -> Result<Self, LspClientError> {
+    /// Spawn `server_path` (e.g. a rust-analyzer binary) with optional
+    /// extra launch arguments and run the LSP initialize handshake
+    /// against `workspace_root`. The plugin-provided `server_args` let
+    /// servers that need per-workspace flags (e.g. JDT-LS `-data`) be
+    /// launched correctly.
+    pub async fn spawn(
+        server_path: &Path,
+        server_args: &[std::ffi::OsString],
+        workspace_root: &Path,
+    ) -> Result<Self, LspClientError> {
         let mut child = Command::new(server_path)
+            .args(server_args)
             .current_dir(workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

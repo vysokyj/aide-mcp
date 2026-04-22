@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::languages::java::JavaMavenPlugin;
 use crate::languages::rust::RustPlugin;
 use crate::plugin::{LanguageId, LanguagePlugin};
 
@@ -14,7 +15,7 @@ impl Registry {
     /// Registry preloaded with every language plugin shipped with aide-mcp.
     pub fn builtin() -> Self {
         Self {
-            plugins: vec![Arc::new(RustPlugin)],
+            plugins: vec![Arc::new(RustPlugin), Arc::new(JavaMavenPlugin)],
         }
     }
 

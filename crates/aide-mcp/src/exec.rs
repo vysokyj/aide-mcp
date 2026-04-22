@@ -4,22 +4,26 @@
 //!
 //! - spawns the child in `cwd` with a null stdin and piped stdout/stderr,
 //! - captures both streams concurrently up to [`MAX_STREAM_BYTES`]
-//!   (truncating the tail, never blocking the child),
+//!   (truncating the tail — never blocking the child),
+//! - tees the *full* streams to log files under `~/.aide/logs/` when
+//!   the caller supplies a log dir (so oversized output survives the
+//!   1 MB cap),
 //! - kills the child if it exceeds `timeout`,
 //! - returns a structured [`ExecResult`] the agent can parse.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Max bytes kept per stream. Anything beyond is dropped and the
-/// `*_truncated` flag flips to true.
+/// Max bytes kept in memory per stream. Anything beyond is dropped from
+/// the response (but still written to the log file when one is in use).
 pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
 
 /// Default wall-clock budget for a tool invocation (5 minutes). Callers
@@ -39,6 +43,11 @@ pub struct ExecResult {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Full-output stdout log file (populated when `log_dir` was given).
+    /// Useful when `stdout_truncated` is true — the log has everything.
+    pub stdout_log: Option<String>,
+    /// Full-output stderr log file (populated when `log_dir` was given).
+    pub stderr_log: Option<String>,
 }
 
 pub async fn run(
@@ -46,6 +55,7 @@ pub async fn run(
     args: &[OsString],
     cwd: &Path,
     duration: Duration,
+    log_dir: Option<&Path>,
 ) -> std::io::Result<ExecResult> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
@@ -53,6 +63,8 @@ pub async fn run(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    let (stdout_path, stderr_path) = resolve_log_paths(log_dir, bin)?;
 
     let mut child = cmd.spawn()?;
     let stdout = child
@@ -64,8 +76,11 @@ pub async fn run(
         .take()
         .expect("stderr was piped; .take() must return Some");
 
-    let stdout_task = tokio::spawn(read_capped(stdout, MAX_STREAM_BYTES));
-    let stderr_task = tokio::spawn(read_capped(stderr, MAX_STREAM_BYTES));
+    let stdout_file = open_log(stdout_path.as_deref()).await;
+    let stderr_file = open_log(stderr_path.as_deref()).await;
+
+    let stdout_task = tokio::spawn(read_capped_tee(stdout, MAX_STREAM_BYTES, stdout_file));
+    let stderr_task = tokio::spawn(read_capped_tee(stderr, MAX_STREAM_BYTES, stderr_file));
 
     let (timed_out, status) = match timeout(duration, child.wait()).await {
         Ok(Ok(status)) => (false, Some(status)),
@@ -91,6 +106,8 @@ pub async fn run(
         stderr,
         stdout_truncated,
         stderr_truncated,
+        stdout_log: stdout_path.map(|p| p.display().to_string()),
+        stderr_log: stderr_path.map(|p| p.display().to_string()),
     })
 }
 
@@ -103,7 +120,56 @@ fn format_command(bin: &str, args: &[OsString]) -> String {
     s
 }
 
-async fn read_capped<R>(mut reader: R, cap: usize) -> (String, bool)
+fn resolve_log_paths(
+    log_dir: Option<&Path>,
+    bin: &str,
+) -> std::io::Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let Some(dir) = log_dir else {
+        return Ok((None, None));
+    };
+    std::fs::create_dir_all(dir)?;
+    let prefix = log_prefix(bin);
+    Ok((
+        Some(dir.join(format!("{prefix}.stdout.log"))),
+        Some(dir.join(format!("{prefix}.stderr.log"))),
+    ))
+}
+
+fn log_prefix(bin: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let nanos = now.subsec_nanos();
+    let safe_bin: String = Path::new(bin)
+        .file_name()
+        .map_or_else(|| bin.to_string(), |s| s.to_string_lossy().into_owned())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{secs}_{nanos:09}-{safe_bin}")
+}
+
+async fn open_log(path: Option<&Path>) -> Option<File> {
+    match path {
+        None => None,
+        Some(p) => match File::create(p).await {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "could not open exec log");
+                None
+            }
+        },
+    }
+}
+
+async fn read_capped_tee<R>(mut reader: R, cap: usize, mut tee: Option<File>) -> (String, bool)
 where
     R: AsyncReadExt + Unpin + Send + 'static,
 {
@@ -123,11 +189,21 @@ where
                     }
                 } else {
                     // Keep draining so the child never blocks on a full
-                    // pipe; we just throw the bytes away.
+                    // pipe; we just throw the bytes away from memory —
+                    // the tee keeps them on disk.
                     truncated = true;
+                }
+                if let Some(f) = tee.as_mut() {
+                    if let Err(e) = f.write_all(&chunk[..n]).await {
+                        tracing::warn!(error = %e, "exec log tee failed; closing log");
+                        tee = None;
+                    }
                 }
             }
         }
+    }
+    if let Some(mut f) = tee {
+        let _ = f.flush().await;
     }
     (String::from_utf8_lossy(&buf).to_string(), truncated)
 }
@@ -149,6 +225,7 @@ mod tests {
             &os_args(&["-c", "echo hello && echo world"]),
             tmp.path(),
             Duration::from_secs(5),
+            None,
         )
         .await
         .unwrap();
@@ -157,6 +234,7 @@ mod tests {
         assert_eq!(result.stdout, "hello\nworld\n");
         assert!(result.stderr.is_empty());
         assert!(!result.stdout_truncated);
+        assert!(result.stdout_log.is_none());
     }
 
     #[tokio::test]
@@ -167,6 +245,7 @@ mod tests {
             &os_args(&["-c", "echo oops >&2; exit 7"]),
             tmp.path(),
             Duration::from_secs(5),
+            None,
         )
         .await
         .unwrap();
@@ -183,6 +262,7 @@ mod tests {
             &os_args(&["-c", "sleep 30"]),
             tmp.path(),
             Duration::from_millis(200),
+            None,
         )
         .await
         .unwrap();
@@ -193,12 +273,12 @@ mod tests {
     #[tokio::test]
     async fn stdout_is_truncated_past_cap() {
         let tmp = tempfile::tempdir().unwrap();
-        // Emit ~2 MB of 'a' so we exceed the 1 MB cap.
         let result = run(
             "sh",
             &os_args(&["-c", "yes a | head -c 2097152; printf '\\nend\\n' >&2"]),
             tmp.path(),
             Duration::from_secs(10),
+            None,
         )
         .await
         .unwrap();
@@ -215,9 +295,34 @@ mod tests {
             &[],
             tmp.path(),
             Duration::from_secs(1),
+            None,
         )
         .await
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn log_dir_captures_full_output_even_when_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        let result = run(
+            "sh",
+            &os_args(&["-c", "yes x | head -c 2097152"]),
+            tmp.path(),
+            Duration::from_secs(10),
+            Some(&logs),
+        )
+        .await
+        .unwrap();
+        assert!(result.stdout_truncated);
+        let stdout_log = result.stdout_log.expect("stdout log path");
+        let stderr_log = result.stderr_log.expect("stderr log path");
+        let stdout_bytes = std::fs::metadata(&stdout_log).unwrap().len();
+        // Log has the full 2 MB, not just the 1 MB we held in memory.
+        assert_eq!(stdout_bytes, 2 * 1024 * 1024);
+        // stderr log exists but empty.
+        let stderr_bytes = std::fs::metadata(&stderr_log).unwrap().len();
+        assert_eq!(stderr_bytes, 0);
     }
 }
