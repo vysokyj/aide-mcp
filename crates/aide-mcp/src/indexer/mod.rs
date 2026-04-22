@@ -10,6 +10,8 @@ mod state;
 mod worker;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use aide_core::{AidePaths, ScipConfig};
 use aide_git::resolve_head;
@@ -101,5 +103,11 @@ impl Indexer {
 
     pub async fn last_ready(&self, repo_root: &str) -> Option<CommitInfo> {
         self.store.last_ready(repo_root).await
+    }
+
+    /// Shared handle to the retention counter so the config auto-reloader
+    /// can bump it at runtime.
+    pub fn retention_handle(&self) -> Arc<AtomicUsize> {
+        self.store.retention_handle()
     }
 }

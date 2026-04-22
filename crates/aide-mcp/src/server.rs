@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use rmcp::{
     transport::stdio,
     ServerHandler, ServiceExt,
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::exec;
 use crate::indexer::Indexer;
@@ -418,7 +419,10 @@ const DEFAULT_DAP_SESSION: &str = "default";
 pub struct AideServer {
     registry: Registry,
     paths: AidePaths,
-    config: Arc<Config>,
+    /// Live config — swapped by a background reloader every
+    /// [`CONFIG_RELOAD_INTERVAL`] on mtime change. Tool methods take
+    /// a short read lock when they need a value.
+    config: Arc<RwLock<Config>>,
     pool: Arc<LspPool>,
     indexer: Indexer,
     /// Active DAP sessions keyed by a user-chosen name (default
@@ -433,20 +437,36 @@ pub struct AideServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// How often the background reloader polls `~/.aide/config.toml`.
+const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+
 impl AideServer {
     pub fn new() -> anyhow::Result<Self> {
         let paths = AidePaths::from_home()?;
         let config = Config::load(&paths.config_file())?;
         let indexer = Indexer::start(&paths, &config.scip)?;
+        let config = Arc::new(RwLock::new(config));
+        let config_path = paths.config_file();
+        spawn_config_reloader(config_path, config.clone(), indexer.retention_handle());
         Ok(Self {
             registry: Registry::builtin(),
             paths,
-            config: Arc::new(config),
+            config,
             pool: Arc::new(LspPool::new()),
             indexer,
             dap_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Current exec default timeout (config is live-reloaded).
+    async fn exec_default_timeout(&self) -> u64 {
+        self.config.read().await.exec.default_timeout_secs
+    }
+
+    /// Current DAP wait-for-stopped timeout (config is live-reloaded).
+    async fn dap_stop_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.read().await.dap.stop_timeout_secs)
     }
 
     /// Clone the Arc to the DAP client for `session` (default `"default"`).
@@ -487,10 +507,7 @@ impl AideServer {
         if let Err(e) = op {
             return error_json(e.to_string());
         }
-        match client
-            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
-            .await
-        {
+        match client.wait_for_stopped(self.dap_stop_timeout().await).await {
             Ok(info) => to_json(&info),
             Err(e) => error_json(format!("no stop after step: {e}")),
         }
@@ -951,7 +968,7 @@ impl AideServer {
         argv.extend(args.extra_args.into_iter().map(OsString::from));
         let duration = Duration::from_secs(
             args.timeout_secs
-                .unwrap_or(self.config.exec.default_timeout_secs),
+                .unwrap_or(self.exec_default_timeout().await),
         );
 
         match exec::run(
@@ -984,7 +1001,7 @@ impl AideServer {
         argv.extend(args.extra_args.into_iter().map(OsString::from));
         let duration = Duration::from_secs(
             args.timeout_secs
-                .unwrap_or(self.config.exec.default_timeout_secs),
+                .unwrap_or(self.exec_default_timeout().await),
         );
 
         match exec::run(
@@ -1017,7 +1034,7 @@ impl AideServer {
         argv.extend(args.packages.into_iter().map(OsString::from));
         let duration = Duration::from_secs(
             args.timeout_secs
-                .unwrap_or(self.config.exec.default_timeout_secs),
+                .unwrap_or(self.exec_default_timeout().await),
         );
 
         match exec::run(
@@ -1163,10 +1180,7 @@ impl AideServer {
             return error_json(format!("launch: {e}"));
         }
 
-        let stopped = match client
-            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
-            .await
-        {
+        let stopped = match client.wait_for_stopped(self.dap_stop_timeout().await).await {
             Ok(info) => info,
             Err(e) => {
                 let _ = client.disconnect().await;
@@ -1219,10 +1233,7 @@ impl AideServer {
         if let Err(e) = client.continue_thread(thread_id).await {
             return error_json(e.to_string());
         }
-        match client
-            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
-            .await
-        {
+        match client.wait_for_stopped(self.dap_stop_timeout().await).await {
             Ok(info) => to_json(&info),
             Err(e) => error_json(format!("no stop after continue: {e}")),
         }
@@ -1261,10 +1272,7 @@ impl AideServer {
         if let Err(e) = client.pause(args.thread_id).await {
             return error_json(e.to_string());
         }
-        match client
-            .wait_for_stopped(Duration::from_secs(self.config.dap.stop_timeout_secs))
-            .await
-        {
+        match client.wait_for_stopped(self.dap_stop_timeout().await).await {
             Ok(info) => to_json(&info),
             Err(e) => error_json(format!("no stop after pause: {e}")),
         }
@@ -1381,4 +1389,45 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 fn error_json(message: impl Into<String>) -> String {
     let message = message.into();
     serde_json::json!({ "error": message }).to_string()
+}
+
+/// Background reloader: poll `config_path` every
+/// [`CONFIG_RELOAD_INTERVAL`] and swap the live [`Config`] when the
+/// file's mtime changes. Updates the [`Indexer`] retention atomic
+/// side-by-side so a bumped `scip.retention_ready` takes effect at
+/// the next `mark_ready`.
+fn spawn_config_reloader(
+    path: PathBuf,
+    config: Arc<RwLock<Config>>,
+    retention: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    tokio::spawn(async move {
+        let mut last_mtime = file_mtime(&path);
+        loop {
+            tokio::time::sleep(CONFIG_RELOAD_INTERVAL).await;
+            let current_mtime = file_mtime(&path);
+            if current_mtime == last_mtime {
+                continue;
+            }
+            last_mtime = current_mtime;
+            match Config::load(&path) {
+                Ok(new_cfg) => {
+                    retention.store(new_cfg.scip.retention_ready.max(1), Ordering::Relaxed);
+                    *config.write().await = new_cfg;
+                    tracing::info!(path = %path.display(), "config reloaded");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "config reload failed; keeping previous values"
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn file_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }

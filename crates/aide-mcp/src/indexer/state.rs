@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use aide_proto::{CommitInfo, IndexState};
@@ -70,7 +71,9 @@ impl CommitEntry {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Mutex<StoreInner>>,
-    retention_ready: usize,
+    /// Live retention count — updated at runtime by the config
+    /// auto-reloader, read via `Relaxed` at every `mark_ready` call.
+    retention_ready: Arc<AtomicUsize>,
 }
 
 struct StoreInner {
@@ -79,8 +82,10 @@ struct StoreInner {
 }
 
 impl Store {
-    /// Load state from `path`. `retention_ready` is the number of Ready
-    /// commits to keep per repo — older ones get evicted on `mark_ready`.
+    /// Load state from `path`. `retention_ready` is the initial number
+    /// of Ready commits to keep per repo; callers can mutate it at
+    /// runtime through [`Self::retention_handle`] (the config reloader
+    /// uses this).
     pub fn load(path: impl Into<PathBuf>, retention_ready: usize) -> Result<Self, StateError> {
         let path = path.into();
         let state = if path.exists() {
@@ -91,8 +96,15 @@ impl Store {
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(StoreInner { state, path })),
-            retention_ready: retention_ready.max(1),
+            retention_ready: Arc::new(AtomicUsize::new(retention_ready.max(1))),
         })
+    }
+
+    /// Return a shared handle to the retention counter so an external
+    /// task (typically the config reloader) can update it without a
+    /// full `Store::load`.
+    pub fn retention_handle(&self) -> Arc<AtomicUsize> {
+        self.retention_ready.clone()
     }
 
     /// Record a commit as needing to be indexed. The commit lands in
@@ -177,7 +189,10 @@ impl Store {
                 .collect();
             ready.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
-            for (evict_sha, _) in ready.into_iter().skip(self.retention_ready) {
+            for (evict_sha, _) in ready
+                .into_iter()
+                .skip(self.retention_ready.load(Ordering::Relaxed))
+            {
                 if let Some(entry) = repo.commits.remove(&evict_sha) {
                     if let Some(p) = entry.index_path {
                         evicted.push(PathBuf::from(p));
