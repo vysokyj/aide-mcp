@@ -22,7 +22,13 @@ pub struct AidePaths {
 }
 
 impl AidePaths {
+    /// Resolve the root directory the same way the running server does:
+    /// 1. `$AIDE_HOME` if set (explicit override — primarily for tests).
+    /// 2. Otherwise `$HOME/.aide`.
     pub fn from_home() -> Result<Self, PathsError> {
+        if let Some(override_root) = std::env::var_os("AIDE_HOME") {
+            return Ok(Self::at(override_root));
+        }
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or(PathsError::NoHome)?;

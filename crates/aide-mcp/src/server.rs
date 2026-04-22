@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aide_core::AidePaths;
 use aide_install::{install_tool, InstallOutcome};
-use aide_lang::Registry;
+use aide_lang::{LanguagePlugin, Registry};
+use aide_lsp::{ops as lsp_ops, LspPool};
 use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -61,10 +63,33 @@ pub struct ToolInstallReport {
     pub error: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspPositionArgs {
+    /// Absolute path to the source file.
+    pub file: String,
+    /// 0-indexed line number.
+    pub line: u32,
+    /// 0-indexed UTF-16 column within the line.
+    pub column: u32,
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspFileArgs {
+    /// Absolute path to the source file.
+    pub file: String,
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AideServer {
     registry: Registry,
     paths: AidePaths,
+    pool: Arc<LspPool>,
     #[allow(
         dead_code,
         reason = "field is read via #[tool_handler] macro expansion"
@@ -77,8 +102,17 @@ impl AideServer {
         Ok(Self {
             registry: Registry::builtin(),
             paths: AidePaths::from_home()?,
+            pool: Arc::new(LspPool::new()),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Select a language plugin that claims `root`, together with the path to
+    /// its LSP binary in `~/.aide/bin/`.
+    fn language_for(&self, root: &std::path::Path) -> Option<(Arc<dyn LanguagePlugin>, PathBuf)> {
+        let plugin = self.registry.detect(root).into_iter().next()?;
+        let binary = self.paths.bin().join(plugin.lsp().executable);
+        Some((plugin, binary))
     }
 }
 
@@ -102,7 +136,7 @@ impl AideServer {
             languages,
         };
 
-        serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+        to_json(&result)
     }
 
     #[tool(
@@ -153,7 +187,83 @@ impl AideServer {
             tools: reports,
         };
 
-        serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+        to_json(&result)
+    }
+
+    #[tool(
+        description = "LSP hover: summary of the symbol at (file, line, column). Returns null if no symbol is at that position. Requires project_setup to have installed the language server."
+    )]
+    async fn lsp_hover(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::hover(&client, &file, args.line, args.column).await {
+            Ok(Some(h)) => to_json(&h),
+            Ok(None) => "null".to_string(),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP goto-definition: return the source location(s) where the symbol at (file, line, column) is defined."
+    )]
+    async fn lsp_definition(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::definition(&client, &file, args.line, args.column).await {
+            Ok(hits) => to_json(&hits),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP diagnostics for a single file (errors, warnings). Waits briefly for the server to finish analysing the file, then returns the published diagnostics."
+    )]
+    async fn lsp_diagnostics(&self, Parameters(args): Parameters<LspFileArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::diagnostics(&client, &file, std::time::Duration::from_millis(500)).await {
+            Ok(d) => to_json(&d),
+            Err(e) => error_json(e.to_string()),
+        }
     }
 }
 
@@ -174,4 +284,13 @@ fn resolve_root(path: Option<String>) -> PathBuf {
         Some(p) => PathBuf::from(p),
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|e| error_json(e.to_string()))
+}
+
+fn error_json(message: impl Into<String>) -> String {
+    let message = message.into();
+    serde_json::json!({ "error": message }).to_string()
 }
