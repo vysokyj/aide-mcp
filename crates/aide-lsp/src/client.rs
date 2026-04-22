@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
 
-use crate::framing::{read_message, write_message, FramingError};
+use aide_proto::framing::{read_message, write_message, FramingError};
 
 #[derive(Debug, Error)]
 pub enum LspClientError {

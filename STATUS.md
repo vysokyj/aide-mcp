@@ -32,7 +32,7 @@ decisions, roadmap, current state — is mirrored here.
 | v0.3      | git read tools + indexer | ✅ done — in-process indexer, no daemon |
 | v0.4      | SCIP build + query | ✅ done |
 | v0.5      | exec tools (run/test/install) | ✅ done |
-| v0.6      | DAP proxy (Rust via codelldb first) | ⬜ planned |
+| v0.6      | DAP proxy (Rust via codelldb first) | ✅ done |
 
 ## Workspace layout
 
@@ -41,10 +41,14 @@ crates/
   aide-core/      AidePaths (~/.aide/bin/scip/sock/queue/logs/config.toml), AIDE_HOME override
   aide-install/   ToolSpec, GitHub-release downloader, gzip decode, manifest.json
   aide-lang/      LanguagePlugin trait + Registry; built-ins: RustPlugin, JavaMavenPlugin
-  aide-lsp/       framing, LspClient (spawn takes plugin-supplied args),
-                  LspPool, ops (hover/def/refs/symbols/diagnostics)
+  aide-lsp/       LspClient (spawn takes plugin-supplied args), LspPool,
+                  ops (hover/def/refs/symbols/diagnostics)
+  aide-dap/       DapClient speaking Debug Adapter Protocol over stdio
+                  (initialize, launch, setBreakpoints, continue,
+                  stackTrace, scopes, variables, evaluate, disconnect)
   aide-git/       libgit2-backed status/log/diff/blame + export_commit + resolve_head
-  aide-proto/     Shared schema (IndexState, CommitInfo) for indexer tool responses
+  aide-proto/     Shared primitives: Content-Length framing + indexer
+                  schema (IndexState, CommitInfo)
   aide-scip/      scip protobuf loader + query helpers (documents/symbols/refs)
   aide-mcp/       MCP stdio server exposing every tool via rmcp 1.5. Owns the
                   in-process SCIP indexer (src/indexer/: state + worker) and
@@ -116,6 +120,14 @@ crates/
 | `run_project(path?, extra_args?, timeout_secs?)` | Invoke plugin.runner (e.g. `cargo run`); capture stdout/stderr/exit. |
 | `run_tests(path?, filter?, extra_args?, timeout_secs?)` | Invoke plugin.test_runner (e.g. `cargo test [filter]`). |
 | `install_package(path?, packages, timeout_secs?)` | Invoke plugin.package_manager (e.g. `cargo add <pkg>`). |
+| `dap_launch(path?, program, args?, stop_on_entry?, env?)` | Start a DAP session via plugin.dap (Rust = codelldb). Full initialize → launch → configurationDone handshake; returns initial StoppedInfo. |
+| `dap_set_breakpoints(source, lines)` | Set line breakpoints on `source` for the active session. |
+| `dap_continue(thread_id?)` | Resume the paused thread and wait for next stop. |
+| `dap_stack_trace(thread_id?)` | Current call stack (up to 50 frames). |
+| `dap_scopes(frame_id)` | Scopes for a frame (Locals, Registers, …). |
+| `dap_variables(variables_reference)` | Read variables for a scope / composite variable. |
+| `dap_evaluate(expression, frame_id?)` | Evaluate an expression in the debuggee. |
+| `dap_terminate()` | Disconnect from the adapter. |
 
 Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 `"head-to-index"`.
@@ -141,28 +153,26 @@ Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 
 ## What to build next
 
-**v0.6** — DAP proxy:
+Core roadmap (v0.1 through v0.6) is complete. Remaining ideas, in
+roughly diminishing value:
 
-1. Extend `LanguagePlugin::dap` usage: wire the debug adapter binary
-   download into `project_setup` (for Rust, `codelldb`).
-2. New `aide-dap` crate speaking the Debug Adapter Protocol over stdio
-   to the adapter process — analogous to `aide-lsp`.
-3. MCP tools to launch/attach a debug session, set breakpoints, step,
-   evaluate, read variables. Exact surface TBD — start with the minimal
-   happy path: launch → break → read locals → continue.
-
-Nice-to-have polish (no milestone, add when useful):
-
+- **Step-over/step-in/step-out DAP ops** — `next`, `stepIn`, `stepOut`
+  and `pause` requests. Trivial given the existing wrapper; scoped out
+  of the first DAP cut only to keep the diff small.
 - **Config file (`~/.aide/config.toml`)** — expose retention count,
-  default timeouts, log retention, etc.
+  default timeouts, DAP timeouts, log retention.
+- **Auto-install for codelldb / JDT-LS / scip-java** — the current
+  `ToolSpec` pipeline handles single-binary releases; these three are
+  multi-file tarballs. Extending `aide-install` to unpack
+  `tar.gz` / `zip` archives unlocks all of them.
 - **Gradle flavour of the Java plugin** — sibling `JavaGradlePlugin`
-  that claims `build.gradle(.kts)` and uses `./gradlew` / `gradle`.
-- **Auto-install for JDT-LS + scip-java** — currently Java expects
-  both on `$PATH`; the ToolSpec pipeline needs multi-file tarball
-  support to download JDT-LS directly.
+  claiming `build.gradle(.kts)` and using `./gradlew` / `gradle`.
 - **True streaming exec output via MCP notifications** — log files
   cover post-mortem, but live progress for long builds still requires
   the MCP `notifications/progress` mechanism.
+- **Multi-session DAP** — currently one debug session per MCP server;
+  agents that want to compare two programs side-by-side would need
+  keyed sessions.
 
 ## Build & test
 

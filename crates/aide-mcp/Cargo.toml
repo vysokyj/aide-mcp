@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 aide-core.workspace = true
+aide-dap.workspace = true
 aide-git.workspace = true
 aide-install.workspace = true
 aide-lang.workspace = true

@@ -1,10 +1,10 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use std::ffi::OsString;
 use std::time::Duration;
 
 use aide_core::AidePaths;
+use aide_dap::DapClient;
 use aide_git::diff::DiffMode;
 use aide_install::{install_tool, InstallOutcome};
 use aide_lang::{LanguagePlugin, Registry};
@@ -17,6 +17,7 @@ use rmcp::{
     transport::stdio,
     ServerHandler, ServiceExt,
 };
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::exec::{self, DEFAULT_TIMEOUT_SECS};
 use crate::indexer::Indexer;
@@ -272,12 +273,83 @@ pub struct InstallPackageArgs {
     pub timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapLaunchArgs {
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Absolute path to the debuggee executable (e.g. `target/debug/my_bin`).
+    pub program: String,
+    /// Command-line arguments passed to the debuggee.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Stop on program entry. Defaults to true so the agent can
+    /// inspect state before the debuggee runs.
+    #[serde(default)]
+    pub stop_on_entry: Option<bool>,
+    /// Optional environment overrides passed through to the adapter's
+    /// `env` launch field (shape is adapter-specific).
+    #[serde(default)]
+    pub env: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapSetBreakpointsArgs {
+    /// Absolute path to the source file.
+    pub source: String,
+    /// 1-indexed line numbers for the breakpoints.
+    pub lines: Vec<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapContinueArgs {
+    /// Thread to resume. Defaults to the thread reported by the most
+    /// recent `stopped` event.
+    #[serde(default)]
+    pub thread_id: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapStackTraceArgs {
+    /// Thread to read. Defaults to the thread reported by the most
+    /// recent `stopped` event.
+    #[serde(default)]
+    pub thread_id: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapScopesArgs {
+    pub frame_id: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapVariablesArgs {
+    /// `variablesReference` from a scope or variable returned earlier.
+    pub variables_reference: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapEvaluateArgs {
+    /// Expression in the adapter's native syntax (e.g. gdb/lldb syntax
+    /// for codelldb).
+    pub expression: String,
+    /// Frame to evaluate in. Omit to evaluate in the "global" context.
+    #[serde(default)]
+    pub frame_id: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DapTerminateArgs {}
+
 #[derive(Clone)]
 pub struct AideServer {
     registry: Registry,
     paths: AidePaths,
     pool: Arc<LspPool>,
     indexer: Indexer,
+    /// The currently active DAP session, if any. At most one session is
+    /// supported at a time; consumers guard access with the mutex.
+    dap_session: Arc<AsyncMutex<Option<Arc<DapClient>>>>,
     #[allow(
         dead_code,
         reason = "field is read via #[tool_handler] macro expansion"
@@ -294,8 +366,20 @@ impl AideServer {
             paths,
             pool: Arc::new(LspPool::new()),
             indexer,
+            dap_session: Arc::new(AsyncMutex::new(None)),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Clone the Arc to the active DAP client out of the session slot,
+    /// returning an error JSON string when no session is active.
+    async fn dap_client(&self) -> Result<Arc<DapClient>, String> {
+        self.dap_session
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "no DAP session is active; call dap_launch first".to_string())
     }
 
     /// Select a language plugin that claims `root`, together with the
@@ -824,6 +908,212 @@ impl AideServer {
         {
             Ok(result) => to_json(&result),
             Err(e) => error_json(format!("failed to spawn {}: {e}", pm.executable)),
+        }
+    }
+
+    #[tool(
+        description = "Start a DAP debug session for `program` using the language plugin's debug adapter (Rust = codelldb). Runs the full initialize → launch → configurationDone → first-stop handshake and returns the initial StoppedInfo. Only one session at a time — call dap_terminate to end it."
+    )]
+    async fn dap_launch(&self, Parameters(args): Parameters<DapLaunchArgs>) -> String {
+        let root = resolve_root(args.path);
+        let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+        let Some(dap_spec) = plugin.dap() else {
+            return error_json(format!(
+                "language `{}` does not declare a DAP adapter",
+                plugin.id().as_str()
+            ));
+        };
+
+        let pinned = self.paths.bin().join(dap_spec.executable);
+        let adapter_path: PathBuf = if pinned.exists() {
+            pinned
+        } else {
+            // Fall back to a bare executable name so a system-installed
+            // adapter (e.g. pacman -S lldb) still works without
+            // project_setup having been able to auto-install it.
+            PathBuf::from(dap_spec.executable)
+        };
+
+        let mut session_guard = self.dap_session.lock().await;
+        if session_guard.is_some() {
+            return error_json("a DAP session is already active; call dap_terminate first");
+        }
+
+        let client = match DapClient::spawn(&adapter_path, &[], &root).await {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                return error_json(format!("failed to spawn {}: {e}", adapter_path.display()));
+            }
+        };
+
+        if let Err(e) = client.initialize("aide-mcp").await {
+            let _ = client.disconnect().await;
+            return error_json(format!("initialize: {e}"));
+        }
+
+        let mut launch_args = serde_json::json!({
+            "program": args.program,
+            "args": args.args,
+            "stopOnEntry": args.stop_on_entry.unwrap_or(true),
+            "cwd": root.display().to_string(),
+        });
+        if let Some(env) = args.env {
+            launch_args["env"] = env;
+        }
+
+        let launch_rx = match client.launch_start(launch_args).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let _ = client.disconnect().await;
+                return error_json(format!("launch dispatch: {e}"));
+            }
+        };
+
+        if let Err(e) = client.wait_for_initialized(Duration::from_secs(30)).await {
+            let _ = client.disconnect().await;
+            return error_json(format!("adapter did not signal initialized: {e}"));
+        }
+
+        if let Err(e) = client.configuration_done().await {
+            let _ = client.disconnect().await;
+            return error_json(format!("configurationDone: {e}"));
+        }
+
+        if let Err(e) = client.await_response(launch_rx).await {
+            let _ = client.disconnect().await;
+            return error_json(format!("launch: {e}"));
+        }
+
+        let stopped = match client.wait_for_stopped(Duration::from_mins(1)).await {
+            Ok(info) => info,
+            Err(e) => {
+                let _ = client.disconnect().await;
+                return error_json(format!("no stop after launch: {e}"));
+            }
+        };
+
+        *session_guard = Some(client);
+        to_json(&stopped)
+    }
+
+    #[tool(
+        description = "Set line breakpoints in `source` for the active DAP session. Replaces any previous breakpoints in that file. Returns the adapter's verified-breakpoint list."
+    )]
+    async fn dap_set_breakpoints(
+        &self,
+        Parameters(args): Parameters<DapSetBreakpointsArgs>,
+    ) -> String {
+        let client = match self.dap_client().await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        match client.set_breakpoints(&args.source, &args.lines).await {
+            Ok(v) => to_json(&v),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Resume a paused thread and wait for the next stop. Defaults to the thread reported by the most recent `stopped` event. Returns the new StoppedInfo once the debuggee pauses again (or errors on timeout / program exit)."
+    )]
+    async fn dap_continue(&self, Parameters(args): Parameters<DapContinueArgs>) -> String {
+        let client = match self.dap_client().await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        let thread_id = match args.thread_id {
+            Some(t) => t,
+            None => match client.current_stopped().await.and_then(|s| s.thread_id) {
+                Some(t) => t,
+                None => return error_json("no stopped thread; pass thread_id explicitly"),
+            },
+        };
+        if let Err(e) = client.continue_thread(thread_id).await {
+            return error_json(e.to_string());
+        }
+        match client.wait_for_stopped(Duration::from_mins(1)).await {
+            Ok(info) => to_json(&info),
+            Err(e) => error_json(format!("no stop after continue: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Return the current call stack for `thread_id` (defaults to the last-stopped thread). Up to 50 frames."
+    )]
+    async fn dap_stack_trace(&self, Parameters(args): Parameters<DapStackTraceArgs>) -> String {
+        let client = match self.dap_client().await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        let thread_id = match args.thread_id {
+            Some(t) => t,
+            None => match client.current_stopped().await.and_then(|s| s.thread_id) {
+                Some(t) => t,
+                None => return error_json("no stopped thread"),
+            },
+        };
+        match client.stack_trace(thread_id).await {
+            Ok(frames) => to_json(&frames),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "List scopes (e.g. Locals, Registers) for a stack frame. Use the `variables_reference` returned here with `dap_variables` to read actual values."
+    )]
+    async fn dap_scopes(&self, Parameters(args): Parameters<DapScopesArgs>) -> String {
+        let client = match self.dap_client().await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        match client.scopes(args.frame_id).await {
+            Ok(s) => to_json(&s),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Read variables for a `variables_reference` (from a scope or a structured variable). Useful for expanding composite values."
+    )]
+    async fn dap_variables(&self, Parameters(args): Parameters<DapVariablesArgs>) -> String {
+        let client = match self.dap_client().await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        match client.variables(args.variables_reference).await {
+            Ok(v) => to_json(&v),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Evaluate an expression in the debuggee. When `frame_id` is given, the expression resolves in that frame's scope."
+    )]
+    async fn dap_evaluate(&self, Parameters(args): Parameters<DapEvaluateArgs>) -> String {
+        let client = match self.dap_client().await {
+            Ok(c) => c,
+            Err(e) => return error_json(e),
+        };
+        match client.evaluate(&args.expression, args.frame_id).await {
+            Ok(v) => to_json(&v),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(description = "Disconnect from the DAP adapter and tear down the session.")]
+    async fn dap_terminate(&self, Parameters(_args): Parameters<DapTerminateArgs>) -> String {
+        let mut session = self.dap_session.lock().await;
+        match session.take() {
+            None => to_json(&serde_json::json!({
+                "terminated": false,
+                "reason": "no active session",
+            })),
+            Some(client) => {
+                let _ = client.disconnect().await;
+                to_json(&serde_json::json!({ "terminated": true }))
+            }
         }
     }
 }

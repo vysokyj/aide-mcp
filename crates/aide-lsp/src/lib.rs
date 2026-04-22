@@ -6,7 +6,6 @@
 //! map onto.
 
 pub mod client;
-pub mod framing;
 pub mod ops;
 pub mod pool;
 

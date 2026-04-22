@@ -27,6 +27,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aide-dap"
+version = "0.1.0"
+dependencies = [
+ "aide-proto",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aide-git"
 version = "0.1.0"
 dependencies = [
@@ -69,6 +82,7 @@ dependencies = [
 name = "aide-lsp"
 version = "0.1.0"
 dependencies = [
+ "aide-proto",
  "anyhow",
  "lsp-types",
  "serde",
@@ -85,6 +99,7 @@ name = "aide-mcp"
 version = "0.1.0"
 dependencies = [
  "aide-core",
+ "aide-dap",
  "aide-git",
  "aide-install",
  "aide-lang",
@@ -109,6 +124,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

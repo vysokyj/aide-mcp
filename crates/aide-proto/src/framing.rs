@@ -1,12 +1,11 @@
-//! LSP uses `Content-Length`-framed JSON-RPC over stdio:
+//! `Content-Length`-framed JSON over stdio. Shared by LSP and DAP,
+//! which use identical framing:
 //!
 //! ```text
 //! Content-Length: 42\r\n
 //! \r\n
 //! {"jsonrpc":"2.0", ... 42 bytes ...}
 //! ```
-//!
-//! This module handles the framing — nothing else.
 
 use std::io;
 

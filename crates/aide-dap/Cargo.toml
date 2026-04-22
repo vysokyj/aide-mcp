@@ -1,5 +1,5 @@
 [package]
-name = "aide-lsp"
+name = "aide-dap"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,16 +9,11 @@ repository.workspace = true
 [dependencies]
 aide-proto.workspace = true
 anyhow.workspace = true
-lsp-types.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
-url.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true
