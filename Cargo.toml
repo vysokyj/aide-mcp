@@ -3,10 +3,12 @@ resolver = "2"
 members = [
     "crates/aide-core",
     "crates/aide-git",
+    "crates/aide-indexer",
     "crates/aide-install",
     "crates/aide-lang",
     "crates/aide-lsp",
     "crates/aide-mcp",
+    "crates/aide-proto",
 ]
 
 [workspace.package]
@@ -22,6 +24,7 @@ aide-git = { path = "crates/aide-git" }
 aide-install = { path = "crates/aide-install" }
 aide-lang = { path = "crates/aide-lang" }
 aide-lsp = { path = "crates/aide-lsp" }
+aide-proto = { path = "crates/aide-proto" }
 
 anyhow = "1"
 flate2 = "1"

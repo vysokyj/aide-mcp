@@ -1,5 +1,5 @@
 [package]
-name = "aide-mcp"
+name = "aide-indexer"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,20 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "aide-mcp"
+name = "aide-indexer"
 path = "src/main.rs"
 
 [dependencies]
 aide-core.workspace = true
-aide-git.workspace = true
-aide-install.workspace = true
-aide-lang.workspace = true
-aide-lsp.workspace = true
 aide-proto.workspace = true
-
 anyhow.workspace = true
-rmcp = { workspace = true }
-schemars.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true

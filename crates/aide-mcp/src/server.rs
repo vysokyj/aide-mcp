@@ -6,7 +6,11 @@ use aide_git::diff::DiffMode;
 use aide_install::{install_tool, InstallOutcome};
 use aide_lang::{LanguagePlugin, Registry};
 use aide_lsp::{ops as lsp_ops, LspPool};
+use aide_proto::{default_indexer_socket, Request, Response};
 use anyhow::Result;
+
+use crate::hook::{install_post_commit_hook, HookInstallOutcome};
+use crate::indexer;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
@@ -53,6 +57,7 @@ pub struct ProjectSetupResult {
     pub root: String,
     pub languages: Vec<String>,
     pub tools: Vec<ToolInstallReport>,
+    pub post_commit_hook: PostCommitHookReport,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -60,6 +65,15 @@ pub struct ToolInstallReport {
     pub name: String,
     pub version: String,
     pub status: &'static str,
+    pub path: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct PostCommitHookReport {
+    /// One of: `installed`, `already-installed`, `skipped-no-hooks-dir`,
+    /// `skipped-foreign-hook`, `error`.
+    pub status: String,
     pub path: Option<String>,
     pub error: Option<String>,
 }
@@ -158,6 +172,24 @@ pub struct GitBlameArgs {
     pub file: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct IndexStatusArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Commit SHA to query. If omitted, the daemon returns the state of
+    /// the most recently enqueued commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct WorkLastKnownStateArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AideServer {
     registry: Registry,
@@ -254,10 +286,24 @@ impl AideServer {
             }
         }
 
+        let post_commit_hook = match install_post_commit_hook(&root) {
+            Ok(HookInstallOutcome { status, path }) => PostCommitHookReport {
+                status: status.to_string(),
+                path: path.map(|p| p.display().to_string()),
+                error: None,
+            },
+            Err(e) => PostCommitHookReport {
+                status: "error".to_string(),
+                path: None,
+                error: Some(e.to_string()),
+            },
+        };
+
         let result = ProjectSetupResult {
             root: root.display().to_string(),
             languages,
             tools: reports,
+            post_commit_hook,
         };
 
         to_json(&result)
@@ -475,6 +521,64 @@ impl AideServer {
         let file = PathBuf::from(&args.file);
         match aide_git::blame::blame(&root, &file) {
             Ok(lines) => to_json(&lines),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Ask aide-indexer for the state of a commit (the last enqueued one by default). Returns null when the daemon has never heard of this repo."
+    )]
+    async fn index_status(&self, Parameters(args): Parameters<IndexStatusArgs>) -> String {
+        let root = resolve_root(args.path);
+        let socket = default_indexer_socket(&self.paths);
+        let request = Request::IndexStatus {
+            repo_root: root.display().to_string(),
+            sha: args.sha,
+        };
+        match indexer::send(&socket, &request).await {
+            Ok(Response::IndexStatus {
+                repo_root,
+                sha,
+                state,
+                enqueued_at_unix,
+                indexed_at_unix,
+            }) => to_json(&serde_json::json!({
+                "repo_root": repo_root,
+                "sha": sha,
+                "state": state,
+                "enqueued_at_unix": enqueued_at_unix,
+                "indexed_at_unix": indexed_at_unix,
+            })),
+            Ok(Response::NoCommit { repo_root }) => to_json(&serde_json::json!({
+                "repo_root": repo_root,
+                "sha": null,
+                "state": null,
+            })),
+            Ok(Response::Error { message }) => error_json(message),
+            Ok(other) => error_json(format!("unexpected daemon response: {other:?}")),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Last commit the aide-indexer daemon knows about for this repo. Use this to recover an agent's last stable view of 'completed work' across sessions."
+    )]
+    async fn work_last_known_state(
+        &self,
+        Parameters(args): Parameters<WorkLastKnownStateArgs>,
+    ) -> String {
+        let root = resolve_root(args.path);
+        let socket = default_indexer_socket(&self.paths);
+        let request = Request::LastKnownState {
+            repo_root: root.display().to_string(),
+        };
+        match indexer::send(&socket, &request).await {
+            Ok(Response::LastKnownState { repo_root, commit }) => to_json(&serde_json::json!({
+                "repo_root": repo_root,
+                "commit": commit,
+            })),
+            Ok(Response::Error { message }) => error_json(message),
+            Ok(other) => error_json(format!("unexpected daemon response: {other:?}")),
             Err(e) => error_json(e.to_string()),
         }
     }

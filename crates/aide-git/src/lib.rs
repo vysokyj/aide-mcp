@@ -8,7 +8,7 @@ pub mod diff;
 pub mod log;
 pub mod status;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -16,6 +16,8 @@ use thiserror::Error;
 pub enum GitError {
     #[error("no git repository at {0}")]
     NotARepo(String),
+    #[error("HEAD does not point at a commit (unborn branch?)")]
+    NoHead,
     #[error("git2: {0}")]
     Git2(#[from] git2::Error),
     #[error("decode error: {0}")]
@@ -30,4 +32,23 @@ pub(crate) fn open_repo(root: &Path) -> Result<git2::Repository, GitError> {
             GitError::Git2(e)
         }
     })
+}
+
+/// Resolve the repository working-directory root (the dir containing `.git/`)
+/// and the current `HEAD` commit SHA for the repo that `path` lives inside.
+pub fn resolve_head(path: &Path) -> Result<(PathBuf, String), GitError> {
+    let repo = open_repo(path)?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| GitError::NotARepo(path.display().to_string()))?
+        .to_path_buf();
+    let head = repo.head().map_err(|e| {
+        if e.code() == git2::ErrorCode::UnbornBranch || e.code() == git2::ErrorCode::NotFound {
+            GitError::NoHead
+        } else {
+            GitError::Git2(e)
+        }
+    })?;
+    let oid = head.target().ok_or(GitError::NoHead)?;
+    Ok((workdir, oid.to_string()))
 }
