@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aide_core::AidePaths;
+use aide_git::diff::DiffMode;
 use aide_install::{install_tool, InstallOutcome};
 use aide_lang::{LanguagePlugin, Registry};
 use aide_lsp::{ops as lsp_ops, LspPool};
@@ -112,6 +113,49 @@ pub struct LspWorkspaceSymbolsArgs {
     /// Project root. If omitted, falls back to the server cwd.
     #[serde(default)]
     pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GitPathArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GitLogArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Maximum number of commits to return. Default 20.
+    #[serde(default = "default_log_limit")]
+    pub limit: usize,
+}
+
+fn default_log_limit() -> usize {
+    20
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GitDiffArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Which diff to produce. One of: "head-to-worktree" (default), "index-to-worktree", "head-to-index".
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Optional path spec to limit the diff (e.g. "src/foo.rs").
+    #[serde(default)]
+    pub pathspec: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GitBlameArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Path to the file to blame (absolute, or relative to the repo root).
+    pub file: String,
 }
 
 #[derive(Clone)]
@@ -376,6 +420,61 @@ impl AideServer {
 
         match lsp_ops::workspace_symbols(&client, &args.query).await {
             Ok(hits) => to_json(&hits),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "git status: branch, upstream divergence, and per-file working-tree + index state."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn git_status(&self, Parameters(args): Parameters<GitPathArgs>) -> String {
+        let root = resolve_root(args.path);
+        match aide_git::status::status(&root) {
+            Ok(s) => to_json(&s),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "git log: recent commits reachable from HEAD. Returns sha, author, summary, time; newest first."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn git_log(&self, Parameters(args): Parameters<GitLogArgs>) -> String {
+        let root = resolve_root(args.path);
+        match aide_git::log::log(&root, args.limit) {
+            Ok(entries) => to_json(&entries),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "git diff: unified diff patch plus stats (files changed, insertions, deletions). Selects HEAD vs worktree by default."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn git_diff(&self, Parameters(args): Parameters<GitDiffArgs>) -> String {
+        let root = resolve_root(args.path);
+        let mode = match args.mode.as_deref() {
+            Some("index-to-worktree") => DiffMode::IndexToWorktree,
+            Some("head-to-index") => DiffMode::HeadToIndex,
+            None | Some("head-to-worktree") => DiffMode::HeadToWorktree,
+            Some(other) => return error_json(format!("unknown diff mode: {other}")),
+        };
+        match aide_git::diff::diff(&root, mode, args.pathspec.as_deref()) {
+            Ok(d) => to_json(&d),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "git blame: per-line authorship for a single file. Each entry gives the commit, author, time, and summary introducing that line."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn git_blame(&self, Parameters(args): Parameters<GitBlameArgs>) -> String {
+        let root = resolve_root(args.path);
+        let file = PathBuf::from(&args.file);
+        match aide_git::blame::blame(&root, &file) {
+            Ok(lines) => to_json(&lines),
             Err(e) => error_json(e.to_string()),
         }
     }
