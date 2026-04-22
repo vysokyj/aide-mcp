@@ -1,10 +1,13 @@
-//! Git read operations for aide-mcp, backed by libgit2 via the `git2` crate.
+//! Git operations for aide-mcp, backed by libgit2 via the `git2` crate.
 //!
-//! All operations are read-only and synchronous — they open the repository
-//! at the given root, compute the answer, and close.
+//! Most operations are read-only: open the repo at `root`, compute the
+//! answer, close. The one mutation-like helper is [`export::export_commit`],
+//! which materialises a commit's tree into a destination dir without
+//! touching the source repo's workdir or index.
 
 pub mod blame;
 pub mod diff;
+pub mod export;
 pub mod log;
 pub mod status;
 
@@ -18,6 +21,8 @@ pub enum GitError {
     NotARepo(String),
     #[error("HEAD does not point at a commit (unborn branch?)")]
     NoHead,
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("git2: {0}")]
     Git2(#[from] git2::Error),
     #[error("decode error: {0}")]

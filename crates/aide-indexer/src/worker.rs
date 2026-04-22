@@ -4,13 +4,20 @@
 //! The server handler pushes jobs in; the worker pops them, runs the
 //! configured SCIP indexer for the language, and writes the resulting
 //! index under `~/.aide/scip/<repo-id>/<sha>.scip`.
+//!
+//! Each job exports the commit's tree to a fresh temp dir via
+//! [`aide_git::export::export_commit`] and runs the indexer there, so
+//! the SCIP output reflects the commit exactly — never the dirty
+//! working tree of the source repo.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aide_core::AidePaths;
-use aide_lang::Registry;
+use aide_git::export::export_commit;
+use aide_lang::{LanguagePlugin, Registry};
+use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -96,8 +103,27 @@ async fn build_index(
         std::fs::create_dir_all(parent).map_err(IndexError::Io)?;
     }
 
-    let args: Vec<OsString> = plugin.scip_args(repo_path, output);
-    let output_res = Command::new(&bin)
+    // Materialise the commit into a throwaway dir so the SCIP output
+    // reflects the committed state, not the source repo's working tree.
+    let snapshot = TempDir::new().map_err(IndexError::Io)?;
+    let snapshot_path = snapshot.path();
+    export_commit(repo_path, &job.sha, snapshot_path).map_err(IndexError::Export)?;
+
+    run_indexer(plugin.as_ref(), &bin, snapshot_path, output).await?;
+
+    // Snapshot is dropped here, removing the temp tree.
+    drop(snapshot);
+    Ok(())
+}
+
+async fn run_indexer(
+    plugin: &dyn LanguagePlugin,
+    bin: &Path,
+    workdir: &Path,
+    output: &Path,
+) -> Result<(), IndexError> {
+    let args: Vec<OsString> = plugin.scip_args(workdir, output);
+    let output_res = Command::new(bin)
         .args(&args)
         .output()
         .await
@@ -150,6 +176,8 @@ enum IndexError {
     BinaryMissing { name: String, path: PathBuf },
     #[error("I/O error: {0}")]
     Io(std::io::Error),
+    #[error("exporting commit to snapshot dir failed: {0}")]
+    Export(aide_git::GitError),
     #[error("indexer exited with status {status:?}: {stderr}")]
     IndexerFailed { status: Option<i32>, stderr: String },
     #[error("indexer reported success but did not write {expected}", expected = expected.display())]

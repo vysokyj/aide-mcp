@@ -12,11 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 aide-core.workspace = true
+aide-git.workspace = true
 aide-lang.workspace = true
 aide-proto.workspace = true
 anyhow.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
