@@ -108,6 +108,7 @@ fn rust_analyzer_spec() -> ToolSpec {
             tag: RUST_ANALYZER_TAG.to_string(),
             assets,
         },
+        custom_install: None,
     }
 }
 
@@ -153,6 +154,7 @@ fn codelldb_spec() -> ToolSpec {
             tag: CODELLDB_TAG.to_string(),
             assets,
         },
+        custom_install: None,
     }
 }
 

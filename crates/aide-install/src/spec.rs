@@ -1,4 +1,14 @@
 use std::fmt;
+use std::path::Path;
+
+use crate::install::InstallError;
+
+/// Post-extract hook for tools that can't be reduced to "extract one
+/// archive, symlink one file" — typically because they need a
+/// generated shell wrapper (JDT-LS, scip-java, …). Receives the
+/// extract dir and the target install path; returns an error string
+/// on failure.
+pub type CustomInstallFn = fn(&Path, &Path) -> Result<(), InstallError>;
 
 /// A declarative description of a tool we can install. Produced by language
 /// plugins, consumed by [`crate::install_tool`].
@@ -12,6 +22,10 @@ pub struct ToolSpec {
     pub executable: String,
     /// Where and how to fetch the binary.
     pub source: Source,
+    /// Replaces the default "symlink `entry_path`" step after extract
+    /// for `TarGz` / `Zip` archives. When `Some`, the fn is responsible
+    /// for making `install_path` point at a runnable executable.
+    pub custom_install: Option<CustomInstallFn>,
 }
 
 impl fmt::Display for ToolSpec {
@@ -32,13 +46,30 @@ pub enum Source {
         /// One entry per supported target triple.
         assets: Vec<TargetAsset>,
     },
+    /// Direct HTTPS URL — used for non-GitHub hosts (Eclipse, CDN, …).
+    /// The `label` is a human-readable identifier for logs; it does
+    /// not affect resolution.
+    DirectUrl {
+        label: String,
+        assets: Vec<DirectAsset>,
+    },
 }
 
-/// A single downloadable asset for one target triple.
+/// A single downloadable asset for one target triple (or `"any"` for
+/// language-runtime artefacts that don't depend on OS/arch).
 #[derive(Debug, Clone)]
 pub struct TargetAsset {
     pub triple: &'static str,
     pub filename: String,
+    pub archive: ArchiveFormat,
+}
+
+/// Like [`TargetAsset`] but carries a full URL instead of a filename
+/// that gets appended to a GitHub release base.
+#[derive(Debug, Clone)]
+pub struct DirectAsset {
+    pub triple: &'static str,
+    pub url: String,
     pub archive: ArchiveFormat,
 }
 

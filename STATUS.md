@@ -41,8 +41,9 @@ crates/
   aide-core/      AidePaths (~/.aide/bin/scip/sock/queue/logs/config.toml),
                   AIDE_HOME override, Config (TOML) for scip/exec/dap
                   tunables
-  aide-install/   ToolSpec, GitHub-release downloader, gzip/tar.gz/zip
-                  extract, manifest.json
+  aide-install/   ToolSpec, GitHub-release + DirectUrl downloader,
+                  gzip/tar.gz/zip extract, post-extract `custom_install`
+                  hook, manifest.json
   aide-lang/      LanguagePlugin trait + Registry; built-ins: RustPlugin,
                   JavaMavenPlugin, JavaGradlePlugin
   aide-lsp/       LspClient (spawn takes plugin-supplied args), LspPool,
@@ -63,12 +64,13 @@ crates/
 
 1. **SDK** = `rmcp` 1.5 (official Anthropic Rust MCP SDK, Tier 2 stable).
 2. **Transport** = stdio only.
-3. **Languages** = Rust (dogfood) + Java (Maven). Added via the
-   `LanguagePlugin` trait; each declares its LSP / SCIP / DAP / package
-   manager / runner, plus the full command line for its SCIP indexer
-   (`scip_args`) and optional LSP launch flags (`lsp_spawn_args`).
-   Java's jdtls and scip-java are expected on `$PATH` (system install);
-   only Rust uses the auto-download pipeline today.
+3. **Languages** = Rust (dogfood) + Java (Maven and Gradle). Added
+   via the `LanguagePlugin` trait; each declares its LSP / SCIP / DAP
+   / package manager / runner, plus the full command line for its
+   SCIP indexer (`scip_args`) and optional LSP launch flags
+   (`lsp_spawn_args`). Rust auto-installs rust-analyzer + codelldb.
+   Java auto-installs JDT-LS from the Eclipse snapshot tarball via a
+   generated wrapper script. scip-java still expects a system install.
 4. **Execution model** = MCP tools operate directly against the user's
    working tree. SCIP is built against a commit snapshot exported to a
    TempDir — never against the dirty working tree.
@@ -98,6 +100,20 @@ crates/
     `~/.aide/logs/<ts>-<bin>.{stdout,stderr}.log`. The JSON response
     still caps each stream at 1 MB in memory; the log files hold the
     complete output for post-mortem when `*_truncated` is true.
+13. **Config is hot-reloaded**: the MCP server polls
+    `~/.aide/config.toml` every 5 s and swaps the live values in
+    place. Editing the file does not require restarting MCP.
+14. **Exec tools emit MCP progress notifications** when the client
+    attaches a `progressToken`: one heartbeat per second for the
+    duration of a `run_project` / `run_tests` / `install_package`
+    call. Clients can pair this with `read_exec_log` for
+    tail-and-progress UX.
+15. **Multi-file tool installs** extend `aide-install` via
+    `ArchiveFormat::TarGz` / `Zip` (extract under `~/.aide/bin/<name>-
+    <version>/` and symlink the entry) plus an optional
+    `custom_install: fn(&Path, &Path) -> Result<(), InstallError>`
+    hook that replaces the default symlink step. Used by JDT-LS to
+    generate a `java -jar …` wrapper script at install time.
 
 ## Tools implemented
 
@@ -162,21 +178,19 @@ Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 
 ## What to build next
 
-Core roadmap (v0.1 through v0.6) and the first polish round are
-complete. Remaining open ideas:
+Core roadmap (v0.1 through v0.6) plus two polish rounds are complete.
+Remaining open ideas:
 
-- **JDT-LS auto-install** — needs a wrapper script to launch the
-  Eclipse JDT server under a JRE with the correct classpath. Tricky
-  enough to defer until a concrete agent needs LSP on Java.
-- **scip-java auto-install** — Sourcegraph distributes via coursier
-  rather than a standalone tarball. Needs a bootstrap step to drop
-  a launcher.
-- **True streaming exec output via MCP notifications** — `read_exec_log`
-  already covers polling; live `notifications/progress` would avoid
-  the polling round-trip.
-- **Config auto-reload** — Config is loaded once at MCP startup;
-  restart to pick up changes. Watching the file would spare the
-  restart.
+- **scip-java auto-install** — Sourcegraph distributes via coursier,
+  not a standalone tarball. Would need either a coursier bootstrap
+  step or wrapping the `scip-java_2.13-*-assembly.jar` release with
+  a generated `java -jar` launcher. Not blocking in practice: users
+  run `pacman -S scip-java` / `brew install scip-java` today.
+- **Multi-session LSP** — one `LspPool` per workspace today is fine;
+  multi-client MCP setups might later want explicit pool keys.
+- **`install_tool` progress notifications** — currently only the
+  `run_*` / `install_package` tools emit MCP progress. Downloading a
+  multi-hundred-MB tarball during `project_setup` is silent right now.
 
 ## Build & test
 

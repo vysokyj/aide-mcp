@@ -6,7 +6,7 @@ use flate2::read::GzDecoder;
 use thiserror::Error;
 
 use crate::manifest::{InstalledRecord, Manifest, ManifestError};
-use crate::spec::{ArchiveFormat, Source, TargetAsset, ToolSpec};
+use crate::spec::{ArchiveFormat, Source, ToolSpec};
 use crate::target::{current_triple, TargetTripleError};
 
 #[derive(Debug, Error)]
@@ -30,6 +30,8 @@ pub enum InstallError {
     Decode(String),
     #[error("archive extracted but expected entry `{entry}` not found under {dir}")]
     MissingEntry { entry: String, dir: PathBuf },
+    #[error("custom install failed: {0}")]
+    Custom(String),
 }
 
 /// Result of an install attempt.
@@ -81,25 +83,24 @@ pub async fn install_tool(
     }
 
     let triple = current_triple()?;
-    let asset = pick_asset(spec, triple)?;
-    let url = build_url(&spec.source, &asset.filename);
-    tracing::info!(tool = %spec, url = %url, "downloading");
-    let bytes = http_get(&url).await?;
+    let resolved = resolve_asset(spec, triple)?;
+    tracing::info!(tool = %spec, url = %resolved.url, "downloading");
+    let bytes = http_get(&resolved.url).await?;
 
-    match asset.archive {
+    match resolved.archive {
         ArchiveFormat::Raw | ArchiveFormat::Gzip => {
-            let binary = decode_single(&bytes, &asset.archive)?;
+            let binary = decode_single(&bytes, &resolved.archive)?;
             write_executable(&install_path, &binary)?;
         }
         ArchiveFormat::TarGz { entry_path } => {
             let extract_dir = bin_dir.join(format!("{}-{}", spec.name, spec.version));
             extract_tar_gz(&bytes, &extract_dir)?;
-            link_entry(&extract_dir, entry_path, &install_path)?;
+            finalise_archive(spec, &extract_dir, entry_path, &install_path)?;
         }
         ArchiveFormat::Zip { entry_path } => {
             let extract_dir = bin_dir.join(format!("{}-{}", spec.name, spec.version));
             extract_zip(&bytes, &extract_dir)?;
-            link_entry(&extract_dir, entry_path, &install_path)?;
+            finalise_archive(spec, &extract_dir, entry_path, &install_path)?;
         }
     }
 
@@ -115,26 +116,59 @@ pub async fn install_tool(
     })
 }
 
-fn pick_asset<'a>(
-    spec: &'a ToolSpec,
-    triple: &'static str,
-) -> Result<&'a TargetAsset, InstallError> {
+struct ResolvedAsset {
+    url: String,
+    archive: ArchiveFormat,
+}
+
+fn resolve_asset(spec: &ToolSpec, triple: &'static str) -> Result<ResolvedAsset, InstallError> {
     match &spec.source {
-        Source::GithubRelease { assets, .. } => assets
-            .iter()
-            .find(|a| a.triple == triple)
-            .ok_or_else(|| InstallError::NoAssetForTriple {
-                tool: spec.name.clone(),
-                triple,
-            }),
+        Source::GithubRelease { repo, tag, assets } => {
+            let asset = assets
+                .iter()
+                .find(|a| a.triple == triple)
+                .or_else(|| assets.iter().find(|a| a.triple == "any"))
+                .ok_or_else(|| InstallError::NoAssetForTriple {
+                    tool: spec.name.clone(),
+                    triple,
+                })?;
+            Ok(ResolvedAsset {
+                url: format!(
+                    "https://github.com/{repo}/releases/download/{tag}/{}",
+                    asset.filename
+                ),
+                archive: asset.archive.clone(),
+            })
+        }
+        Source::DirectUrl { assets, .. } => {
+            let asset = assets
+                .iter()
+                .find(|a| a.triple == triple)
+                .or_else(|| assets.iter().find(|a| a.triple == "any"))
+                .ok_or_else(|| InstallError::NoAssetForTriple {
+                    tool: spec.name.clone(),
+                    triple,
+                })?;
+            Ok(ResolvedAsset {
+                url: asset.url.clone(),
+                archive: asset.archive.clone(),
+            })
+        }
     }
 }
 
-fn build_url(source: &Source, filename: &str) -> String {
-    match source {
-        Source::GithubRelease { repo, tag, .. } => {
-            format!("https://github.com/{repo}/releases/download/{tag}/{filename}")
-        }
+/// After an archive has been extracted, either call the plugin's
+/// `custom_install` hook or fall back to linking `entry_path`.
+fn finalise_archive(
+    spec: &ToolSpec,
+    extract_dir: &Path,
+    entry_path: &str,
+    install_path: &Path,
+) -> Result<(), InstallError> {
+    if let Some(custom) = spec.custom_install {
+        custom(extract_dir, install_path)
+    } else {
+        link_entry(extract_dir, entry_path, install_path)
     }
 }
 

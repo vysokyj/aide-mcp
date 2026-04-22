@@ -10,5 +10,5 @@ pub mod target;
 
 pub use install::{install_tool, InstallError, InstallOutcome};
 pub use manifest::{InstalledRecord, Manifest};
-pub use spec::{ArchiveFormat, Source, TargetAsset, ToolSpec};
+pub use spec::{ArchiveFormat, CustomInstallFn, DirectAsset, Source, TargetAsset, ToolSpec};
 pub use target::{current_triple, TargetTripleError};
