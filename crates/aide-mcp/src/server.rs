@@ -15,13 +15,15 @@ use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
     transport::stdio,
-    ServerHandler, ServiceExt,
+    RoleServer, ServerHandler, ServiceExt,
 };
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-use crate::exec;
+use crate::exec::{self, Progress};
 use crate::indexer::Indexer;
 
 pub async fn run() -> Result<()> {
@@ -467,6 +469,17 @@ impl AideServer {
     /// Current DAP wait-for-stopped timeout (config is live-reloaded).
     async fn dap_stop_timeout(&self) -> Duration {
         Duration::from_secs(self.config.read().await.dap.stop_timeout_secs)
+    }
+
+    /// Build a [`Progress`] if the MCP client attached a `progressToken`
+    /// to the request meta. No token → no heartbeat.
+    fn progress_for(&self, ctx: &RequestContext<RoleServer>, label: &str) -> Option<Progress> {
+        let _ = self;
+        ctx.meta.get_progress_token().map(|token| Progress {
+            token,
+            peer: ctx.peer.clone(),
+            label: label.to_string(),
+        })
     }
 
     /// Clone the Arc to the DAP client for `session` (default `"default"`).
@@ -958,7 +971,11 @@ impl AideServer {
     #[tool(
         description = "Run the project via the language plugin's runner (e.g. `cargo run`) and return the full stdout + stderr. Captures up to 1 MB per stream. Default timeout 300s; override with timeout_secs."
     )]
-    async fn run_project(&self, Parameters(args): Parameters<RunProjectArgs>) -> String {
+    async fn run_project(
+        &self,
+        Parameters(args): Parameters<RunProjectArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
         let root = resolve_root(args.path);
         let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
             return error_json(format!("no language plugin claims root {}", root.display()));
@@ -970,6 +987,7 @@ impl AideServer {
             args.timeout_secs
                 .unwrap_or(self.exec_default_timeout().await),
         );
+        let progress = self.progress_for(&ctx, runner.executable);
 
         match exec::run(
             runner.executable,
@@ -977,6 +995,7 @@ impl AideServer {
             &root,
             duration,
             Some(&self.paths.logs()),
+            progress,
         )
         .await
         {
@@ -988,7 +1007,11 @@ impl AideServer {
     #[tool(
         description = "Run the project's tests via the language plugin's test_runner (e.g. `cargo test [filter]`). Captures stdout/stderr and exit code. Default timeout 300s."
     )]
-    async fn run_tests(&self, Parameters(args): Parameters<RunTestsArgs>) -> String {
+    async fn run_tests(
+        &self,
+        Parameters(args): Parameters<RunTestsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
         let root = resolve_root(args.path);
         let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
             return error_json(format!("no language plugin claims root {}", root.display()));
@@ -1003,6 +1026,7 @@ impl AideServer {
             args.timeout_secs
                 .unwrap_or(self.exec_default_timeout().await),
         );
+        let progress = self.progress_for(&ctx, runner.executable);
 
         match exec::run(
             runner.executable,
@@ -1010,6 +1034,7 @@ impl AideServer {
             &root,
             duration,
             Some(&self.paths.logs()),
+            progress,
         )
         .await
         {
@@ -1021,7 +1046,11 @@ impl AideServer {
     #[tool(
         description = "Install packages via the language plugin's package manager (e.g. `cargo add <pkg>`). Each string in `packages` becomes a positional argument after the install subcommand."
     )]
-    async fn install_package(&self, Parameters(args): Parameters<InstallPackageArgs>) -> String {
+    async fn install_package(
+        &self,
+        Parameters(args): Parameters<InstallPackageArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
         let root = resolve_root(args.path);
         let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
             return error_json(format!("no language plugin claims root {}", root.display()));
@@ -1036,6 +1065,7 @@ impl AideServer {
             args.timeout_secs
                 .unwrap_or(self.exec_default_timeout().await),
         );
+        let progress = self.progress_for(&ctx, pm.executable);
 
         match exec::run(
             pm.executable,
@@ -1043,6 +1073,7 @@ impl AideServer {
             &root,
             duration,
             Some(&self.paths.logs()),
+            progress,
         )
         .await
         {

@@ -14,17 +14,36 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rmcp::model::{ProgressNotificationParam, ProgressToken};
+use rmcp::{Peer, RoleServer};
 use serde::Serialize;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 /// Max bytes kept in memory per stream. Anything beyond is dropped from
 /// the response (but still written to the log file when one is in use).
 pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
+
+/// Per-second heartbeat for MCP `notifications/progress` so the client
+/// knows a long-running `cargo test` / `mvn test` is still alive.
+const PROGRESS_TICK: Duration = Duration::from_secs(1);
+
+/// Optional side channel for emitting MCP progress notifications while
+/// a command runs. Callers build this from the `progressToken` on the
+/// tool-call meta and the server-side [`Peer`]; no token = `None` =
+/// no heartbeat.
+#[derive(Clone)]
+pub struct Progress {
+    pub token: ProgressToken,
+    pub peer: Peer<RoleServer>,
+    /// Human-readable bin name surfaced in each notification's message.
+    pub label: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecResult {
@@ -52,6 +71,7 @@ pub async fn run(
     cwd: &Path,
     duration: Duration,
     log_dir: Option<&Path>,
+    progress: Option<Progress>,
 ) -> std::io::Result<ExecResult> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
@@ -78,15 +98,26 @@ pub async fn run(
     let stdout_task = tokio::spawn(read_capped_tee(stdout, MAX_STREAM_BYTES, stdout_file));
     let stderr_task = tokio::spawn(read_capped_tee(stderr, MAX_STREAM_BYTES, stderr_file));
 
+    let heartbeat = progress.map(spawn_progress_heartbeat);
+
     let (timed_out, status) = match timeout(duration, child.wait()).await {
         Ok(Ok(status)) => (false, Some(status)),
-        Ok(Err(e)) => return Err(e),
+        Ok(Err(e)) => {
+            if let Some(h) = heartbeat {
+                h.abort();
+            }
+            return Err(e);
+        }
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
             (true, None)
         }
     };
+
+    if let Some(h) = heartbeat {
+        h.abort();
+    }
 
     let (stdout, stdout_truncated) = stdout_task.await.unwrap_or_else(|_| (String::new(), false));
     let (stderr, stderr_truncated) = stderr_task.await.unwrap_or_else(|_| (String::new(), false));
@@ -104,6 +135,28 @@ pub async fn run(
         stderr_truncated,
         stdout_log: stdout_path.map(|p| p.display().to_string()),
         stderr_log: stderr_path.map(|p| p.display().to_string()),
+    })
+}
+
+fn spawn_progress_heartbeat(progress: Progress) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let start = Instant::now();
+        let mut tick: f64 = 0.0;
+        loop {
+            tokio::time::sleep(PROGRESS_TICK).await;
+            tick += 1.0;
+            let elapsed = start.elapsed().as_secs();
+            let message = format!("{} running: {elapsed}s", progress.label);
+            let _ = progress
+                .peer
+                .notify_progress(ProgressNotificationParam {
+                    progress_token: progress.token.clone(),
+                    progress: tick,
+                    total: None,
+                    message: Some(message),
+                })
+                .await;
+        }
     })
 }
 
@@ -222,6 +275,7 @@ mod tests {
             tmp.path(),
             Duration::from_secs(5),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -242,6 +296,7 @@ mod tests {
             tmp.path(),
             Duration::from_secs(5),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -259,6 +314,7 @@ mod tests {
             tmp.path(),
             Duration::from_millis(200),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -274,6 +330,7 @@ mod tests {
             &os_args(&["-c", "yes a | head -c 2097152; printf '\\nend\\n' >&2"]),
             tmp.path(),
             Duration::from_secs(10),
+            None,
             None,
         )
         .await
@@ -292,6 +349,7 @@ mod tests {
             tmp.path(),
             Duration::from_secs(1),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -308,6 +366,7 @@ mod tests {
             tmp.path(),
             Duration::from_secs(10),
             Some(&logs),
+            None,
         )
         .await
         .unwrap();
