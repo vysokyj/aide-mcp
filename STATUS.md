@@ -30,8 +30,8 @@ decisions, roadmap, current state — is mirrored here.
 | v0.1.1    | `project_setup` (downloads rust-analyzer) | ✅ done |
 | v0.2      | LSP proxy: hover, definition, references, document/workspace symbols, diagnostics | ✅ done |
 | v0.3      | git read tools + indexer | ✅ done — in-process indexer, no daemon |
-| v0.4      | SCIP build + query | 🟡 in progress — build done, query pending |
-| v0.5      | exec tools (run/test/install) | ⬜ planned |
+| v0.4      | SCIP build + query | ✅ done |
+| v0.5      | exec tools (run/test/install) | ✅ done |
 | v0.6      | DAP proxy (Rust via codelldb first) | ⬜ planned |
 
 ## Workspace layout
@@ -98,6 +98,12 @@ crates/
 | `index_commit(path?, sha?)` | Explicitly enqueue a commit (HEAD by default) for SCIP indexing. |
 | `index_status(path?, sha?)` | State of a commit in the indexer (Pending/InProgress/Ready/Failed). |
 | `work_last_known_state(path?)` | Last commit the indexer knows about for this repo. |
+| `scip_documents(path?, sha?)` | Paths covered by the SCIP index for a commit. Default = last Ready. |
+| `scip_symbols(path?, query, sha?)` | Fuzzy-search SCIP symbols by display_name or symbol id. |
+| `scip_references(path?, symbol, sha?)` | Every occurrence of a SCIP symbol id (with `is_definition`). |
+| `run_project(path?, extra_args?, timeout_secs?)` | Invoke plugin.runner (e.g. `cargo run`); capture stdout/stderr/exit. |
+| `run_tests(path?, filter?, extra_args?, timeout_secs?)` | Invoke plugin.test_runner (e.g. `cargo test [filter]`). |
+| `install_package(path?, packages, timeout_secs?)` | Invoke plugin.package_manager (e.g. `cargo add <pkg>`). |
 
 Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 `"head-to-index"`.
@@ -123,20 +129,25 @@ Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 
 ## What to build next
 
-Finish **v0.4**:
+**v0.6** — DAP proxy:
 
-1. New crate `aide-scip` loading and parsing `.scip` files (protobuf
-   via the official `scip` crate).
-2. MCP tools `scip_documents`, `scip_symbols`, `scip_references` that
-   read `indexer.last_ready(repo)` → resolve the `.scip` path → run
-   queries.
-3. Optional: retention — when a new commit becomes Ready, prune older
-   `.scip` files for that repo to keep only the latest (configurable
-   via `~/.aide/config.toml`).
+1. Extend `LanguagePlugin::dap` usage: wire the debug adapter binary
+   download into `project_setup` (for Rust, `codelldb`).
+2. New `aide-dap` crate speaking the Debug Adapter Protocol over stdio
+   to the adapter process — analogous to `aide-lsp`.
+3. MCP tools to launch/attach a debug session, set breakpoints, step,
+   evaluate, read variables. Exact surface TBD — start with the minimal
+   happy path: launch → break → read locals → continue.
 
-Then start **v0.5** (exec tools): `run`, `test`, `install_package`
-invoking the language plugin's `runner` / `test_runner` /
-`package_manager` and streaming output back to the agent.
+Nice-to-have polish (no milestone, add when useful):
+
+- **SCIP retention** — when a new commit reaches Ready, prune older
+  `.scip` files for that repo; configurable via `~/.aide/config.toml`.
+- **Streaming exec output** — currently `run_*` tools buffer to 1 MB.
+  For long builds the agent would benefit from incremental progress;
+  likely requires an MCP resource/notification mechanism.
+- **Second language plugin** — Python or Go — to validate the
+  `LanguagePlugin` abstraction beyond Rust.
 
 ## Build & test
 

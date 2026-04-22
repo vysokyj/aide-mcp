@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::ffi::OsString;
+use std::time::Duration;
+
 use aide_core::AidePaths;
 use aide_git::diff::DiffMode;
 use aide_install::{install_tool, InstallOutcome};
@@ -15,6 +18,7 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 
+use crate::exec::{self, DEFAULT_TIMEOUT_SECS};
 use crate::indexer::Indexer;
 
 pub async fn run() -> Result<()> {
@@ -224,6 +228,48 @@ pub struct ScipReferencesArgs {
     /// indexed Ready commit for this repo.
     #[serde(default)]
     pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RunProjectArgs {
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Extra args appended to the plugin's runner (e.g. `["--release"]`).
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Wall-clock budget in seconds. Defaults to 300.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RunTestsArgs {
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Optional test filter passed as the first positional arg
+    /// (e.g. `"my_test"` → `cargo test my_test`).
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Extra args appended to the test-runner command.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Wall-clock budget in seconds. Defaults to 300.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InstallPackageArgs {
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Packages to install (passed after the plugin's `install_args`).
+    pub packages: Vec<String>,
+    /// Wall-clock budget in seconds. Defaults to 300.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -686,6 +732,69 @@ impl AideServer {
         match aide_scip::load(&index_path) {
             Ok(idx) => to_json(&aide_scip::references(&idx, &args.symbol)),
             Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Run the project via the language plugin's runner (e.g. `cargo run`) and return the full stdout + stderr. Captures up to 1 MB per stream. Default timeout 300s; override with timeout_secs."
+    )]
+    async fn run_project(&self, Parameters(args): Parameters<RunProjectArgs>) -> String {
+        let root = resolve_root(args.path);
+        let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+        let runner = plugin.runner();
+        let mut argv: Vec<OsString> = runner.args.iter().map(OsString::from).collect();
+        argv.extend(args.extra_args.into_iter().map(OsString::from));
+        let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+
+        match exec::run(runner.executable, &argv, &root, duration).await {
+            Ok(result) => to_json(&result),
+            Err(e) => error_json(format!("failed to spawn {}: {e}", runner.executable)),
+        }
+    }
+
+    #[tool(
+        description = "Run the project's tests via the language plugin's test_runner (e.g. `cargo test [filter]`). Captures stdout/stderr and exit code. Default timeout 300s."
+    )]
+    async fn run_tests(&self, Parameters(args): Parameters<RunTestsArgs>) -> String {
+        let root = resolve_root(args.path);
+        let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+        let runner = plugin.test_runner();
+        let mut argv: Vec<OsString> = runner.args.iter().map(OsString::from).collect();
+        if let Some(filter) = args.filter {
+            argv.push(OsString::from(filter));
+        }
+        argv.extend(args.extra_args.into_iter().map(OsString::from));
+        let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+
+        match exec::run(runner.executable, &argv, &root, duration).await {
+            Ok(result) => to_json(&result),
+            Err(e) => error_json(format!("failed to spawn {}: {e}", runner.executable)),
+        }
+    }
+
+    #[tool(
+        description = "Install packages via the language plugin's package manager (e.g. `cargo add <pkg>`). Each string in `packages` becomes a positional argument after the install subcommand."
+    )]
+    async fn install_package(&self, Parameters(args): Parameters<InstallPackageArgs>) -> String {
+        let root = resolve_root(args.path);
+        let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+        if args.packages.is_empty() {
+            return error_json("`packages` must be non-empty");
+        }
+        let pm = plugin.package_manager();
+        let mut argv: Vec<OsString> = pm.install_args.iter().map(OsString::from).collect();
+        argv.extend(args.packages.into_iter().map(OsString::from));
+        let duration = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+
+        match exec::run(pm.executable, &argv, &root, duration).await {
+            Ok(result) => to_json(&result),
+            Err(e) => error_json(format!("failed to spawn {}: {e}", pm.executable)),
         }
     }
 }
