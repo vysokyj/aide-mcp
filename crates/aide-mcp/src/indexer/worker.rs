@@ -1,9 +1,9 @@
-//! Worker loop that actually produces SCIP indexes.
+//! Background worker task that produces SCIP indexes.
 //!
-//! One worker per daemon, processing jobs serially off an mpsc channel.
-//! The server handler pushes jobs in; the worker pops them, runs the
-//! configured SCIP indexer for the language, and writes the resulting
-//! index under `~/.aide/scip/<repo-id>/<sha>.scip`.
+//! One worker per MCP server, processing jobs serially off an mpsc
+//! channel. Callers push jobs in via [`Indexer::enqueue`](super::Indexer);
+//! the worker pops them, runs the language plugin's SCIP indexer, and
+//! writes the output under `~/.aide/scip/<slug(repo_root)>/<sha>.scip`.
 //!
 //! Each job exports the commit's tree to a fresh temp dir via
 //! [`aide_git::export::export_commit`] and runs the indexer there, so
@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::state::Store;
+use super::state::Store;
 
 /// A single piece of work: index `sha` in `repo_root`.
 #[derive(Debug, Clone)]
@@ -111,7 +111,6 @@ async fn build_index(
 
     run_indexer(plugin.as_ref(), &bin, snapshot_path, output).await?;
 
-    // Snapshot is dropped here, removing the temp tree.
     drop(snapshot);
     Ok(())
 }

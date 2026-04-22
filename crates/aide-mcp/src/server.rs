@@ -6,11 +6,7 @@ use aide_git::diff::DiffMode;
 use aide_install::{install_tool, InstallOutcome};
 use aide_lang::{LanguagePlugin, Registry};
 use aide_lsp::{ops as lsp_ops, LspPool};
-use aide_proto::{default_indexer_socket, Request, Response};
 use anyhow::Result;
-
-use crate::hook::{install_post_commit_hook, HookInstallOutcome};
-use crate::indexer;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
@@ -18,6 +14,8 @@ use rmcp::{
     transport::stdio,
     ServerHandler, ServiceExt,
 };
+
+use crate::indexer::Indexer;
 
 pub async fn run() -> Result<()> {
     let handler = AideServer::new()?;
@@ -57,7 +55,6 @@ pub struct ProjectSetupResult {
     pub root: String,
     pub languages: Vec<String>,
     pub tools: Vec<ToolInstallReport>,
-    pub post_commit_hook: PostCommitHookReport,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -65,15 +62,6 @@ pub struct ToolInstallReport {
     pub name: String,
     pub version: String,
     pub status: &'static str,
-    pub path: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-pub struct PostCommitHookReport {
-    /// One of: `installed`, `already-installed`, `skipped-no-hooks-dir`,
-    /// `skipped-foreign-hook`, `error`.
-    pub status: String,
     pub path: Option<String>,
     pub error: Option<String>,
 }
@@ -177,8 +165,18 @@ pub struct IndexStatusArgs {
     /// Repository root. If omitted, falls back to the server cwd.
     #[serde(default)]
     pub path: Option<String>,
-    /// Commit SHA to query. If omitted, the daemon returns the state of
-    /// the most recently enqueued commit for this repo.
+    /// Commit SHA to query. If omitted, returns the state of the most
+    /// recently enqueued commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct IndexCommitArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Commit SHA to index. If omitted, uses the repo's current HEAD.
     #[serde(default)]
     pub sha: Option<String>,
 }
@@ -195,6 +193,7 @@ pub struct AideServer {
     registry: Registry,
     paths: AidePaths,
     pool: Arc<LspPool>,
+    indexer: Indexer,
     #[allow(
         dead_code,
         reason = "field is read via #[tool_handler] macro expansion"
@@ -204,10 +203,13 @@ pub struct AideServer {
 
 impl AideServer {
     pub fn new() -> anyhow::Result<Self> {
+        let paths = AidePaths::from_home()?;
+        let indexer = Indexer::start(&paths)?;
         Ok(Self {
             registry: Registry::builtin(),
-            paths: AidePaths::from_home()?,
+            paths,
             pool: Arc::new(LspPool::new()),
+            indexer,
             tool_router: Self::tool_router(),
         })
     }
@@ -245,7 +247,7 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Install the LSP server, SCIP indexer, and debug adapter binaries for every language detected in the given project root. Idempotent — already-installed versions are skipped."
+        description = "Install the LSP server, SCIP indexer, and debug adapter binaries for every language detected in the given project root. Idempotent — already-installed versions are skipped. Also enqueues the current HEAD commit for SCIP indexing in the background."
     )]
     async fn project_setup(&self, Parameters(args): Parameters<ProjectSetupArgs>) -> String {
         let root = resolve_root(args.path);
@@ -286,24 +288,13 @@ impl AideServer {
             }
         }
 
-        let post_commit_hook = match install_post_commit_hook(&root) {
-            Ok(HookInstallOutcome { status, path }) => PostCommitHookReport {
-                status: status.to_string(),
-                path: path.map(|p| p.display().to_string()),
-                error: None,
-            },
-            Err(e) => PostCommitHookReport {
-                status: "error".to_string(),
-                path: None,
-                error: Some(e.to_string()),
-            },
-        };
+        // Kick off SCIP indexing for the current HEAD in the background.
+        self.indexer.enqueue_head(&root).await;
 
         let result = ProjectSetupResult {
             root: root.display().to_string(),
             languages,
             tools: reports,
-            post_commit_hook,
         };
 
         to_json(&result)
@@ -471,34 +462,35 @@ impl AideServer {
     }
 
     #[tool(
-        description = "git status: branch, upstream divergence, and per-file working-tree + index state."
+        description = "git status: branch, upstream divergence, and per-file working-tree + index state. Also nudges the SCIP indexer to keep up with new commits."
     )]
-    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
-    fn git_status(&self, Parameters(args): Parameters<GitPathArgs>) -> String {
+    async fn git_status(&self, Parameters(args): Parameters<GitPathArgs>) -> String {
         let root = resolve_root(args.path);
-        match aide_git::status::status(&root) {
+        let body = match aide_git::status::status(&root) {
             Ok(s) => to_json(&s),
             Err(e) => error_json(e.to_string()),
-        }
+        };
+        self.indexer.enqueue_head(&root).await;
+        body
     }
 
     #[tool(
-        description = "git log: recent commits reachable from HEAD. Returns sha, author, summary, time; newest first."
+        description = "git log: recent commits reachable from HEAD. Returns sha, author, summary, time; newest first. Also nudges the SCIP indexer to keep up with new commits."
     )]
-    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
-    fn git_log(&self, Parameters(args): Parameters<GitLogArgs>) -> String {
+    async fn git_log(&self, Parameters(args): Parameters<GitLogArgs>) -> String {
         let root = resolve_root(args.path);
-        match aide_git::log::log(&root, args.limit) {
+        let body = match aide_git::log::log(&root, args.limit) {
             Ok(entries) => to_json(&entries),
             Err(e) => error_json(e.to_string()),
-        }
+        };
+        self.indexer.enqueue_head(&root).await;
+        body
     }
 
     #[tool(
-        description = "git diff: unified diff patch plus stats (files changed, insertions, deletions). Selects HEAD vs worktree by default."
+        description = "git diff: unified diff patch plus stats (files changed, insertions, deletions). Selects HEAD vs worktree by default. Also nudges the SCIP indexer to keep up with new commits."
     )]
-    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
-    fn git_diff(&self, Parameters(args): Parameters<GitDiffArgs>) -> String {
+    async fn git_diff(&self, Parameters(args): Parameters<GitDiffArgs>) -> String {
         let root = resolve_root(args.path);
         let mode = match args.mode.as_deref() {
             Some("index-to-worktree") => DiffMode::IndexToWorktree,
@@ -506,10 +498,12 @@ impl AideServer {
             None | Some("head-to-worktree") => DiffMode::HeadToWorktree,
             Some(other) => return error_json(format!("unknown diff mode: {other}")),
         };
-        match aide_git::diff::diff(&root, mode, args.pathspec.as_deref()) {
+        let body = match aide_git::diff::diff(&root, mode, args.pathspec.as_deref()) {
             Ok(d) => to_json(&d),
             Err(e) => error_json(e.to_string()),
-        }
+        };
+        self.indexer.enqueue_head(&root).await;
+        body
     }
 
     #[tool(
@@ -526,62 +520,47 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Ask aide-indexer for the state of a commit (the last enqueued one by default). Returns null when the daemon has never heard of this repo."
+        description = "Explicitly enqueue a commit for SCIP indexing. Defaults to the repo's current HEAD when no sha is given. Returns the current CommitInfo; indexing continues in the background."
     )]
-    async fn index_status(&self, Parameters(args): Parameters<IndexStatusArgs>) -> String {
+    async fn index_commit(&self, Parameters(args): Parameters<IndexCommitArgs>) -> String {
         let root = resolve_root(args.path);
-        let socket = default_indexer_socket(&self.paths);
-        let request = Request::IndexStatus {
-            repo_root: root.display().to_string(),
-            sha: args.sha,
+        let (repo_root, sha) = match args.sha {
+            Some(sha) => (root.display().to_string(), sha),
+            None => match aide_git::resolve_head(&root) {
+                Ok((rr, sha)) => (rr.display().to_string(), sha),
+                Err(e) => return error_json(e.to_string()),
+            },
         };
-        match indexer::send(&socket, &request).await {
-            Ok(Response::IndexStatus {
-                repo_root,
-                sha,
-                state,
-                enqueued_at_unix,
-                indexed_at_unix,
-                index_path,
-            }) => to_json(&serde_json::json!({
-                "repo_root": repo_root,
-                "sha": sha,
-                "state": state,
-                "enqueued_at_unix": enqueued_at_unix,
-                "indexed_at_unix": indexed_at_unix,
-                "index_path": index_path,
-            })),
-            Ok(Response::NoCommit { repo_root }) => to_json(&serde_json::json!({
-                "repo_root": repo_root,
-                "sha": null,
-                "state": null,
-            })),
-            Ok(Response::Error { message }) => error_json(message),
-            Ok(other) => error_json(format!("unexpected daemon response: {other:?}")),
+        match self.indexer.enqueue(repo_root, sha).await {
+            Ok(info) => to_json(&info),
             Err(e) => error_json(e.to_string()),
         }
     }
 
     #[tool(
-        description = "Last commit the aide-indexer daemon knows about for this repo. Use this to recover an agent's last stable view of 'completed work' across sessions."
+        description = "State of a commit in the in-process SCIP indexer. Defaults to the most recently enqueued commit for this repo. Returns null when nothing is known yet."
+    )]
+    async fn index_status(&self, Parameters(args): Parameters<IndexStatusArgs>) -> String {
+        let root = resolve_root(args.path);
+        let repo_root = root.display().to_string();
+        match self.indexer.status(&repo_root, args.sha.as_deref()).await {
+            Some(info) => to_json(&info),
+            None => "null".to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Last commit the indexer knows about for this repo. Use this to recover an agent's last stable view of 'completed work' across sessions. Returns null when nothing has been enqueued."
     )]
     async fn work_last_known_state(
         &self,
         Parameters(args): Parameters<WorkLastKnownStateArgs>,
     ) -> String {
         let root = resolve_root(args.path);
-        let socket = default_indexer_socket(&self.paths);
-        let request = Request::LastKnownState {
-            repo_root: root.display().to_string(),
-        };
-        match indexer::send(&socket, &request).await {
-            Ok(Response::LastKnownState { repo_root, commit }) => to_json(&serde_json::json!({
-                "repo_root": repo_root,
-                "commit": commit,
-            })),
-            Ok(Response::Error { message }) => error_json(message),
-            Ok(other) => error_json(format!("unexpected daemon response: {other:?}")),
-            Err(e) => error_json(e.to_string()),
+        let repo_root = root.display().to_string();
+        match self.indexer.last_known(&repo_root).await {
+            Some(info) => to_json(&info),
+            None => "null".to_string(),
         }
     }
 }

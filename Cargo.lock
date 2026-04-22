@@ -38,24 +38,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aide-indexer"
-version = "0.1.0"
-dependencies = [
- "aide-core",
- "aide-git",
- "aide-lang",
- "aide-proto",
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "aide-install"
 version = "0.1.0"
 dependencies = [
@@ -124,11 +106,8 @@ dependencies = [
 name = "aide-proto"
 version = "0.1.0"
 dependencies = [
- "aide-core",
  "serde",
  "serde_json",
- "thiserror",
- "tokio",
 ]
 
 [[package]]

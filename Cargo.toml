@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/aide-core",
     "crates/aide-git",
-    "crates/aide-indexer",
     "crates/aide-install",
     "crates/aide-lang",
     "crates/aide-lsp",

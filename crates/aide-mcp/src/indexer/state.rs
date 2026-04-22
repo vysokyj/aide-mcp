@@ -1,9 +1,10 @@
-//! Persistent state for the indexer daemon.
+//! Persistent state for the indexer.
 //!
 //! Tracks every repo → every enqueued commit, its state, timestamps, and
 //! the on-disk path of the produced `.scip` index. Flushed to disk
 //! atomically on every mutation — calls are infrequent and durability
-//! matters more than throughput.
+//! matters more than throughput, and the file survives MCP restarts so
+//! indexes built in a previous session are still discoverable.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -200,8 +201,8 @@ impl Store {
     }
 
     /// Return every (`repo_root`, sha) pair that is still `Pending` or
-    /// `InProgress`. The daemon calls this on start-up so that commits
-    /// interrupted by an earlier crash get retried.
+    /// `InProgress`. Called on start-up so that commits interrupted by
+    /// an earlier crash get retried.
     pub async fn recoverable_jobs(&self) -> Vec<(String, String)> {
         let guard = self.inner.lock().await;
         let mut out = Vec::new();

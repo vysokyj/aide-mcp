@@ -1,13 +1,10 @@
-//! IPC protocol between `aide-mcp` and the `aide-indexer` daemon.
+//! Shared schemas used across aide-mcp crates.
 //!
-//! Wire format is newline-delimited JSON (`serde_json` values followed by
-//! `\n`) over a unix-domain stream. One request, one response, one line each.
-//! Keep the schema strictly additive — the daemon may outlive many mcp
-//! versions.
+//! Currently just the indexer data model — commit state, timestamps, and
+//! the path to the produced SCIP index. Kept as its own crate so the
+//! types can be referenced from any tool surface without pulling in the
+//! rest of the indexing machinery.
 
-pub mod framing;
 pub mod ipc;
-pub mod socket;
 
-pub use ipc::{CommitInfo, IndexState, Request, Response};
-pub use socket::{default_indexer_socket, INDEXER_SOCKET_NAME};
+pub use ipc::{CommitInfo, IndexState};
