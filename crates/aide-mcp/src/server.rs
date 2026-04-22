@@ -85,6 +85,35 @@ pub struct LspFileArgs {
     pub root: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspReferencesArgs {
+    /// Absolute path to the source file.
+    pub file: String,
+    /// 0-indexed line number.
+    pub line: u32,
+    /// 0-indexed UTF-16 column within the line.
+    pub column: u32,
+    /// Whether to include the definition site in the results. Defaults to true.
+    #[serde(default = "default_true")]
+    pub include_declaration: bool,
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspWorkspaceSymbolsArgs {
+    /// Fuzzy query string (empty string = return all top-level symbols).
+    pub query: String,
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AideServer {
     registry: Registry,
@@ -262,6 +291,91 @@ impl AideServer {
 
         match lsp_ops::diagnostics(&client, &file, std::time::Duration::from_millis(500)).await {
             Ok(d) => to_json(&d),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP references: return every source location that references the symbol at (file, line, column)."
+    )]
+    async fn lsp_references(&self, Parameters(args): Parameters<LspReferencesArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::references(
+            &client,
+            &file,
+            args.line,
+            args.column,
+            args.include_declaration,
+        )
+        .await
+        {
+            Ok(hits) => to_json(&hits),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP document symbols: a hierarchical outline of every symbol (function, struct, method, …) in a single file."
+    )]
+    async fn lsp_document_symbols(&self, Parameters(args): Parameters<LspFileArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::document_symbols(&client, &file).await {
+            Ok(symbols) => to_json(&symbols),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP workspace symbols: fuzzy-search every symbol defined anywhere in the project. Empty query returns top-level symbols."
+    )]
+    async fn lsp_workspace_symbols(
+        &self,
+        Parameters(args): Parameters<LspWorkspaceSymbolsArgs>,
+    ) -> String {
+        let root = resolve_root(args.root);
+        let Some((plugin, binary)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::workspace_symbols(&client, &args.query).await {
+            Ok(hits) => to_json(&hits),
             Err(e) => error_json(e.to_string()),
         }
     }

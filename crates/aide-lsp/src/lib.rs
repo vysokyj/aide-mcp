@@ -11,5 +11,5 @@ pub mod ops;
 pub mod pool;
 
 pub use client::{LspClient, LspClientError};
-pub use ops::{HoverHit, LocationHit, PublishedDiagnostic};
+pub use ops::{HoverHit, LocationHit, PublishedDiagnostic, SymbolNode, WorkspaceSymbolHit};
 pub use pool::{LspPool, LspPoolError};
