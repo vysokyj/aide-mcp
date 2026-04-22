@@ -1,28 +1,26 @@
 [package]
-name = "aide-mcp"
+name = "aide-install"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "aide-mcp"
-path = "src/main.rs"
-
 [dependencies]
 aide-core.workspace = true
-aide-install.workspace = true
-aide-lang.workspace = true
 
 anyhow.workspace = true
-rmcp = { workspace = true }
-schemars.workspace = true
+flate2.workspace = true
+futures.workspace = true
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

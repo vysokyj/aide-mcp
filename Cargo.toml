@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/aide-core",
+    "crates/aide-install",
     "crates/aide-lang",
     "crates/aide-mcp",
 ]
@@ -15,9 +16,13 @@ repository = "https://github.com/vysokyj/aide-mcp"
 
 [workspace.dependencies]
 aide-core = { path = "crates/aide-core" }
+aide-install = { path = "crates/aide-install" }
 aide-lang = { path = "crates/aide-lang" }
 
 anyhow = "1"
+flate2 = "1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"

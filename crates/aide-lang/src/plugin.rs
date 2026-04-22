@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use aide_install::ToolSpec;
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier of a supported language (lowercase, kebab-case).
@@ -72,4 +73,13 @@ pub trait LanguagePlugin: Send + Sync {
     fn package_manager(&self) -> PackageManager;
     fn runner(&self) -> Runner;
     fn test_runner(&self) -> TestRunner;
+
+    /// Tools that `project.setup` should install for this language.
+    ///
+    /// Typically the LSP server, SCIP indexer, and debug adapter — whichever
+    /// are shipped as third-party binaries. Return an empty vec if the language
+    /// relies entirely on tools found on the user's `$PATH`.
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
 }

@@ -1,10 +1,15 @@
 use std::path::Path;
 
+use aide_install::{ArchiveFormat, Source, TargetAsset, ToolSpec};
+
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
 };
 
 pub struct RustPlugin;
+
+/// Pinned rust-analyzer release. Bump when we validate a newer tag.
+const RUST_ANALYZER_TAG: &str = "2026-04-20";
 
 impl LanguagePlugin for RustPlugin {
     fn id(&self) -> LanguageId {
@@ -55,6 +60,37 @@ impl LanguagePlugin for RustPlugin {
             executable: "cargo",
             args: &["test"],
         }
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        vec![rust_analyzer_spec()]
+    }
+}
+
+fn rust_analyzer_spec() -> ToolSpec {
+    let triples = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ];
+    let assets = triples
+        .iter()
+        .map(|triple| TargetAsset {
+            triple,
+            filename: format!("rust-analyzer-{triple}.gz"),
+            archive: ArchiveFormat::Gzip,
+        })
+        .collect();
+    ToolSpec {
+        name: "rust-analyzer".to_string(),
+        version: RUST_ANALYZER_TAG.to_string(),
+        executable: "rust-analyzer".to_string(),
+        source: Source::GithubRelease {
+            repo: "rust-lang/rust-analyzer".to_string(),
+            tag: RUST_ANALYZER_TAG.to_string(),
+            assets,
+        },
     }
 }
 
