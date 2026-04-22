@@ -1,0 +1,18 @@
+[package]
+name = "aide-lang"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aide-core.workspace = true
+anyhow.workspace = true
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
