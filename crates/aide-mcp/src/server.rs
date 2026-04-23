@@ -23,6 +23,7 @@ use rmcp::{
 };
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
+use crate::dogfood::aggregate_coverage_gaps;
 use crate::exec::{self, Progress};
 use crate::indexer::Indexer;
 
@@ -424,6 +425,17 @@ pub struct TestsForChangedFilesArgs {
     /// Defaults to the most recently indexed Ready commit.
     #[serde(default)]
     pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DogfoodCoverageGapsArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Directory (relative to `path`) where dogfood run records
+    /// live. Defaults to `dogfood/runs`.
+    #[serde(default)]
+    pub runs_dir: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1651,6 +1663,23 @@ impl AideServer {
         }
 
         to_json(&out)
+    }
+
+    #[tool(
+        description = "Aggregate `Coverage gaps` bullets from `dogfood/runs/*.md` (or `runs_dir` override) and rank them by frequency. Each gap record lists the missing capability, the agent's proposed tool name (text after '→'), and which run files mentioned it. Drives the dogfood → roadmap feedback loop — the most-frequent gaps point at what the benchmark keeps catching the aide agent lacking."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn dogfood_coverage_gaps(
+        &self,
+        Parameters(args): Parameters<DogfoodCoverageGapsArgs>,
+    ) -> String {
+        let root = resolve_root(args.path);
+        let runs_rel = args.runs_dir.unwrap_or_else(|| "dogfood/runs".to_string());
+        let runs_dir = root.join(&runs_rel);
+        match aggregate_coverage_gaps(&runs_dir) {
+            Ok(report) => to_json(&report),
+            Err(e) => error_json(e),
+        }
     }
 
     #[tool(

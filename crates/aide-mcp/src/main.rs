@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+mod dogfood;
 mod exec;
 mod indexer;
 mod server;
