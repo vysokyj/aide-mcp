@@ -71,6 +71,12 @@ pub struct LineMatch {
     pub line: u64,
     pub text: String,
     pub kind: LineKind,
+    /// Enclosing-symbol annotation, filled in by the MCP layer when a
+    /// SCIP index covers the hit path. `None` when no SCIP data is
+    /// available or the lookup misses — so it is skipped in the
+    /// serialised output entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +314,7 @@ impl Sink for CollectSink<'_> {
             line,
             text,
             kind: LineKind::Match,
+            symbol: None,
         });
         self.match_count += 1;
         Ok(true)
@@ -321,7 +328,12 @@ impl Sink for CollectSink<'_> {
             SinkContextKind::Other => return Ok(true),
         };
         let text = strip_eol(ctx.bytes());
-        self.lines.push(LineMatch { line, text, kind });
+        self.lines.push(LineMatch {
+            line,
+            text,
+            kind,
+            symbol: None,
+        });
         Ok(true)
     }
 }

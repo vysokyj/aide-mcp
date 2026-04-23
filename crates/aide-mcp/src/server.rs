@@ -676,6 +676,37 @@ impl AideServer {
             other => Err(format!("index for {} is {:?}, not Ready", info.sha, other)),
         }
     }
+
+    /// Best-effort enrichment: for each grep hit, attach the enclosing
+    /// definition's display name to every line, using the most recent
+    /// Ready SCIP index for `root`. Silently no-ops if no index is
+    /// Ready, the `.scip` file cannot be loaded, or the hit's path is
+    /// not covered by the index. Hits whose file is dirty relative to
+    /// the indexed commit will see best-effort annotations that may
+    /// point at a neighbouring symbol — good enough for orientation,
+    /// not a substitute for `lsp_*` tools on the live tree.
+    async fn annotate_hits_with_scip(
+        &self,
+        root: &std::path::Path,
+        hits: &mut [aide_search::GrepHit],
+    ) {
+        if hits.is_empty() {
+            return;
+        }
+        let root_str = root.display().to_string();
+        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
+            return;
+        };
+        let Ok(index) = aide_scip::load(&scip_path) else {
+            return;
+        };
+        for hit in hits {
+            for line in &mut hit.lines {
+                let line_0based = i32::try_from(line.line.saturating_sub(1)).unwrap_or(i32::MAX);
+                line.symbol = aide_scip::enclosing_definition(&index, &hit.path, line_0based);
+            }
+        }
+    }
 }
 
 #[tool_router]
@@ -789,10 +820,9 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Regex search across project files. Replaces `grep`/`rg` with a gitignore-aware, git-scoped searcher powered by the ripgrep engine (grep-regex + grep-searcher). Smart-case by default, binary files skipped, per-file and total result caps. Returns match lines with optional before/after context tagged by kind."
+        description = "Regex search across project files. Replaces `grep`/`rg` with a gitignore-aware, git-scoped searcher powered by the ripgrep engine (grep-regex + grep-searcher). Smart-case by default, binary files skipped, per-file and total result caps. Returns match lines with optional before/after context tagged by kind. When a SCIP index is Ready for the project, each line is annotated with `symbol` (the enclosing definition's display name) — a semantic layer no plain grep can provide."
     )]
-    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
-    fn project_grep(&self, Parameters(args): Parameters<ProjectGrepArgs>) -> String {
+    async fn project_grep(&self, Parameters(args): Parameters<ProjectGrepArgs>) -> String {
         let root = resolve_root(args.path);
         let scope = match parse_scope(args.scope.as_deref()) {
             Ok(s) => s,
@@ -808,7 +838,10 @@ impl AideServer {
             include_hidden: args.include_hidden,
         };
         match aide_search::grep(&root, &args.pattern, &scope, &options) {
-            Ok(result) => to_json(&result),
+            Ok(mut result) => {
+                self.annotate_hits_with_scip(&root, &mut result.hits).await;
+                to_json(&result)
+            }
             Err(e) => error_json(e.to_string()),
         }
     }

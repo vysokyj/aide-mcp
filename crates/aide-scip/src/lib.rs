@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use protobuf::Message;
-use scip::types::{Index, SymbolRole};
+use scip::types::{Document, Index, SymbolRole};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -84,6 +84,56 @@ pub struct OccurrenceHit {
     /// `[start_line, start_col, end_col]` per the SCIP spec.
     pub range: Vec<i32>,
     pub is_definition: bool,
+}
+
+/// For the document in `index` whose `relative_path == path`, find the
+/// most recent definition occurrence whose range starts at or before
+/// `line_0based` and return its display name (or the raw symbol id if
+/// no matching [`SymbolInformation`] ships with a display name).
+///
+/// Lines in SCIP are 0-indexed; callers with 1-indexed line numbers
+/// (e.g. grep output) must subtract one before calling.
+///
+/// Returns `None` if the document is not present, if no definition
+/// occurrence precedes the line, or if the occurrence refers to an
+/// unknown symbol.
+pub fn enclosing_definition(index: &Index, path: &str, line_0based: i32) -> Option<String> {
+    let doc = index.documents.iter().find(|d| d.relative_path == path)?;
+    enclosing_definition_in_doc(doc, line_0based)
+}
+
+fn enclosing_definition_in_doc(doc: &Document, line_0based: i32) -> Option<String> {
+    let mut best: Option<(i32, &str)> = None;
+    for occ in &doc.occurrences {
+        if (occ.symbol_roles & SymbolRole::Definition as i32) == 0 {
+            continue;
+        }
+        let Some(start_line) = occ.range.first().copied() else {
+            continue;
+        };
+        if start_line > line_0based {
+            continue;
+        }
+        if best.is_none_or(|(b, _)| start_line >= b) {
+            best = Some((start_line, occ.symbol.as_str()));
+        }
+    }
+    let (_, symbol_id) = best?;
+    Some(
+        doc.symbols
+            .iter()
+            .find(|s| s.symbol == symbol_id)
+            .map_or_else(
+                || symbol_id.to_string(),
+                |s| {
+                    if s.display_name.is_empty() {
+                        s.symbol.clone()
+                    } else {
+                        s.display_name.clone()
+                    }
+                },
+            ),
+    )
 }
 
 /// Every occurrence of `symbol` (exact match on the SCIP symbol id) across
@@ -208,6 +258,82 @@ mod tests {
         let defs: Vec<_> = hits.iter().filter(|h| h.is_definition).collect();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].relative_path, "src/helper.rs");
+    }
+
+    #[test]
+    fn enclosing_definition_returns_enclosing_fn() {
+        let idx = fake_index();
+        assert_eq!(
+            enclosing_definition(&idx, "src/main.rs", 0),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn enclosing_definition_ignores_non_definition_occurrences() {
+        // Line 2 of src/main.rs is where helper is *referenced* (not
+        // defined). The enclosing definition is still main.
+        let idx = fake_index();
+        assert_eq!(
+            enclosing_definition(&idx, "src/main.rs", 2),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn enclosing_definition_picks_most_recent_preceding_def() {
+        let outer_sym = SymbolInformation {
+            symbol: "s outer".into(),
+            display_name: "outer".into(),
+            kind: EnumOrUnknown::new(Kind::Function),
+            ..Default::default()
+        };
+        let inner_sym = SymbolInformation {
+            symbol: "s inner".into(),
+            display_name: "inner".into(),
+            kind: EnumOrUnknown::new(Kind::Function),
+            ..Default::default()
+        };
+        let doc = Document {
+            relative_path: "src/nested.rs".into(),
+            symbols: vec![outer_sym.clone(), inner_sym.clone()],
+            occurrences: vec![
+                Occurrence {
+                    symbol: outer_sym.symbol.clone(),
+                    range: vec![0, 3, 8],
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    symbol: inner_sym.symbol.clone(),
+                    range: vec![4, 7, 12],
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let idx = ScipIndex {
+            metadata: MessageField::some(Metadata::default()),
+            documents: vec![doc],
+            ..Default::default()
+        };
+        assert_eq!(
+            enclosing_definition(&idx, "src/nested.rs", 3),
+            Some("outer".to_string())
+        );
+        // Line 4 onwards belongs to `inner` — it's the most recent
+        // preceding definition.
+        assert_eq!(
+            enclosing_definition(&idx, "src/nested.rs", 5),
+            Some("inner".to_string())
+        );
+    }
+
+    #[test]
+    fn enclosing_definition_returns_none_for_unknown_path() {
+        let idx = fake_index();
+        assert_eq!(enclosing_definition(&idx, "src/missing.rs", 0), None);
     }
 
     #[test]
