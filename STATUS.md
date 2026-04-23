@@ -1,6 +1,6 @@
 # Project status snapshot
 
-Last updated: 2026-04-22.
+Last updated: 2026-04-23.
 
 ## Purpose of this file
 
@@ -33,6 +33,7 @@ decisions, roadmap, current state — is mirrored here.
 | v0.4      | SCIP build + query | ✅ done |
 | v0.5      | exec tools (run/test/install) | ✅ done |
 | v0.6      | DAP proxy (Rust via codelldb first) | ✅ done |
+| v0.7      | project-scoped search primitives (`project_ls`, `project_grep`) to make `ls`/`find`/`grep` via Bash unnecessary | 🚧 in progress — core tools landed, RAM cache and commit-pinned variants deferred |
 
 ## Workspace layout
 
@@ -55,6 +56,10 @@ crates/
   aide-proto/     Shared primitives: Content-Length framing + indexer
                   schema (IndexState, CommitInfo)
   aide-scip/      scip protobuf loader + query helpers (documents/symbols/refs)
+  aide-search/    project-scoped ls + grep: libgit2 index walk (Scope::Tracked),
+                  ripgrep `ignore` walker (Scope::All), git2 status (Dirty /
+                  Staged), grep-regex + grep-searcher engine with smart-case
+                  and binary skip
   aide-mcp/       MCP stdio server exposing every tool via rmcp 1.5. Owns the
                   in-process SCIP indexer (src/indexer/: state + worker) and
                   the shared exec runner (src/exec.rs).
@@ -120,6 +125,8 @@ crates/
 | Tool | Behaviour |
 |------|-----------|
 | `project_detect(path?)` | Report detected languages for project root. |
+| `project_ls(path?, scope?, glob?, max_results?, include_hidden?)` | Enumerate files under the project root. Scope = tracked (default, libgit2 index) / all (gitignore-aware walk) / dirty / staged. Optional glob filter over the relative path. |
+| `project_grep(pattern, path?, scope?, glob?, case_sensitive?, before_context?, after_context?, max_results?, max_results_per_file?, include_hidden?)` | Regex search powered by grep-regex + grep-searcher. Smart-case by default, binary files skipped, per-file and total result caps, optional context lines tagged match/before/after. |
 | `project_setup(path?)` | Install LSP/SCIP/DAP binaries for detected languages; idempotent. Enqueues HEAD for SCIP indexing. |
 | `lsp_hover(file, line, column, root?)` | LSP hover text, or null. |
 | `lsp_definition(file, line, column, root?)` | Locations a symbol is defined at. |
@@ -178,8 +185,16 @@ Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 
 ## What to build next
 
-Core roadmap (v0.1 through v0.6) plus two polish rounds are complete.
-Remaining open ideas:
+Core roadmap (v0.1 through v0.6) plus two polish rounds are complete;
+v0.7 search primitives landed in minimal form. Remaining open ideas:
+
+- **v0.7 follow-ups** — RAM cache for `project_ls` invalidated on git
+  index mtime (so repeated calls in one session are O(1)); commit-pinned
+  variants (`project_ls_at(sha)`, `project_grep_at(sha)`) piggy-backing
+  on `aide_git::export_commit`; SCIP annotation of grep hits (attach
+  `symbol_at_line` from the `last_ready` index when the hit path is
+  covered). These were deliberately deferred from the first commit to
+  keep scope tight.
 
 - **scip-java auto-install** — Sourcegraph distributes via coursier,
   not a standalone tarball. Would need either a coursier bootstrap

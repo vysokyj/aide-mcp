@@ -19,6 +19,7 @@ aide-lang.workspace = true
 aide-lsp.workspace = true
 aide-proto.workspace = true
 aide-scip.workspace = true
+aide-search.workspace = true
 
 anyhow.workspace = true
 rmcp = { workspace = true }

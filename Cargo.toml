@@ -10,6 +10,7 @@ members = [
     "crates/aide-mcp",
     "crates/aide-proto",
     "crates/aide-scip",
+    "crates/aide-search",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ aide-lang = { path = "crates/aide-lang" }
 aide-lsp = { path = "crates/aide-lsp" }
 aide-proto = { path = "crates/aide-proto" }
 aide-scip = { path = "crates/aide-scip" }
+aide-search = { path = "crates/aide-search" }
 
 anyhow = "1"
 flate2 = "1"
@@ -50,6 +52,11 @@ tempfile = "3"
 toml = "0.8"
 url = "2"
 zip = { version = "4", default-features = false, features = ["deflate"] }
+ignore = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+globset = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

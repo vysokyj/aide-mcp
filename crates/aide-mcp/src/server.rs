@@ -76,6 +76,70 @@ pub struct ToolInstallReport {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectLsArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// One of "tracked" (default, reads libgit2 index), "all" (gitignore-aware
+    /// walk of the working tree), "dirty" (files with non-clean status), or
+    /// "staged" (files whose index entry differs from HEAD).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Glob over the repo-relative path, e.g. `crates/*/src/**/*.rs`.
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Cap on the number of returned paths. Defaults to 500.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// Include dotfiles when `scope = "all"`. Defaults to false.
+    #[serde(default)]
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct ProjectLsResult {
+    pub root: String,
+    pub scope: String,
+    pub files: Vec<String>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectGrepArgs {
+    /// Regex pattern. Smart-case by default — lowercase pattern matches
+    /// case-insensitively, mixed-case matches case-sensitively.
+    pub pattern: String,
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Same scopes as `project_ls`. Defaults to "tracked".
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Glob over repo-relative paths to restrict the file set.
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Override smart-case: `true` = sensitive, `false` = insensitive.
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    /// Lines of context before each match (capped at 10).
+    #[serde(default)]
+    pub before_context: Option<usize>,
+    /// Lines of context after each match (capped at 10).
+    #[serde(default)]
+    pub after_context: Option<usize>,
+    /// Total cap on matches across all files. Defaults to 200.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// Cap on matches per file. Defaults to 50.
+    #[serde(default)]
+    pub max_results_per_file: Option<usize>,
+    /// Include dotfiles when `scope = "all"`. Defaults to false.
+    #[serde(default)]
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LspPositionArgs {
     /// Absolute path to the source file.
     pub file: String,
@@ -645,6 +709,64 @@ impl AideServer {
         };
 
         to_json(&result)
+    }
+
+    #[tool(
+        description = "List files under the project root. Replaces `ls`/`find` with a gitignore-aware, git-scoped enumerator. Scope: \"tracked\" (default, fastest — reads libgit2 index), \"all\" (working tree minus .gitignore), \"dirty\" (anything non-clean), \"staged\" (index vs HEAD). Optional glob filter applies to repo-relative paths."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn project_ls(&self, Parameters(args): Parameters<ProjectLsArgs>) -> String {
+        let root = resolve_root(args.path);
+        let scope = match parse_scope(args.scope.as_deref()) {
+            Ok(s) => s,
+            Err(e) => return error_json(e),
+        };
+        let max_results = args.max_results.unwrap_or(500);
+        let options = aide_search::LsOptions {
+            glob: args.glob,
+            max_results: Some(max_results),
+            include_hidden: args.include_hidden,
+        };
+        match aide_search::list_files(&root, &scope, &options) {
+            Ok(files) => {
+                let total = files.len();
+                let truncated = total == max_results;
+                let result = ProjectLsResult {
+                    root: root.display().to_string(),
+                    scope: scope_label(&scope).to_string(),
+                    files,
+                    total,
+                    truncated,
+                };
+                to_json(&result)
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Regex search across project files. Replaces `grep`/`rg` with a gitignore-aware, git-scoped searcher powered by the ripgrep engine (grep-regex + grep-searcher). Smart-case by default, binary files skipped, per-file and total result caps. Returns match lines with optional before/after context tagged by kind."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn project_grep(&self, Parameters(args): Parameters<ProjectGrepArgs>) -> String {
+        let root = resolve_root(args.path);
+        let scope = match parse_scope(args.scope.as_deref()) {
+            Ok(s) => s,
+            Err(e) => return error_json(e),
+        };
+        let options = aide_search::GrepOptions {
+            glob: args.glob,
+            case_sensitive: args.case_sensitive,
+            before_context: args.before_context.unwrap_or(0),
+            after_context: args.after_context.unwrap_or(0),
+            max_results_per_file: args.max_results_per_file.unwrap_or(50),
+            max_results: args.max_results.unwrap_or(200),
+            include_hidden: args.include_hidden,
+        };
+        match aide_search::grep(&root, &args.pattern, &scope, &options) {
+            Ok(result) => to_json(&result),
+            Err(e) => error_json(e.to_string()),
+        }
     }
 
     #[tool(
@@ -1403,6 +1525,27 @@ impl ServerHandler for AideServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions("aide-mcp: IDE-grade tools (LSP/SCIP/GIT/exec/DAP) for AI agents")
+    }
+}
+
+fn parse_scope(raw: Option<&str>) -> Result<aide_search::Scope, String> {
+    match raw.unwrap_or("tracked") {
+        "tracked" => Ok(aide_search::Scope::Tracked),
+        "all" => Ok(aide_search::Scope::All),
+        "dirty" => Ok(aide_search::Scope::Dirty),
+        "staged" => Ok(aide_search::Scope::Staged),
+        other => Err(format!(
+            "unknown scope {other:?}; expected one of: tracked, all, dirty, staged"
+        )),
+    }
+}
+
+fn scope_label(scope: &aide_search::Scope) -> &'static str {
+    match scope {
+        aide_search::Scope::Tracked => "tracked",
+        aide_search::Scope::All => "all",
+        aide_search::Scope::Dirty => "dirty",
+        aide_search::Scope::Staged => "staged",
     }
 }
 
