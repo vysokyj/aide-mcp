@@ -95,6 +95,28 @@ impl LanguagePlugin for RustPlugin {
     fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
         parse_cargo_json_messages(stdout)
     }
+
+    fn is_test_symbol(&self, relative_path: &str, display_name: &str) -> bool {
+        is_rust_test(relative_path, display_name)
+    }
+}
+
+/// Rust test heuristic: a function is considered a test when it lives
+/// in a conventional test location *or* its name carries a test-like
+/// prefix/suffix. Both checks are independent — integration tests
+/// under `tests/*.rs` don't need `test_` prefixes to count, and
+/// `#[cfg(test)] mod tests` functions named `test_foo` get picked up
+/// even though the module isn't in a test directory.
+fn is_rust_test(relative_path: &str, display_name: &str) -> bool {
+    let path = relative_path.to_ascii_lowercase();
+    let in_test_path = path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.ends_with("_test.rs")
+        || path.ends_with("_tests.rs");
+    let name = display_name.to_ascii_lowercase();
+    let looks_like_test =
+        name.starts_with("test_") || name.ends_with("_test") || name.ends_with("_tests");
+    in_test_path || looks_like_test
 }
 
 /// Parse a stdout stream of cargo machine-readable output (one JSON
@@ -299,6 +321,18 @@ mod tests {
             "\n",
         );
         assert!(RustPlugin.parse_diagnostics(stdout).is_empty());
+    }
+
+    #[test]
+    fn is_rust_test_picks_up_conventional_paths_and_names() {
+        assert!(is_rust_test("tests/it.rs", "anything"));
+        assert!(is_rust_test("crates/x/tests/sub/it.rs", "anything"));
+        assert!(is_rust_test("src/foo_test.rs", "anything"));
+        assert!(is_rust_test("src/foo_tests.rs", "anything"));
+        assert!(is_rust_test("src/foo.rs", "test_bar"));
+        assert!(is_rust_test("src/foo.rs", "bar_test"));
+        assert!(!is_rust_test("src/foo.rs", "bar"));
+        assert!(!is_rust_test("src/foo.rs", "tested"));
     }
 
     #[test]

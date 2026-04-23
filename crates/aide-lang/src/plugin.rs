@@ -123,4 +123,15 @@ pub trait LanguagePlugin: Send + Sync {
         let _ = stdout;
         Vec::new()
     }
+
+    /// Language-aware heuristic: does a symbol with the given name,
+    /// defined in the given repo-relative path, look like a test
+    /// function? Used by test-discovery tools (`tests_for_symbol`,
+    /// `tests_for_changed_files`) to filter candidate callers.
+    /// Default rejects everything — plugins without a test convention
+    /// will simply never light up these tools.
+    fn is_test_symbol(&self, relative_path: &str, display_name: &str) -> bool {
+        let _ = (relative_path, display_name);
+        false
+    }
 }

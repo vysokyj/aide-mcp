@@ -361,6 +361,30 @@ pub struct ProjectMapArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TestsForSymbolArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Exact SCIP symbol id (from `scip_symbols`).
+    pub symbol: String,
+    /// Commit SHA whose index to query. Defaults to the most recently
+    /// indexed Ready commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TestsForChangedFilesArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Commit SHA whose index to query when resolving callers.
+    /// Defaults to the most recently indexed Ready commit.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TaskContextArgs {
     /// Absolute or repo-relative path of the file to orient around.
     pub file: String,
@@ -1334,6 +1358,99 @@ impl AideServer {
     }
 
     #[tool(
+        description = "Tests (by the language plugin's test heuristic) that transitively reference `symbol`. Walks every non-definition occurrence of the symbol in the SCIP index, resolves the enclosing function, and keeps those the plugin recognises as tests (Rust: `tests/` paths, `*_test.rs`, `test_*` / `*_test` names). Returns the test symbols; pair with `run_tests`."
+    )]
+    async fn tests_for_symbol(&self, Parameters(args): Parameters<TestsForSymbolArgs>) -> String {
+        let root = resolve_root(args.path);
+        let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        let idx = match aide_scip::load(&index_path) {
+            Ok(i) => i,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let tests: Vec<_> = aide_scip::enclosing_defs_of_callers(&idx, &args.symbol)
+            .into_iter()
+            .filter(|c| plugin.is_test_symbol(&c.relative_path, &c.display_name))
+            .collect();
+        to_json(&tests)
+    }
+
+    #[tool(
+        description = "Tests worth running after the current working-tree changes. Collects every symbol defined in dirty or staged files, then combines (a) tests that directly reference any of those symbols with (b) tests defined in the changed files themselves. Deduplicated, tagged with the file and line where each test lives. Agent can feed the display names into `run_tests` as filters."
+    )]
+    async fn tests_for_changed_files(
+        &self,
+        Parameters(args): Parameters<TestsForChangedFilesArgs>,
+    ) -> String {
+        let root = resolve_root(args.path);
+        let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+        let changed_paths: Vec<String> = match aide_git::status::status(&root) {
+            Ok(s) => s
+                .files
+                .into_iter()
+                .filter(|f| !f.is_ignored && (f.staged.is_some() || f.working.is_some()))
+                .map(|f| f.path)
+                .collect(),
+            Err(e) => return error_json(e.to_string()),
+        };
+        if changed_paths.is_empty() {
+            return to_json(&Vec::<aide_scip::LocatedSymbol>::new());
+        }
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        let idx = match aide_scip::load(&index_path) {
+            Ok(i) => i,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<aide_scip::LocatedSymbol> = Vec::new();
+
+        // (a) tests defined directly inside changed files.
+        for path in &changed_paths {
+            for sym in aide_scip::defs_in_path(&idx, path) {
+                if plugin.is_test_symbol(&sym.relative_path, &sym.display_name)
+                    && seen.insert(sym.symbol.clone())
+                {
+                    out.push(sym);
+                }
+            }
+        }
+
+        // (b) tests that reference any symbol defined in a changed file.
+        for path in &changed_paths {
+            for sym in aide_scip::defs_in_path(&idx, path) {
+                for cand in aide_scip::enclosing_defs_of_callers(&idx, &sym.symbol) {
+                    if plugin.is_test_symbol(&cand.relative_path, &cand.display_name)
+                        && seen.insert(cand.symbol.clone())
+                    {
+                        out.push(cand);
+                    }
+                }
+            }
+        }
+
+        to_json(&out)
+    }
+
+    #[tool(
         description = "Aggregate orientation data for a single file: LSP document symbols, LSP diagnostics, head-to-worktree diff for just this file, the last `history_limit` commits that touched it, and SCIP top-level symbols. One call replaces the five agents typically make when picking up work on a file. Any sub-query that fails (LSP warming up, no SCIP Ready yet) contributes a null/empty field — the rest of the response stays valid."
     )]
     async fn task_context(&self, Parameters(args): Parameters<TaskContextArgs>) -> String {
@@ -1389,13 +1506,9 @@ impl AideServer {
         let repo_root = root.display().to_string();
         if let Ok(index_path) = self.resolve_scip_path(&repo_root, None).await {
             if let Ok(idx) = aide_scip::load(&index_path) {
-                let entries = aide_scip::project_map(&idx, &[]);
-                let for_file: Vec<_> = entries
-                    .into_iter()
-                    .filter(|e| e.relative_path == relative_str)
-                    .flat_map(|e| e.symbols)
-                    .collect();
-                ctx["scip_symbols"] = serde_json::to_value(for_file).unwrap_or_default();
+                ctx["scip_symbols"] =
+                    serde_json::to_value(aide_scip::defs_in_path(&idx, &relative_str))
+                        .unwrap_or_default();
             }
         }
 

@@ -103,22 +103,7 @@ pub fn enclosing_definition(index: &Index, path: &str, line_0based: i32) -> Opti
 }
 
 fn enclosing_definition_in_doc(doc: &Document, line_0based: i32) -> Option<String> {
-    let mut best: Option<(i32, &str)> = None;
-    for occ in &doc.occurrences {
-        if (occ.symbol_roles & SymbolRole::Definition as i32) == 0 {
-            continue;
-        }
-        let Some(start_line) = occ.range.first().copied() else {
-            continue;
-        };
-        if start_line > line_0based {
-            continue;
-        }
-        if best.is_none_or(|(b, _)| start_line >= b) {
-            best = Some((start_line, occ.symbol.as_str()));
-        }
-    }
-    let (_, symbol_id) = best?;
+    let symbol_id = enclosing_definition_symbol_id(doc, line_0based)?;
     Some(
         doc.symbols
             .iter()
@@ -165,6 +150,114 @@ pub fn callers(index: &Index, symbol: &str) -> Vec<OccurrenceHit> {
         .into_iter()
         .filter(|o| !o.is_definition)
         .collect()
+}
+
+/// A symbol with its defining document's path attached — the shape
+/// returned by queries that mix occurrences from multiple documents.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LocatedSymbol {
+    pub symbol: String,
+    pub display_name: String,
+    pub kind: String,
+    pub relative_path: String,
+    /// Zero-indexed start line of the symbol's definition occurrence,
+    /// when one is present in the document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<i32>,
+}
+
+/// For each non-definition occurrence of `symbol`, resolve the
+/// enclosing definition (via the same rule as
+/// [`enclosing_definition`]) and return a de-duplicated list of those
+/// enclosing definitions. Think "which functions call this symbol?"
+/// — the building block for test-discovery and impact analysis.
+pub fn enclosing_defs_of_callers(index: &Index, symbol: &str) -> Vec<LocatedSymbol> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for doc in &index.documents {
+        for occ in &doc.occurrences {
+            if occ.symbol != symbol {
+                continue;
+            }
+            if (occ.symbol_roles & SymbolRole::Definition as i32) != 0 {
+                continue;
+            }
+            let Some(line) = occ.range.first().copied() else {
+                continue;
+            };
+            let Some(enclosing_id) = enclosing_definition_symbol_id(doc, line) else {
+                continue;
+            };
+            if !seen.insert((doc.relative_path.clone(), enclosing_id.to_string())) {
+                continue;
+            }
+            let Some(info) = doc.symbols.iter().find(|s| s.symbol == enclosing_id) else {
+                continue;
+            };
+            let def_line = doc
+                .occurrences
+                .iter()
+                .find(|o| {
+                    o.symbol == info.symbol && (o.symbol_roles & SymbolRole::Definition as i32) != 0
+                })
+                .and_then(|o| o.range.first().copied());
+            out.push(LocatedSymbol {
+                symbol: info.symbol.clone(),
+                display_name: if info.display_name.is_empty() {
+                    info.symbol.clone()
+                } else {
+                    info.display_name.clone()
+                },
+                kind: format!("{:?}", info.kind.enum_value_or_default()),
+                relative_path: doc.relative_path.clone(),
+                line: def_line,
+            });
+        }
+    }
+    out
+}
+
+/// Every symbol defined in `relative_path` according to the index.
+/// Equivalent to filtering [`project_map`] to a single document but
+/// resolves in one pass without allocating every other document's
+/// entries.
+pub fn defs_in_path(index: &Index, relative_path: &str) -> Vec<LocatedSymbol> {
+    let Some(doc) = index
+        .documents
+        .iter()
+        .find(|d| d.relative_path == relative_path)
+    else {
+        return Vec::new();
+    };
+    document_map_symbols(doc, &[])
+        .into_iter()
+        .map(|s| LocatedSymbol {
+            symbol: s.symbol,
+            display_name: s.display_name,
+            kind: s.kind,
+            relative_path: doc.relative_path.clone(),
+            line: s.line,
+        })
+        .collect()
+}
+
+fn enclosing_definition_symbol_id(doc: &Document, line_0based: i32) -> Option<&str> {
+    let mut best: Option<(i32, &str)> = None;
+    for occ in &doc.occurrences {
+        if (occ.symbol_roles & SymbolRole::Definition as i32) == 0 {
+            continue;
+        }
+        let Some(start_line) = occ.range.first().copied() else {
+            continue;
+        };
+        if start_line > line_0based {
+            continue;
+        }
+        if best.is_none_or(|(b, _)| start_line >= b) {
+            best = Some((start_line, occ.symbol.as_str()));
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -465,5 +558,76 @@ mod tests {
             .find(|e| e.relative_path == "src/main.rs")
             .unwrap();
         assert_eq!(main_entry.symbols[0].line, Some(0));
+    }
+
+    #[test]
+    fn enclosing_defs_of_callers_finds_enclosing_fn() {
+        let idx = fake_index();
+        let helper_id = "rust-analyzer rust aide-mcp . `helper`().";
+        let callers = enclosing_defs_of_callers(&idx, helper_id);
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].display_name, "main");
+    }
+
+    #[test]
+    fn enclosing_defs_of_callers_dedupes_per_function() {
+        // A single function that references the target symbol twice
+        // should only appear once in the resolved caller list.
+        let parent_fn = SymbolInformation {
+            symbol: "s parent".into(),
+            display_name: "parent_fn".into(),
+            kind: EnumOrUnknown::new(Kind::Function),
+            ..Default::default()
+        };
+        let target_fn = SymbolInformation {
+            symbol: "s target".into(),
+            display_name: "target_fn".into(),
+            kind: EnumOrUnknown::new(Kind::Function),
+            ..Default::default()
+        };
+        let doc = Document {
+            relative_path: "src/x.rs".into(),
+            symbols: vec![parent_fn.clone(), target_fn.clone()],
+            occurrences: vec![
+                Occurrence {
+                    symbol: parent_fn.symbol.clone(),
+                    range: vec![0, 3, 8],
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    symbol: target_fn.symbol.clone(),
+                    range: vec![2, 4, 10],
+                    symbol_roles: 0,
+                    ..Default::default()
+                },
+                Occurrence {
+                    symbol: target_fn.symbol.clone(),
+                    range: vec![3, 4, 10],
+                    symbol_roles: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let idx = ScipIndex {
+            metadata: MessageField::some(Metadata::default()),
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let callers = enclosing_defs_of_callers(&idx, &target_fn.symbol);
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].display_name, "parent_fn");
+    }
+
+    #[test]
+    fn defs_in_path_returns_only_the_documents_defined_symbols() {
+        let idx = fake_index();
+        let defs = defs_in_path(&idx, "src/main.rs");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].display_name, "main");
+
+        let missing = defs_in_path(&idx, "nope.rs");
+        assert!(missing.is_empty());
     }
 }
