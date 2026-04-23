@@ -39,7 +39,8 @@ decisions, roadmap, current state — is mirrored here.
 | v0.10     | Test discovery via SCIP: `tests_for_symbol`, `tests_for_changed_files` with plugin-aware `is_test_symbol` heuristic | ✅ done |
 | v0.11     | Impact analysis: `impact_of_change` (callers classified test/bin/lib/example/bench), `public_api_diff(sha1, sha2)` | ✅ done |
 | v0.12     | Macro / generated code visibility: `lsp_expand_macro` via rust-analyzer's `expandMacro` extension | ✅ done — `cargo expand` fallback deferred |
-| v0.13     | Write-side tooling: `lsp_rename_symbol` with LSP-backed cross-file rename | ✅ done — `apply_code_action`, `safe_edit` deferred to v0.13.x |
+| v0.13     | Write-side tooling: `lsp_rename_symbol` with LSP-backed cross-file rename | ✅ done |
+| v0.13.1   | `lsp_list_code_actions` + `lsp_apply_code_action` (point or range, select by kind or title substring); `apply_workspace_edit` extended to handle `document_changes` | ✅ done |
 | v0.14     | Dogfood → roadmap loop: `dogfood_coverage_gaps` aggregates run records into a ranked report | ✅ done — CI integration deferred |
 
 ## Workspace layout
@@ -330,22 +331,6 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
   around `exec::run("cargo", ["expand", …])` with an early-return
   pointing at the install command when the binary is missing.
 
-- **`apply_code_action` (from v0.13)** — rename is live but LSP
-  code actions ("organize imports", "add missing match arm", "fill
-  struct fields") need a `workspace/executeCommand` round-trip and
-  a per-server registry of action kinds (rust-analyzer ships its
-  own list outside the standard). Blocker is scope, not ambiguity.
-  *Proposed move:* v0.13.1, next natural slot. Plan:
-  1. `lsp_list_code_actions(file, range)` — returns available
-     actions with title + kind.
-  2. `lsp_apply_code_action(file, range, kind_or_title)` — resolves
-     the action (server may need a follow-up `codeAction/resolve`),
-     runs any `workspace/executeCommand`, applies the resulting
-     WorkspaceEdit through the same `apply_workspace_edit` path
-     that `lsp_rename_symbol` already uses.
-  3. No new plugin hooks — code actions are per-server, discovered
-     at runtime.
-
 - **`safe_edit` with diagnostic-diff (from v0.13)** — the
   "snapshot diagnostics, apply edit, wait for server to
   re-analyse, snapshot again, diff" flow needs a reliable
@@ -382,13 +367,14 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
 
 ### Proposed next milestone
 
-**v0.13.1: `apply_code_action`.** Smallest clean scope of the four
-deferrals, reuses infrastructure that just landed (the
-`apply_workspace_edit` helper is already public), and adds a tool
-that pairs naturally with `lsp_rename_symbol` from the
-agent's perspective. The other three deferrals depend on either
-capability negotiation, usage data, or operational decisions that
-this session can't resolve unilaterally.
+**v0.13.2: `safe_edit`** is the cleanest remaining pick from the
+deferral list. Blocked on capability negotiation (pull diagnostics)
+and server-specific quiescence heuristics, but both are
+tractable — probe `diagnosticProvider` at `initialize`, use
+`workspace/diagnostic` when available and a time-boxed fallback
+otherwise. The two other deferrals (`run_cargo_expand`, dogfood CI)
+remain gated on usage data and operational decisions that don't
+belong to a coding session.
 
 ### Legacy open items
 
