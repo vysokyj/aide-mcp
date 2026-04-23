@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use git2::{ObjectType, TreeWalkMode, TreeWalkResult};
 use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch};
@@ -96,13 +97,7 @@ pub fn grep(
     options: &GrepOptions,
 ) -> Result<GrepResult, SearchError> {
     let matcher = build_matcher(pattern, options.case_sensitive)?;
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        .before_context(options.before_context.min(10))
-        .after_context(options.after_context.min(10))
-        .line_terminator(LineTerminator::byte(b'\n'))
-        .binary_detection(grep_searcher::BinaryDetection::quit(0))
-        .build();
+    let mut searcher = build_searcher(options);
 
     let ls_opts = LsOptions {
         glob: options.glob.clone(),
@@ -156,6 +151,121 @@ pub fn grep(
         total_matches,
         truncated,
     })
+}
+
+/// Run a regex search over the tree of commit `sha`.
+///
+/// Unlike [`grep`], this reads blob contents directly from libgit2 — no
+/// working-tree export is required, so historical searches are cheap
+/// and leave no filesystem trace. The same smart-case, binary-skip,
+/// context, and capping rules apply.
+pub fn grep_at(
+    repo_root: &Path,
+    sha: &str,
+    pattern: &str,
+    options: &GrepOptions,
+) -> Result<GrepResult, SearchError> {
+    let matcher = build_matcher(pattern, options.case_sensitive)?;
+    let mut searcher = build_searcher(options);
+
+    let glob_matcher = options
+        .glob
+        .as_deref()
+        .map(|pattern| {
+            globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map(|g| g.compile_matcher())
+                .map_err(|source| SearchError::InvalidGlob {
+                    pattern: pattern.to_string(),
+                    source,
+                })
+        })
+        .transpose()?;
+
+    let repo = git2::Repository::discover(repo_root)
+        .map_err(|_| SearchError::NotARepo(repo_root.to_path_buf()))?;
+    let oid = git2::Oid::from_str(sha)?;
+    let tree = repo.find_commit(oid)?.tree()?;
+
+    // Collect (path, blob_oid) pairs up front so we can drop the closure
+    // borrow before doing the blob reads (libgit2 lifetimes want it).
+    let mut entries: Vec<(String, git2::Oid)> = Vec::new();
+    tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+        if entry.kind() == Some(ObjectType::Blob) {
+            if let Some(name) = entry.name() {
+                let path = if root.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{root}{name}")
+                };
+                if glob_matcher.as_ref().is_none_or(|m| m.is_match(&path)) {
+                    entries.push((path, entry.id()));
+                }
+            }
+        }
+        TreeWalkResult::Ok
+    })?;
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hits: Vec<GrepHit> = Vec::new();
+    let mut total_matches = 0usize;
+    let mut truncated = false;
+    let files_scanned = entries.len();
+
+    'files: for (rel, blob_oid) in &entries {
+        let remaining = options.max_results.saturating_sub(total_matches);
+        if remaining == 0 {
+            truncated = true;
+            break 'files;
+        }
+        let effective_cap = options.max_results_per_file.min(remaining);
+
+        let Ok(blob) = repo.find_blob(*blob_oid) else {
+            continue;
+        };
+
+        let mut sink = CollectSink {
+            path: rel,
+            lines: Vec::new(),
+            match_count: 0,
+            per_file_cap: effective_cap,
+        };
+        let _ = searcher.search_slice(&matcher, blob.content(), &mut sink);
+
+        if sink.lines.is_empty() {
+            continue;
+        }
+        total_matches = total_matches.saturating_add(sink.match_count);
+
+        hits.push(GrepHit {
+            path: rel.clone(),
+            lines: sink.lines,
+        });
+
+        if total_matches >= options.max_results {
+            truncated = true;
+            break 'files;
+        }
+    }
+
+    Ok(GrepResult {
+        hits,
+        files_scanned,
+        total_matches,
+        truncated,
+    })
+}
+
+fn build_searcher(options: &GrepOptions) -> Searcher {
+    SearcherBuilder::new()
+        .line_number(true)
+        .before_context(options.before_context.min(10))
+        .after_context(options.after_context.min(10))
+        .line_terminator(LineTerminator::byte(b'\n'))
+        .binary_detection(grep_searcher::BinaryDetection::quit(0))
+        .build()
 }
 
 fn build_matcher(pattern: &str, case_sensitive: Option<bool>) -> Result<RegexMatcher, SearchError> {
@@ -377,6 +487,63 @@ mod tests {
         .unwrap();
         assert!(result.truncated);
         assert_eq!(result.total_matches, 1);
+    }
+
+    fn commit_sha(path: &Path) -> String {
+        let repo = git2::Repository::open(path).unwrap();
+        let sha = repo.head().unwrap().target().unwrap().to_string();
+        sha
+    }
+
+    #[test]
+    fn grep_at_reads_committed_blobs_not_worktree() {
+        let (_d, path) = init_repo();
+        let sha = commit_sha(&path);
+        // Dirty the working tree — must NOT leak into grep_at results.
+        fs::write(path.join("a.rs"), "fn totally_different() {}").unwrap();
+
+        let result = grep_at(&path, &sha, "fn hello", &GrepOptions::default()).unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "a.rs");
+        assert_eq!(result.hits[0].lines[0].line, 1);
+    }
+
+    #[test]
+    fn grep_at_skips_binary_committed_blobs() {
+        let (_d, path) = init_repo();
+        let sha = commit_sha(&path);
+        let result = grep_at(&path, &sha, ".", &GrepOptions::default()).unwrap();
+        assert!(result.hits.iter().all(|h| h.path != "bin.dat"));
+    }
+
+    #[test]
+    fn grep_at_respects_glob_filter() {
+        let (_d, path) = init_repo();
+        let sha = commit_sha(&path);
+        let result = grep_at(
+            &path,
+            &sha,
+            "fn",
+            &GrepOptions {
+                glob: Some("a.rs".into()),
+                ..GrepOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "a.rs");
+    }
+
+    #[test]
+    fn grep_at_rejects_unknown_sha() {
+        let (_d, path) = init_repo();
+        let result = grep_at(
+            &path,
+            "0000000000000000000000000000000000000000",
+            "fn",
+            &GrepOptions::default(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

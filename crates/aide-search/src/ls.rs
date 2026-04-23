@@ -4,10 +4,14 @@
 //! the `ignore` crate (ripgrep's walker). `Scope::Dirty` / `Scope::Staged`
 //! use `git2::Statuses` / HEAD-vs-index diff. An optional glob filter is
 //! applied after the scope has produced a candidate list.
+//!
+//! The commit-pinned counterpart [`list_files_at`] walks the tree of a
+//! specific commit via libgit2 — no working-tree export is required,
+//! so listing a historical snapshot is as cheap as listing the index.
 
 use std::path::Path;
 
-use git2::{DiffOptions, Status, StatusOptions};
+use git2::{DiffOptions, ObjectType, Status, StatusOptions, TreeWalkMode, TreeWalkResult};
 use globset::GlobBuilder;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -60,6 +64,66 @@ pub fn list_files(
         Scope::Dirty => dirty(repo_root)?,
         Scope::Staged => staged(repo_root)?,
     };
+
+    if let Some(m) = matcher {
+        files.retain(|p| m.is_match(p));
+    }
+
+    files.sort();
+    files.dedup();
+
+    if let Some(cap) = options.max_results {
+        files.truncate(cap);
+    }
+
+    Ok(files)
+}
+
+/// List files tracked in the tree of commit `sha`.
+///
+/// No checkout, no working-tree export — this reads the tree object
+/// directly via libgit2. Glob and `max_results` from `options` are
+/// honoured; `include_hidden` is ignored (a commit tree is exactly
+/// whatever git recorded, no walker rules apply).
+pub fn list_files_at(
+    repo_root: &Path,
+    sha: &str,
+    options: &LsOptions,
+) -> Result<Vec<String>, SearchError> {
+    let matcher = options
+        .glob
+        .as_deref()
+        .map(|pattern| {
+            GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map(|g| g.compile_matcher())
+                .map_err(|source| SearchError::InvalidGlob {
+                    pattern: pattern.to_string(),
+                    source,
+                })
+        })
+        .transpose()?;
+
+    let repo = git2::Repository::discover(repo_root)
+        .map_err(|_| SearchError::NotARepo(repo_root.to_path_buf()))?;
+    let oid = git2::Oid::from_str(sha)?;
+    let tree = repo.find_commit(oid)?.tree()?;
+
+    let mut files = Vec::new();
+    tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+        if entry.kind() == Some(ObjectType::Blob) {
+            if let Some(name) = entry.name() {
+                let path = if root.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{root}{name}")
+                };
+                files.push(path);
+            }
+        }
+        TreeWalkResult::Ok
+    })?;
 
     if let Some(m) = matcher {
         files.retain(|p| m.is_match(p));
@@ -273,6 +337,51 @@ mod tests {
         assert!(files.contains(&"a.rs".to_string()));
         assert!(files.contains(&"new.rs".to_string()));
         assert!(!files.contains(&"b.rs".to_string()));
+    }
+
+    fn commit_sha(repo_path: &Path) -> String {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        let sha = repo.head().unwrap().target().unwrap().to_string();
+        sha
+    }
+
+    #[test]
+    fn list_files_at_walks_commit_tree() {
+        let f = init_repo();
+        let sha = commit_sha(&f.path);
+        // Modify the working tree — must NOT leak into the at-commit listing.
+        fs::write(f.path.join("a.rs"), "fn changed() {}").unwrap();
+        fs::write(f.path.join("fresh.rs"), "fn x() {}").unwrap();
+
+        let files = list_files_at(&f.path, &sha, &LsOptions::default()).unwrap();
+        assert_eq!(files, vec!["a.rs", "b.rs", "sub/c.rs"]);
+    }
+
+    #[test]
+    fn list_files_at_honours_glob() {
+        let f = init_repo();
+        let sha = commit_sha(&f.path);
+        let files = list_files_at(
+            &f.path,
+            &sha,
+            &LsOptions {
+                glob: Some("sub/**".into()),
+                ..LsOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(files, vec!["sub/c.rs"]);
+    }
+
+    #[test]
+    fn list_files_at_rejects_unknown_sha() {
+        let f = init_repo();
+        let result = list_files_at(
+            &f.path,
+            "0000000000000000000000000000000000000000",
+            &LsOptions::default(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

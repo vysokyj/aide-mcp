@@ -140,6 +140,50 @@ pub struct ProjectGrepArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectLsAtArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Commit SHA whose tree should be listed.
+    pub sha: String,
+    /// Glob over the repo-relative path.
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Cap on the number of returned paths. Defaults to 500.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectGrepAtArgs {
+    /// Regex pattern. Smart-case by default.
+    pub pattern: String,
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Commit SHA whose tree should be searched.
+    pub sha: String,
+    /// Glob over repo-relative paths to restrict the blob set.
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Override smart-case: `true` = sensitive, `false` = insensitive.
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    /// Lines of context before each match (capped at 10).
+    #[serde(default)]
+    pub before_context: Option<usize>,
+    /// Lines of context after each match (capped at 10).
+    #[serde(default)]
+    pub after_context: Option<usize>,
+    /// Total cap on matches across all files. Defaults to 200.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// Cap on matches per file. Defaults to 50.
+    #[serde(default)]
+    pub max_results_per_file: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LspPositionArgs {
     /// Absolute path to the source file.
     pub file: String,
@@ -764,6 +808,56 @@ impl AideServer {
             include_hidden: args.include_hidden,
         };
         match aide_search::grep(&root, &args.pattern, &scope, &options) {
+            Ok(result) => to_json(&result),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Like project_ls, but against the tree of a specific commit. Reads the git tree object directly — no worktree checkout, no TempDir, no filesystem side effects. Useful for auditing historical state without disturbing the working tree. Always uses the committed file set as scope (git scopes Tracked/Dirty/Staged don't apply)."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn project_ls_at(&self, Parameters(args): Parameters<ProjectLsAtArgs>) -> String {
+        let root = resolve_root(args.path);
+        let max_results = args.max_results.unwrap_or(500);
+        let options = aide_search::LsOptions {
+            glob: args.glob,
+            max_results: Some(max_results),
+            include_hidden: false,
+        };
+        match aide_search::list_files_at(&root, &args.sha, &options) {
+            Ok(files) => {
+                let total = files.len();
+                let truncated = total == max_results;
+                let result = ProjectLsResult {
+                    root: root.display().to_string(),
+                    scope: format!("at:{}", short_sha(&args.sha)),
+                    files,
+                    total,
+                    truncated,
+                };
+                to_json(&result)
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Like project_grep, but against the tree of a specific commit. Reads blob bytes directly from libgit2 (no worktree export) and runs the ripgrep engine over them. Smart-case, binary skip, context, and result caps work identically to project_grep."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn project_grep_at(&self, Parameters(args): Parameters<ProjectGrepAtArgs>) -> String {
+        let root = resolve_root(args.path);
+        let options = aide_search::GrepOptions {
+            glob: args.glob,
+            case_sensitive: args.case_sensitive,
+            before_context: args.before_context.unwrap_or(0),
+            after_context: args.after_context.unwrap_or(0),
+            max_results_per_file: args.max_results_per_file.unwrap_or(50),
+            max_results: args.max_results.unwrap_or(200),
+            include_hidden: false,
+        };
+        match aide_search::grep_at(&root, &args.sha, &args.pattern, &options) {
             Ok(result) => to_json(&result),
             Err(e) => error_json(e.to_string()),
         }
@@ -1538,6 +1632,11 @@ fn parse_scope(raw: Option<&str>) -> Result<aide_search::Scope, String> {
             "unknown scope {other:?}; expected one of: tracked, all, dirty, staged"
         )),
     }
+}
+
+fn short_sha(sha: &str) -> String {
+    let len = sha.len().min(12);
+    sha[..len].to_string()
 }
 
 fn scope_label(scope: &aide_search::Scope) -> &'static str {

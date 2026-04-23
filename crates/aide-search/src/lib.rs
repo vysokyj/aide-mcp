@@ -24,8 +24,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-pub use crate::grep::{grep, GrepHit, GrepOptions, LineMatch};
-pub use crate::ls::{list_files, LsOptions};
+pub use crate::grep::{grep, grep_at, GrepHit, GrepOptions, GrepResult, LineKind, LineMatch};
+pub use crate::ls::{list_files, list_files_at, LsOptions};
 pub use crate::scope::Scope;
 
 #[derive(Debug, Error)]
