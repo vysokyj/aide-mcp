@@ -25,23 +25,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: false
-            archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            use_cross: true
             archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-13
-            use_cross: false
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-14
-            use_cross: false
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            use_cross: false
             archive: zip
     steps:
       - uses: actions/checkout@v4
@@ -56,18 +48,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --locked --version 0.2.5
-
       - name: Build
         shell: bash
-        run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --bin aide-mcp
-          else
-            cargo build --release --target ${{ matrix.target }} --bin aide-mcp
-          fi
+        run: cargo build --release --target ${{ matrix.target }} --bin aide-mcp
 
       - name: Resolve version
         id: ver
@@ -84,7 +67,7 @@ jobs:
           set -eux
           NAME="aide-mcp-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
           mkdir -p "$NAME"
-          cp README.md "$NAME/"
+          cp README.md LICENSE "$NAME/"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             cp "target/${{ matrix.target }}/release/aide-mcp.exe" "$NAME/"
             7z a "${NAME}.zip" "$NAME" >/dev/null
