@@ -222,6 +222,190 @@ pub async fn workspace_symbols(
     })
 }
 
+/// Find-and-replace `old_string` with `new_string` in `file`,
+/// measure the LSP diagnostic delta, and return the change classified
+/// into new errors, new warnings, and resolved findings. `old_string`
+/// must be unique in the file (mirrors the `Edit` tool's semantics);
+/// the MCP layer errors out early if not.
+///
+/// Diagnostics are snapshotted from the LSP server's published
+/// stream, with a time-boxed `settle` wait between the edit and the
+/// after-snapshot to let the server re-analyse. Results are
+/// best-effort on servers that don't finish re-analysing inside
+/// `settle` — this is marked on the report so the agent knows when
+/// to double-check with a full build.
+pub async fn safe_edit(
+    client: &LspClient,
+    path: &Path,
+    old_string: &str,
+    new_string: &str,
+    related_paths: &[std::path::PathBuf],
+    settle: Duration,
+) -> Result<SafeEditReport, LspClientError> {
+    ensure_document_current(client, path).await?;
+
+    let before_contents = tokio::fs::read_to_string(path)
+        .await
+        .map_err(LspClientError::from_io)?;
+    let matches = before_contents.matches(old_string).count();
+    if matches != 1 {
+        return Err(LspClientError::LspError {
+            code: -32_000,
+            message: format!(
+                "safe_edit: `old_string` must occur exactly once in {} (found {matches})",
+                path.display()
+            ),
+        });
+    }
+
+    let all_paths: Vec<std::path::PathBuf> = std::iter::once(path.to_path_buf())
+        .chain(related_paths.iter().cloned())
+        .collect();
+    let before = snapshot_published_diagnostics(client, &all_paths).await?;
+
+    let after_contents = before_contents.replacen(old_string, new_string, 1);
+    tokio::fs::write(path, &after_contents)
+        .await
+        .map_err(LspClientError::from_io)?;
+
+    let uri = path_to_uri(path)?;
+    let mut docs = client.opened_documents().lock().await;
+    if let Some(doc) = docs.get_mut(&uri) {
+        doc.version += 1;
+        doc.text.clone_from(&after_contents);
+        let version = doc.version;
+        drop(docs);
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: after_contents.clone(),
+            }],
+        };
+        client.notify::<DidChangeTextDocument>(params).await?;
+    } else {
+        drop(docs);
+        // File wasn't open yet; ensure_document_current at next read.
+    }
+
+    tokio::time::sleep(settle).await;
+    let after = snapshot_published_diagnostics(client, &all_paths).await?;
+
+    Ok(build_safe_edit_report(path, &before, &after, settle))
+}
+
+async fn snapshot_published_diagnostics(
+    client: &LspClient,
+    paths: &[std::path::PathBuf],
+) -> Result<Vec<DiagnosticSnapshot>, LspClientError> {
+    let mut out = Vec::new();
+    for p in paths {
+        let uri = path_to_uri(p)?;
+        let raw = client.diagnostics_for(&uri).await;
+        for d in raw {
+            out.push(DiagnosticSnapshot {
+                file: p.display().to_string(),
+                line: d.range.start.line,
+                col: d.range.start.character,
+                severity: d
+                    .severity
+                    .map_or_else(|| "Unknown".to_string(), |s| format!("{s:?}")),
+                message: d.message,
+                source: d.source,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn build_safe_edit_report(
+    path: &Path,
+    before: &[DiagnosticSnapshot],
+    after: &[DiagnosticSnapshot],
+    settle: Duration,
+) -> SafeEditReport {
+    let before_keys: std::collections::HashSet<_> = before.iter().map(diag_key).collect();
+    let after_keys: std::collections::HashSet<_> = after.iter().map(diag_key).collect();
+
+    let new: Vec<_> = after
+        .iter()
+        .filter(|d| !before_keys.contains(&diag_key(d)))
+        .cloned()
+        .collect();
+    let resolved: Vec<_> = before
+        .iter()
+        .filter(|d| !after_keys.contains(&diag_key(d)))
+        .cloned()
+        .collect();
+
+    let new_errors: Vec<_> = new
+        .iter()
+        .filter(|d| d.severity == "Error")
+        .cloned()
+        .collect();
+    let new_warnings: Vec<_> = new
+        .iter()
+        .filter(|d| d.severity == "Warning")
+        .cloned()
+        .collect();
+
+    SafeEditReport {
+        edited_file: path.display().to_string(),
+        total_before: before.len(),
+        total_after: after.len(),
+        new_errors,
+        new_warnings,
+        resolved,
+        unchanged_count: before_keys.intersection(&after_keys).count(),
+        confidence: "best_effort".to_string(),
+        settle_ms: u64::try_from(settle.as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+fn diag_key(d: &DiagnosticSnapshot) -> (String, u32, u32, String, String) {
+    (
+        d.file.clone(),
+        d.line,
+        d.col,
+        d.severity.clone(),
+        d.message.clone(),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticSnapshot {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+    pub severity: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SafeEditReport {
+    pub edited_file: String,
+    pub total_before: usize,
+    pub total_after: usize,
+    pub new_errors: Vec<DiagnosticSnapshot>,
+    pub new_warnings: Vec<DiagnosticSnapshot>,
+    pub resolved: Vec<DiagnosticSnapshot>,
+    pub unchanged_count: usize,
+    /// `"best_effort"` — diagnostics are snapshotted from the
+    /// published stream after a fixed `settle_ms` wait. On servers
+    /// that analyse faster than `settle_ms`, results are reliable;
+    /// on slower ones the `new_*` lists may be incomplete. Follow
+    /// up with `cargo check` / `run_tests` for definitive results
+    /// when the report is non-trivial.
+    pub confidence: String,
+    pub settle_ms: u64,
+}
+
 /// Rename the symbol at `(line, col)` to `new_name` across the
 /// whole workspace, applying the resulting [`WorkspaceEdit`] to
 /// disk (and to the server's in-memory buffers). Returns a summary

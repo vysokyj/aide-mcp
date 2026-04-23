@@ -198,6 +198,28 @@ pub struct LspPositionArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SafeEditArgs {
+    pub file: String,
+    /// Must occur exactly once in `file`. Mirrors the `Edit` tool's
+    /// uniqueness rule so the agent can't accidentally touch the
+    /// wrong occurrence.
+    pub old_string: String,
+    pub new_string: String,
+    /// Other files to snapshot diagnostics in — useful when the
+    /// edit is expected to affect e.g. downstream call sites.
+    /// Empty by default: only the edited file is measured.
+    #[serde(default)]
+    pub related_files: Vec<String>,
+    /// Milliseconds to wait between `didChange` and the after-
+    /// snapshot. Defaults to 1500. Bigger = more reliable on cold
+    /// or large workspaces; smaller = faster feedback loop.
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LspCodeActionRangeArgs {
     pub file: String,
     /// 0-indexed line numbers for the action's range. `end_line` /
@@ -1151,6 +1173,43 @@ impl AideServer {
 
         match lsp_ops::definition(&client, &file, args.line, args.column).await {
             Ok(hits) => to_json(&hits),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Apply a unique `old_string` → `new_string` replacement in `file` and return the LSP diagnostic delta: new errors, new warnings, resolved findings, and the count of unchanged ones. `old_string` must occur exactly once. Optional `related_files` expands which files get snapshotted (use when an edit is expected to propagate to callers). `settle_ms` (default 1500) controls how long to wait between the edit and the after-snapshot — longer is more reliable on slower servers. The `confidence` field is always `\"best_effort\"`: this tool is a fast feedback loop, not a replacement for `run_tests`/`cargo check` when the stakes are high."
+    )]
+    async fn safe_edit(&self, Parameters(args): Parameters<SafeEditArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        let related: Vec<PathBuf> = args.related_files.iter().map(PathBuf::from).collect();
+        let settle = Duration::from_millis(args.settle_ms.unwrap_or(1500));
+
+        match lsp_ops::safe_edit(
+            &client,
+            &file,
+            &args.old_string,
+            &args.new_string,
+            &related,
+            settle,
+        )
+        .await
+        {
+            Ok(report) => to_json(&report),
             Err(e) => error_json(e.to_string()),
         }
     }
