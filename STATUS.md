@@ -33,7 +33,14 @@ decisions, roadmap, current state — is mirrored here.
 | v0.4      | SCIP build + query | ✅ done |
 | v0.5      | exec tools (run/test/install) | ✅ done |
 | v0.6      | DAP proxy (Rust via codelldb first) | ✅ done |
-| v0.7      | project-scoped search primitives (`project_ls`, `project_grep`) to make `ls`/`find`/`grep` via Bash unnecessary | 🚧 in progress — core tools landed, RAM cache and commit-pinned variants deferred |
+| v0.7      | project-scoped search primitives (`project_ls`, `project_grep`) to make `ls`/`find`/`grep` via Bash unnecessary | ✅ done — `project_ls(_at)`, `project_grep(_at)`, SCIP symbol annotation on grep hits |
+| v0.8      | Structured compiler/test feedback: cargo/rustc JSON diagnostics parsed into `ExecResult.diagnostics`, each tagged with enclosing SCIP symbol | 📋 planned |
+| v0.9      | Semantic navigation aggregates: `task_context(file)`, `project_map`, `scip_callers/callees` convenience wrappers — saves ~5 roundtrips per "pick up work on X" | 📋 planned |
+| v0.10     | Test discovery via SCIP: `tests_for_symbol`, `tests_for_changed_files`; `run_tests` can auto-derive filter from working-tree dirty set | 📋 planned |
+| v0.11     | Impact analysis: `impact_of_change(symbol)` (callers classified test/bin/lib), `public_api_diff(sha1, sha2)` for structured pub-surface deltas | 📋 planned |
+| v0.12     | Macro / generated code visibility: `lsp_expand_macro` (rust-analyzer code action) + `cargo expand` fallback. Makes macro-heavy code (serde, clap, sqlx) legible to agents | 📋 planned |
+| v0.13     | Write-side tooling: `edit_by_symbol`, `lsp_rename_symbol`, `apply_code_action`, `safe_edit` wrapper that measures diagnostic delta before/after. Agents stop doing text-level surgery | 📋 planned |
+| v0.14     | Dogfood → roadmap loop: aggregate coverage-gap output across runs, auto-propose new tool ideas; optional CI of the paired-agent benchmark | 📋 planned |
 
 ## Workspace layout
 
@@ -185,16 +192,129 @@ Modes for `git_diff`: `"head-to-worktree"` (default), `"index-to-worktree"`,
 
 ## What to build next
 
-Core roadmap (v0.1 through v0.6) plus two polish rounds are complete;
-v0.7 search primitives landed in minimal form. Remaining open ideas:
+Core roadmap (v0.1 through v0.6) plus two polish rounds are complete.
+v0.7 landed with `project_ls(_at)`, `project_grep(_at)`, and SCIP
+symbol annotation on grep hits. The next milestones focus on what the
+dogfood benchmark keeps revealing: agents still burn roundtrips on
+unstructured compiler output, on reassembling context from many small
+queries, and on text-level editing when the semantic layer is right
+there.
 
-- **v0.7 follow-ups** — RAM cache for `project_ls` invalidated on git
-  index mtime (so repeated calls in one session are O(1)); commit-pinned
-  variants (`project_ls_at(sha)`, `project_grep_at(sha)`) piggy-backing
-  on `aide_git::export_commit`; SCIP annotation of grep hits (attach
-  `symbol_at_line` from the `last_ready` index when the hit path is
-  covered). These were deliberately deferred from the first commit to
-  keep scope tight.
+### v0.8 — Structured compiler / test feedback
+
+Agents today consume wall-of-text from `cargo test`, `cargo check`,
+`cargo clippy` and re-derive "what does this error mean, where does
+it come from, which function am I breaking." Cargo already speaks
+JSON (`--message-format=json`); parsing it on the aide side means
+each diagnostic surfaces as:
+
+```json
+{
+  "level": "error",
+  "code": "E0382",
+  "message": "borrow of moved value: `x`",
+  "file": "src/foo.rs",
+  "line": 42,
+  "enclosing_symbol": "Foo::process",
+  "spans": [ ... ],
+  "suggested_fix": "..."
+}
+```
+
+The enclosing-symbol trick is identical to the one `project_grep`
+now uses — resolve the last Ready SCIP, feed each diagnostic line
+through `enclosing_definition`. `lsp_diagnostics` gets the same
+annotation for free.
+
+Shape: add `diagnostics: Vec<StructuredDiagnostic>` alongside the
+existing `stdout`/`stderr` on `ExecResult`. Plugins get a
+`parse_diagnostics(stdout) -> Vec<Diagnostic>` hook with a default
+empty impl; the Rust plugin flips `cargo` into JSON mode via extra
+args.
+
+### v0.9 — Semantic navigation aggregates
+
+Individual LSP/SCIP tools are sharp but agents still open sessions
+with a cascade of `lsp_document_symbols` + `git_log` + `git_blame`
++ `lsp_diagnostics` just to orient. One aggregate call beats five:
+
+- `task_context(file)` — document symbols, recent blame (author +
+  commit message), current diagnostics, HEAD→worktree diff for this
+  file, enclosing crate/module. One MCP round-trip.
+- `project_map(path?)` — public API surface digest from the last
+  Ready SCIP: crates, modules, pub traits/types, entry points.
+  Replaces the "grep `pub fn`" reflex.
+- `scip_callers(symbol)` / `scip_callees(symbol)` — thin wrappers
+  over `scip_references` that split definition from use and group
+  by file. What agents actually want.
+
+### v0.10 — Test discovery via SCIP
+
+"I edited foo::bar, which tests cover it?" is the most expensive
+question to answer today (read every `#[test]`, guess from names).
+SCIP already has the call graph:
+
+- `tests_for_symbol(symbol)` — any test function that transitively
+  references `symbol` via SCIP edges.
+- `tests_for_changed_files(since?)` — union of the above for every
+  symbol defined in dirty/staged files (or diffed since a ref).
+- `run_tests` gains `derive_filter: bool` that feeds this directly
+  into `cargo test <filter>`.
+
+### v0.11 — Impact analysis
+
+Before a risky edit, answer "how wide is the blast radius":
+
+- `impact_of_change(symbol)` — callers classified as test vs lib
+  vs bin, with enclosing symbol for each call site.
+- `public_api_diff(sha1, sha2)` — structured diff of the pub surface
+  between two commits (added / removed / signature-changed). Much
+  sharper than `git diff | grep pub`.
+
+### v0.12 — Macro / generated-code visibility
+
+Macro-heavy crates (serde, clap, sqlx, tokio::select) are where
+agents flail the most because the apparent source is not what the
+compiler sees. Two cheap wins:
+
+- `lsp_expand_macro(file, line, col)` via rust-analyzer's "Expand
+  macro recursively" code action.
+- `run_cargo_expand(path, target)` subprocess fallback when the
+  code action isn't available or for whole-module expansion.
+
+Same idea applies to Lombok in Java later.
+
+### v0.13 — Write-side tooling
+
+aide today reads semantically but agents still edit by `Edit`/regex.
+This is where the biggest correctness wins live:
+
+- `edit_by_symbol(symbol_id, new_body)` — LSP workspace edits keyed
+  by SCIP symbol id. No scope guessing.
+- `lsp_rename_symbol(file, line, col, new_name)` — proper cross-file
+  rename via LSP `textDocument/rename`.
+- `apply_code_action(file, line, kind)` — invoke LSP code actions
+  ("organize imports", "add missing match arm", "fill struct
+  fields") by action kind.
+- `safe_edit(edits)` — wrap any write with a before/after diagnostic
+  diff. Returns "your change added N new errors in M files" so the
+  agent can self-correct without re-running the build.
+
+Architectural step: adds `apply` semantics to the server. Needs a
+careful conflict-resolution story for concurrent LSP + filesystem
+writes.
+
+### v0.14 — Dogfood → roadmap loop
+
+The paired-agent benchmark already emits a `Coverage gaps` section
+per run ("this Bash call had no aide equivalent"). Today those
+gaps live in `dogfood/runs/NNN-*.md` and have to be read by hand.
+Aggregate across runs: `dogfood_gap_report()` surfacing the
+most-common missing tools, ordered by frequency and recency. Close
+the loop between "what agents actually need" and "what aide
+ships." Optional: wire it to CI so every merge re-benchmarks.
+
+### Legacy open items
 
 - **scip-java auto-install** — Sourcegraph distributes via coursier,
   not a standalone tarball. Would need either a coursier bootstrap
