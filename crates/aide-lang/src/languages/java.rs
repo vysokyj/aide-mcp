@@ -303,12 +303,24 @@ mod tests {
 
     #[test]
     fn lsp_spawn_args_contains_workspace_data_dir() {
-        let paths = AidePaths::at("/tmp/aide-test");
+        // Build the root via env::temp_dir() + PathBuf::join so the
+        // expected-path comparison uses whatever separator the current
+        // platform actually produces (backslash on windows, slash on unix).
+        let root = std::env::temp_dir().join("aide-test");
+        let paths = AidePaths::at(&root);
         let args = JavaMavenPlugin.lsp_spawn_args(Path::new("/home/u/proj"), &paths);
         assert_eq!(args[0], "-data");
-        let data = args[1].to_string_lossy();
-        assert!(data.contains("/tmp/aide-test/lsp-cache/jdtls/"));
-        assert!(data.ends_with("home_u_proj"));
+        let data = PathBuf::from(&args[1]);
+        let expected_parent = root.join("lsp-cache").join("jdtls");
+        assert!(
+            data.starts_with(&expected_parent),
+            "data={data:?} expected to start with {expected_parent:?}"
+        );
+        assert_eq!(
+            data.file_name().unwrap().to_string_lossy(),
+            "home_u_proj",
+            "workspace slug must end the data dir"
+        );
     }
 
     #[test]
@@ -341,7 +353,9 @@ mod tests {
         assert_eq!(spec.version, LOMBOK_VERSION);
         let url = match &spec.source {
             aide_install::Source::DirectUrl { assets, .. } => assets[0].url.clone(),
-            _ => panic!("lombok must be DirectUrl-sourced"),
+            aide_install::Source::GithubRelease { .. } => {
+                panic!("lombok must be DirectUrl-sourced")
+            }
         };
         assert!(url.contains(LOMBOK_VERSION), "url lost the version pin");
         assert!(
