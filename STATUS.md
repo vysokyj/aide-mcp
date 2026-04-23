@@ -41,6 +41,7 @@ decisions, roadmap, current state — is mirrored here.
 | v0.12     | Macro / generated code visibility: `lsp_expand_macro` via rust-analyzer's `expandMacro` extension | ✅ done — `cargo expand` fallback deferred |
 | v0.13     | Write-side tooling: `lsp_rename_symbol` with LSP-backed cross-file rename | ✅ done |
 | v0.13.1   | `lsp_list_code_actions` + `lsp_apply_code_action` (point or range, select by kind or title substring); `apply_workspace_edit` extended to handle `document_changes` | ✅ done |
+| v0.13.2   | `safe_edit` — apply unique `old_string → new_string`, snapshot LSP diagnostics before/after, return the classified delta | ✅ done |
 | v0.14     | Dogfood → roadmap loop: `dogfood_coverage_gaps` aggregates run records into a ranked report | ✅ done — CI integration deferred |
 
 ## Workspace layout
@@ -331,25 +332,17 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
   around `exec::run("cargo", ["expand", …])` with an early-return
   pointing at the install command when the binary is missing.
 
-- **`safe_edit` with diagnostic-diff (from v0.13)** — the
-  "snapshot diagnostics, apply edit, wait for server to
-  re-analyse, snapshot again, diff" flow needs a reliable
-  "analysis done" signal. rust-analyzer doesn't publish one that
-  the standard LSP client can observe; the pull-model
-  `workspace/diagnostic` request (LSP 3.17+) is the right answer
-  but not universally supported.
-  *Proposed move:* v0.13.2 or v0.15, paired with capability
-  probing. Plan:
-  1. Detect pull-diagnostics support at `initialize` time from the
-     server's `workspace.diagnostics.workDoneProgress` /
-     `diagnosticProvider` capabilities.
-  2. When supported: `snapshot → apply → poll
-     workspace/diagnostic → diff`.
-  3. When not: degrade to a fixed 1.5s settle + best-effort
-     published-diagnostics read, flag the result as
-     `confidence: best_effort`.
-  4. Response shape: `{new_errors, new_warnings, resolved,
-     unchanged_count, confidence}`.
+- **Pull-diagnostics in `safe_edit` (v0.13.2 refinement)** —
+  `safe_edit` currently uses the published-diagnostics path with a
+  fixed `settle_ms` wait, which is "best-effort" on cold or large
+  workspaces. The LSP 3.17+ pull-model `textDocument/diagnostic`
+  request is the way to get synchronous "what do you think now?"
+  answers. *Proposed move:* deferred until a real run hits the
+  fixed-wait limit. When it does: probe `diagnosticProvider` at
+  `initialize`, use the pull path when available, keep the
+  published-stream path as universal fallback, promote the
+  `confidence` field from `"best_effort"` to `"synchronous"` when
+  pull succeeded.
 
 - **Dogfood CI integration (from v0.14)** — the aggregator
   exists; what's missing is an automated GitHub Action that runs
@@ -367,14 +360,20 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
 
 ### Proposed next milestone
 
-**v0.13.2: `safe_edit`** is the cleanest remaining pick from the
-deferral list. Blocked on capability negotiation (pull diagnostics)
-and server-specific quiescence heuristics, but both are
-tractable — probe `diagnosticProvider` at `initialize`, use
-`workspace/diagnostic` when available and a time-boxed fallback
-otherwise. The two other deferrals (`run_cargo_expand`, dogfood CI)
-remain gated on usage data and operational decisions that don't
-belong to a coding session.
+The v0.8–v0.14 batch plus v0.13.1 and v0.13.2 all shipped. The
+remaining deferrals (`run_cargo_expand`, pull-diagnostics refinement,
+dogfood CI) are each gated on evidence that isn't yet in the
+repo — a run that demands whole-module macro expansion, a
+safe_edit call whose fixed wait genuinely misses reanalysis, or
+enough dogfood runs to make CI worthwhile. Rather than speculate,
+hold and let the dogfood loop tell us what to pick up next.
+
+A good next *research* pass (not implementation) is a paired
+benchmark over a real multi-file refactor — something that
+exercises rename, apply_code_action, and safe_edit end-to-end —
+to see whether the write-side trio actually bends the
+tool-call-count curve on the aide side. That's the kind of data
+that justifies picking one of the remaining deferrals.
 
 ### Legacy open items
 
