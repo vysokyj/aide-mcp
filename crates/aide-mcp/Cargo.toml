@@ -22,6 +22,7 @@ aide-scip.workspace = true
 aide-search.workspace = true
 
 anyhow.workspace = true
+lsp-types.workspace = true
 rmcp = { workspace = true }
 schemars.workspace = true
 serde = { workspace = true }

@@ -198,6 +198,44 @@ pub struct LspPositionArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspCodeActionRangeArgs {
+    pub file: String,
+    /// 0-indexed line numbers for the action's range. `end_line` /
+    /// `end_column` default to `line` / `column` — i.e. a point
+    /// range at the cursor.
+    pub line: u32,
+    pub column: u32,
+    #[serde(default)]
+    pub end_line: Option<u32>,
+    #[serde(default)]
+    pub end_column: Option<u32>,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspApplyCodeActionArgs {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    #[serde(default)]
+    pub end_line: Option<u32>,
+    #[serde(default)]
+    pub end_column: Option<u32>,
+    /// Case-insensitive substring match on the action's title. One
+    /// of `title` / `kind` must be set; if both are set, `kind`
+    /// wins.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Exact match on the action's LSP kind (e.g.
+    /// "source.organizeImports", "quickfix", "refactor.extract").
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LspRenameArgs {
     pub file: String,
     pub line: u32,
@@ -862,6 +900,23 @@ fn relativize_path(root: &std::path::Path, file: &str) -> String {
     file.to_string()
 }
 
+fn range_from_args(
+    line: u32,
+    column: u32,
+    end_line: Option<u32>,
+    end_column: Option<u32>,
+) -> lsp_types::Range {
+    let start = lsp_types::Position {
+        line,
+        character: column,
+    };
+    let end = lsp_types::Position {
+        line: end_line.unwrap_or(line),
+        character: end_column.unwrap_or(column),
+    };
+    lsp_types::Range { start, end }
+}
+
 #[tool_router]
 impl AideServer {
     #[tool(description = "Detect which supported languages appear in the given project root")]
@@ -1096,6 +1151,73 @@ impl AideServer {
 
         match lsp_ops::definition(&client, &file, args.line, args.column).await {
             Ok(hits) => to_json(&hits),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "List LSP code actions (quick-fixes, refactorings, \"organize imports\", \"fill match arms\", …) offered at a range in `file`. When `end_line`/`end_column` are omitted, the range collapses to the cursor position. Each entry has `title`, optional `kind`, and a `disabled` flag. Pair with `lsp_apply_code_action` to actually run one."
+    )]
+    async fn lsp_list_code_actions(
+        &self,
+        Parameters(args): Parameters<LspCodeActionRangeArgs>,
+    ) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        let range = range_from_args(args.line, args.column, args.end_line, args.end_column);
+        match lsp_ops::list_code_actions(&client, &file, range).await {
+            Ok(hits) => to_json(&hits),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Run a single LSP code action at a range in `file`, selected by `kind` (exact, e.g. \"source.organizeImports\") or `title` (case-insensitive substring). Resolves the action if the server returned a lazy stub, applies its WorkspaceEdit (both `changes` and `document_changes` shapes), and dispatches any attached `workspace/executeCommand`. Returns `{title, kind, applied_edit: {files, total_edits}, ran_command}` — null if no offered action matches the selector."
+    )]
+    async fn lsp_apply_code_action(
+        &self,
+        Parameters(args): Parameters<LspApplyCodeActionArgs>,
+    ) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let selector = if let Some(kind) = args.kind {
+            lsp_ops::CodeActionSelector::Kind(kind)
+        } else if let Some(title) = args.title {
+            lsp_ops::CodeActionSelector::Title(title)
+        } else {
+            return error_json("one of `title` or `kind` must be set".to_string());
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        let range = range_from_args(args.line, args.column, args.end_line, args.end_column);
+        match lsp_ops::apply_code_action(&client, &file, range, &selector).await {
+            Ok(Some(applied)) => to_json(&applied),
+            Ok(None) => "null".to_string(),
             Err(e) => error_json(e.to_string()),
         }
     }

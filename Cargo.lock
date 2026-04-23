@@ -114,6 +114,7 @@ dependencies = [
  "aide-scip",
  "aide-search",
  "anyhow",
+ "lsp-types",
  "rmcp",
  "schemars 0.8.22",
  "serde",

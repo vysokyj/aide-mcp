@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
 use lsp_types::request::{
-    DocumentSymbolRequest, GotoDefinition, HoverRequest, References, Rename, WorkspaceSymbolRequest,
+    CodeActionRequest, CodeActionResolveRequest, DocumentSymbolRequest, ExecuteCommand,
+    GotoDefinition, HoverRequest, References, Rename, WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, HoverContents,
-    HoverParams, MarkedString, PartialResultParams, Position, ReferenceContext, ReferenceParams,
+    CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
+    DocumentChanges, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams,
+    MarkedString, PartialResultParams, Position, Range, ReferenceContext, ReferenceParams,
     RenameParams, SymbolInformation, SymbolKind, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
     VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbol,
@@ -253,10 +256,13 @@ pub async fn rename(
 }
 
 /// Write every change in `edit` back to disk, keeping the LSP
-/// server's in-memory buffers in sync. Edits for each file are
-/// applied in descending byte order so earlier ranges remain valid
-/// after later ones shift. Returns a summary for agents — which
-/// files changed, how many edits per file.
+/// server's in-memory buffers in sync. Handles both the legacy
+/// `changes` map and the newer `document_changes` shape that
+/// rust-analyzer and other LSP 3.16+ servers prefer; file-create /
+/// -rename / -delete operations inside `document_changes` are
+/// skipped with a warning (can be added later). Edits for each
+/// file are applied in descending byte order so earlier ranges
+/// remain valid after later ones shift.
 pub async fn apply_workspace_edit(
     client: &LspClient,
     edit: &WorkspaceEdit,
@@ -266,45 +272,113 @@ pub async fn apply_workspace_edit(
 
     if let Some(changes) = edit.changes.as_ref() {
         for (uri, edits) in changes {
-            let path = uri_to_path(uri)?;
-            let before = tokio::fs::read_to_string(&path)
-                .await
-                .map_err(LspClientError::from_io)?;
-            let after = apply_text_edits(&before, edits);
-            let edit_count = edits.len();
-            total_edits += edit_count;
-            tokio::fs::write(&path, &after)
-                .await
-                .map_err(LspClientError::from_io)?;
+            apply_edits_to_file(client, uri, edits, &mut files, &mut total_edits).await?;
+        }
+    }
 
-            let mut docs = client.opened_documents().lock().await;
-            if let Some(doc) = docs.get_mut(uri) {
-                doc.version += 1;
-                doc.text.clone_from(&after);
-                let version = doc.version;
-                drop(docs);
-                let params = DidChangeTextDocumentParams {
-                    text_document: VersionedTextDocumentIdentifier {
-                        uri: uri.clone(),
-                        version,
-                    },
-                    content_changes: vec![TextDocumentContentChangeEvent {
-                        range: None,
-                        range_length: None,
-                        text: after.clone(),
-                    }],
-                };
-                client.notify::<DidChangeTextDocument>(params).await?;
+    if let Some(doc_changes) = edit.document_changes.as_ref() {
+        match doc_changes {
+            DocumentChanges::Edits(edits) => {
+                for td_edit in edits {
+                    let uri = &td_edit.text_document.uri;
+                    let text_edits: Vec<TextEdit> = td_edit
+                        .edits
+                        .iter()
+                        .map(|oe| match oe {
+                            lsp_types::OneOf::Left(te) => te.clone(),
+                            lsp_types::OneOf::Right(annotated) => TextEdit {
+                                range: annotated.text_edit.range,
+                                new_text: annotated.text_edit.new_text.clone(),
+                            },
+                        })
+                        .collect();
+                    apply_edits_to_file(client, uri, &text_edits, &mut files, &mut total_edits)
+                        .await?;
+                }
             }
-
-            files.push(FileChange {
-                path: path.display().to_string(),
-                edit_count,
-            });
+            DocumentChanges::Operations(ops) => {
+                for op in ops {
+                    match op {
+                        DocumentChangeOperation::Edit(td_edit) => {
+                            let uri = &td_edit.text_document.uri;
+                            let text_edits: Vec<TextEdit> = td_edit
+                                .edits
+                                .iter()
+                                .map(|oe| match oe {
+                                    lsp_types::OneOf::Left(te) => te.clone(),
+                                    lsp_types::OneOf::Right(annotated) => TextEdit {
+                                        range: annotated.text_edit.range,
+                                        new_text: annotated.text_edit.new_text.clone(),
+                                    },
+                                })
+                                .collect();
+                            apply_edits_to_file(
+                                client,
+                                uri,
+                                &text_edits,
+                                &mut files,
+                                &mut total_edits,
+                            )
+                            .await?;
+                        }
+                        DocumentChangeOperation::Op(other) => {
+                            tracing::warn!(
+                                op = ?other,
+                                "workspace edit includes file create/rename/delete; skipped"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(RenameSummary { files, total_edits })
+}
+
+async fn apply_edits_to_file(
+    client: &LspClient,
+    uri: &Uri,
+    edits: &[TextEdit],
+    files: &mut Vec<FileChange>,
+    total_edits: &mut usize,
+) -> Result<(), LspClientError> {
+    let path = uri_to_path(uri)?;
+    let before = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(LspClientError::from_io)?;
+    let after = apply_text_edits(&before, edits);
+    let edit_count = edits.len();
+    *total_edits += edit_count;
+    tokio::fs::write(&path, &after)
+        .await
+        .map_err(LspClientError::from_io)?;
+
+    let mut docs = client.opened_documents().lock().await;
+    if let Some(doc) = docs.get_mut(uri) {
+        doc.version += 1;
+        doc.text.clone_from(&after);
+        let version = doc.version;
+        drop(docs);
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: after.clone(),
+            }],
+        };
+        client.notify::<DidChangeTextDocument>(params).await?;
+    }
+
+    files.push(FileChange {
+        path: path.display().to_string(),
+        edit_count,
+    });
+    Ok(())
 }
 
 /// Apply a list of [`TextEdit`]s to `text` and return the result.
@@ -388,6 +462,198 @@ pub struct RenameSummary {
 pub struct FileChange {
     pub path: String,
     pub edit_count: usize,
+}
+
+/// Offered code action — flattened for MCP consumers so the agent
+/// doesn't have to know about the two `Command | CodeAction`
+/// variants LSP allows in the response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeActionInfo {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `true` when the server provided a reason the action can't
+    /// currently be executed (e.g. "not applicable here"). Disabled
+    /// actions are still listed so the agent can see why they exist
+    /// but shouldn't be applied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_preferred: bool,
+}
+
+/// What `apply_code_action` actually did — either applied edits,
+/// ran a command, or both. `applied_edit` carries the per-file
+/// change counts when edits landed; `ran_command` names the command
+/// that was dispatched. When both are `None` the action had no
+/// effect (nothing to apply after resolve).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeActionApplied {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_edit: Option<RenameSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ran_command: Option<String>,
+}
+
+/// List the code actions the server offers for `range` in `path`.
+/// Both `CodeAction` and bare `Command` replies are flattened into
+/// a single `CodeActionInfo` shape. Returns an empty vec when no
+/// actions apply.
+pub async fn list_code_actions(
+    client: &LspClient,
+    path: &Path,
+    range: Range,
+) -> Result<Vec<CodeActionInfo>, LspClientError> {
+    let raw = fetch_code_actions(client, path, range).await?;
+    Ok(raw.iter().map(info_from_action).collect())
+}
+
+/// Request the code actions, pick the one matching `selector`
+/// (title substring, case-insensitive, or exact kind), resolve it
+/// if the server returned a lazy stub, then execute its edit
+/// and/or command via `apply_workspace_edit` + `workspace/executeCommand`.
+/// Returns `None` when no offered action matches the selector.
+pub async fn apply_code_action(
+    client: &LspClient,
+    path: &Path,
+    range: Range,
+    selector: &CodeActionSelector,
+) -> Result<Option<CodeActionApplied>, LspClientError> {
+    let actions = fetch_code_actions(client, path, range).await?;
+    let Some(picked) = actions.into_iter().find(|a| selector.matches(a)) else {
+        return Ok(None);
+    };
+    let (title, kind, resolved) = match picked {
+        CodeActionOrCommand::Command(cmd) => {
+            let ran = run_command(client, &cmd).await?;
+            return Ok(Some(CodeActionApplied {
+                title: cmd.title,
+                kind: None,
+                applied_edit: None,
+                ran_command: Some(ran),
+            }));
+        }
+        CodeActionOrCommand::CodeAction(a) => (a.title.clone(), a.kind.clone(), a),
+    };
+
+    if resolved.disabled.is_some() {
+        return Err(LspClientError::LspError {
+            code: -32_000,
+            message: format!(
+                "code action {:?} is disabled: {}",
+                title,
+                resolved
+                    .disabled
+                    .as_ref()
+                    .map(|d| d.reason.as_str())
+                    .unwrap_or_default()
+            ),
+        });
+    }
+
+    let resolved = if resolved.edit.is_none() && resolved.command.is_none() {
+        client.request::<CodeActionResolveRequest>(resolved).await?
+    } else {
+        resolved
+    };
+
+    let applied_edit = if let Some(edit) = resolved.edit.as_ref() {
+        Some(apply_workspace_edit(client, edit).await?)
+    } else {
+        None
+    };
+
+    let ran_command = if let Some(cmd) = resolved.command.as_ref() {
+        Some(run_command(client, cmd).await?)
+    } else {
+        None
+    };
+
+    Ok(Some(CodeActionApplied {
+        title,
+        kind: kind.map(|k| k.as_str().to_string()),
+        applied_edit,
+        ran_command,
+    }))
+}
+
+async fn fetch_code_actions(
+    client: &LspClient,
+    path: &Path,
+    range: Range,
+) -> Result<Vec<CodeActionOrCommand>, LspClientError> {
+    ensure_document_current(client, path).await?;
+    let uri = path_to_uri(path)?;
+    let params = CodeActionParams {
+        text_document: TextDocumentIdentifier { uri },
+        range,
+        context: CodeActionContext::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let result: Option<CodeActionResponse> = client.request::<CodeActionRequest>(params).await?;
+    Ok(result.unwrap_or_default())
+}
+
+fn info_from_action(action: &CodeActionOrCommand) -> CodeActionInfo {
+    match action {
+        CodeActionOrCommand::Command(cmd) => CodeActionInfo {
+            title: cmd.title.clone(),
+            kind: None,
+            disabled: false,
+            disabled_reason: None,
+            is_preferred: false,
+        },
+        CodeActionOrCommand::CodeAction(a) => CodeActionInfo {
+            title: a.title.clone(),
+            kind: a.kind.as_ref().map(|k| k.as_str().to_string()),
+            disabled: a.disabled.is_some(),
+            disabled_reason: a.disabled.as_ref().map(|d| d.reason.clone()),
+            is_preferred: a.is_preferred.unwrap_or(false),
+        },
+    }
+}
+
+async fn run_command(
+    client: &LspClient,
+    cmd: &lsp_types::Command,
+) -> Result<String, LspClientError> {
+    let params = ExecuteCommandParams {
+        command: cmd.command.clone(),
+        arguments: cmd.arguments.clone().unwrap_or_default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    let _ = client.request::<ExecuteCommand>(params).await?;
+    Ok(cmd.command.clone())
+}
+
+/// How callers pick one code action out of the offered list.
+/// Either the kind (exact match) or a case-insensitive substring
+/// of the title wins — first-match in the server's own ordering.
+#[derive(Debug, Clone)]
+pub enum CodeActionSelector {
+    Title(String),
+    Kind(String),
+}
+
+impl CodeActionSelector {
+    fn matches(&self, action: &CodeActionOrCommand) -> bool {
+        let (title, kind) = match action {
+            CodeActionOrCommand::Command(cmd) => (cmd.title.as_str(), None),
+            CodeActionOrCommand::CodeAction(a) => (a.title.as_str(), a.kind.as_ref()),
+        };
+        match self {
+            Self::Title(needle) => title
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()),
+            Self::Kind(k) => kind.is_some_and(|kind| kind.as_str() == k),
+        }
+    }
 }
 
 /// Rust-analyzer-specific: recursively expand the macro at
