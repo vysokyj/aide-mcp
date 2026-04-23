@@ -361,6 +361,35 @@ pub struct ProjectMapArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ImpactOfChangeArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Exact SCIP symbol id (from `scip_symbols`).
+    pub symbol: String,
+    /// Commit SHA whose index to query. Defaults to the most recently
+    /// indexed Ready commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PublicApiDiffArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Baseline commit (the "before"). Must have a Ready SCIP index
+    /// — call `index_commit` first if needed.
+    pub sha1: String,
+    /// Target commit (the "after"). Must have a Ready SCIP index.
+    pub sha2: String,
+    /// Optional kind filter on the symbols compared (e.g.
+    /// `["Function","Trait","Struct"]`). Empty = every kind.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TestsForSymbolArgs {
     /// Repository root. If omitted, falls back to the server cwd.
     #[serde(default)]
@@ -1355,6 +1384,115 @@ impl AideServer {
             }
             Err(e) => error_json(e.to_string()),
         }
+    }
+
+    #[tool(
+        description = "Callers of `symbol` classified by the plugin's path heuristic (test / bin / lib / example / bench). Same scan as `scip_callers` but each hit carries a `category` field so an agent can see at a glance how much of the fallout is test-only vs production code. Use before a risky rename / signature change."
+    )]
+    async fn impact_of_change(&self, Parameters(args): Parameters<ImpactOfChangeArgs>) -> String {
+        let root = resolve_root(args.path);
+        let Some(plugin) = self.registry.detect(&root).into_iter().next() else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        let idx = match aide_scip::load(&index_path) {
+            Ok(i) => i,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let callers = aide_scip::enclosing_defs_of_callers(&idx, &args.symbol);
+        let entries: Vec<serde_json::Value> = callers
+            .into_iter()
+            .map(|c| {
+                let category = if plugin.is_test_symbol(&c.relative_path, &c.display_name) {
+                    "test"
+                } else {
+                    plugin.classify_path(&c.relative_path)
+                };
+                let mut v = serde_json::to_value(&c).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "category".to_string(),
+                        serde_json::Value::String(category.to_string()),
+                    );
+                }
+                v
+            })
+            .collect();
+        to_json(&entries)
+    }
+
+    #[tool(
+        description = "Structured diff of the public API surface between two commits. Both must have a Ready SCIP index — call `index_commit` for either SHA that hasn't been indexed yet. Returns `{added: [...], removed: [...]}` lists of symbols (by SCIP id). Use `kinds` to narrow to e.g. `[\"Function\",\"Trait\"]` when checking semver impact of a refactor."
+    )]
+    async fn public_api_diff(&self, Parameters(args): Parameters<PublicApiDiffArgs>) -> String {
+        let root = resolve_root(args.path);
+        let repo_root = root.display().to_string();
+
+        let path1 = match self.resolve_scip_path(&repo_root, Some(&args.sha1)).await {
+            Ok(p) => p,
+            Err(e) => return error_json(format!("sha1 not Ready: {e}")),
+        };
+        let path2 = match self.resolve_scip_path(&repo_root, Some(&args.sha2)).await {
+            Ok(p) => p,
+            Err(e) => return error_json(format!("sha2 not Ready: {e}")),
+        };
+        let idx1 = match aide_scip::load(&path1) {
+            Ok(i) => i,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let idx2 = match aide_scip::load(&path2) {
+            Ok(i) => i,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        let kinds: Vec<&str> = args.kinds.iter().map(String::as_str).collect();
+        let surface = |idx: &aide_scip::ScipIndex| -> std::collections::BTreeMap<String, aide_scip::LocatedSymbol> {
+            aide_scip::project_map(idx, &kinds)
+                .into_iter()
+                .flat_map(|entry| {
+                    let path = entry.relative_path.clone();
+                    entry.symbols.into_iter().map(move |s| {
+                        (
+                            s.symbol.clone(),
+                            aide_scip::LocatedSymbol {
+                                symbol: s.symbol,
+                                display_name: s.display_name,
+                                kind: s.kind,
+                                relative_path: path.clone(),
+                                line: s.line,
+                            },
+                        )
+                    })
+                })
+                .collect()
+        };
+        let before = surface(&idx1);
+        let after = surface(&idx2);
+
+        let added: Vec<_> = after
+            .iter()
+            .filter(|(k, _)| !before.contains_key(*k))
+            .map(|(_, v)| v.clone())
+            .collect();
+        let removed: Vec<_> = before
+            .iter()
+            .filter(|(k, _)| !after.contains_key(*k))
+            .map(|(_, v)| v.clone())
+            .collect();
+
+        to_json(&serde_json::json!({
+            "sha1": args.sha1,
+            "sha2": args.sha2,
+            "added": added,
+            "removed": removed,
+        }))
     }
 
     #[tool(

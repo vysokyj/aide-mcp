@@ -12,6 +12,8 @@ use scip::types::{Document, Index, SymbolRole};
 use serde::Serialize;
 use thiserror::Error;
 
+pub use scip::types::Index as ScipIndex;
+
 #[derive(Debug, Error)]
 pub enum ScipError {
     #[error("I/O error reading {path}: {source}")]

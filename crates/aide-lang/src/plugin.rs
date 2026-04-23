@@ -134,4 +134,14 @@ pub trait LanguagePlugin: Send + Sync {
         let _ = (relative_path, display_name);
         false
     }
+
+    /// Classify a repo-relative path into a broad category. Used by
+    /// impact-analysis tools so callers can be grouped into "test",
+    /// "bin", "lib", "example", "bench" without each caller
+    /// re-inventing the language's layout conventions. Default
+    /// returns `"code"` — a neutral, non-informative label.
+    fn classify_path(&self, relative_path: &str) -> &'static str {
+        let _ = relative_path;
+        "code"
+    }
 }

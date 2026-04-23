@@ -99,6 +99,36 @@ impl LanguagePlugin for RustPlugin {
     fn is_test_symbol(&self, relative_path: &str, display_name: &str) -> bool {
         is_rust_test(relative_path, display_name)
     }
+
+    fn classify_path(&self, relative_path: &str) -> &'static str {
+        classify_rust_path(relative_path)
+    }
+}
+
+/// Broad path-based classification of a Rust source file. Picks the
+/// first matching bucket in this order (tests win over bins because
+/// integration tests can live under `tests/` regardless of name):
+///
+/// - `test` — under `tests/` or matching `*_test(s).rs`
+/// - `bin`  — `src/main.rs` or anything under `src/bin/`
+/// - `example` — under `examples/`
+/// - `bench` — under `benches/`
+/// - `lib` — everything else
+fn classify_rust_path(relative_path: &str) -> &'static str {
+    if is_rust_test(relative_path, "") {
+        return "test";
+    }
+    let p = relative_path.to_ascii_lowercase();
+    if p == "src/main.rs" || p.starts_with("src/bin/") || p.contains("/src/bin/") {
+        return "bin";
+    }
+    if p.starts_with("examples/") || p.contains("/examples/") {
+        return "example";
+    }
+    if p.starts_with("benches/") || p.contains("/benches/") {
+        return "bench";
+    }
+    "lib"
 }
 
 /// Rust test heuristic: a function is considered a test when it lives
@@ -321,6 +351,22 @@ mod tests {
             "\n",
         );
         assert!(RustPlugin.parse_diagnostics(stdout).is_empty());
+    }
+
+    #[test]
+    fn classify_rust_path_buckets_by_convention() {
+        assert_eq!(classify_rust_path("tests/it.rs"), "test");
+        assert_eq!(classify_rust_path("src/foo_test.rs"), "test");
+        assert_eq!(classify_rust_path("src/main.rs"), "bin");
+        assert_eq!(classify_rust_path("src/bin/tool.rs"), "bin");
+        assert_eq!(
+            classify_rust_path("crates/aide-mcp/src/bin/aide-mcp.rs"),
+            "bin"
+        );
+        assert_eq!(classify_rust_path("examples/demo.rs"), "example");
+        assert_eq!(classify_rust_path("benches/speed.rs"), "bench");
+        assert_eq!(classify_rust_path("crates/aide-scip/src/lib.rs"), "lib");
+        assert_eq!(classify_rust_path("src/module/inner.rs"), "lib");
     }
 
     #[test]
