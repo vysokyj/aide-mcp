@@ -156,6 +156,84 @@ pub fn references(index: &Index, symbol: &str) -> Vec<OccurrenceHit> {
     out
 }
 
+/// Call sites of `symbol`: every occurrence except the definition.
+/// Thin wrapper over [`references`] that makes "who uses this?" a
+/// one-call question for an agent. Shape mirrors [`references`] so
+/// existing consumers can swap freely.
+pub fn callers(index: &Index, symbol: &str) -> Vec<OccurrenceHit> {
+    references(index, symbol)
+        .into_iter()
+        .filter(|o| !o.is_definition)
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ModuleEntry {
+    pub relative_path: String,
+    pub symbols: Vec<MapSymbol>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MapSymbol {
+    /// SCIP symbol id (stable, can be fed back into [`references`]
+    /// / [`callers`]).
+    pub symbol: String,
+    pub display_name: String,
+    pub kind: String,
+    /// Zero-indexed start line of the definition occurrence in
+    /// `relative_path`. `None` when no definition occurrence was
+    /// recorded in this document — usually means the indexer emitted
+    /// the symbol information but not a matching occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<i32>,
+}
+
+/// Top-level symbol digest per document — a map of "what's actually
+/// defined here" for an agent that would otherwise grep for `pub fn`
+/// / `class` / `interface`. Filters symbols by `kind`: pass an empty
+/// slice to keep everything, or a curated list to narrow to function
+/// / type / trait shapes.
+pub fn project_map(index: &Index, kinds: &[&str]) -> Vec<ModuleEntry> {
+    index
+        .documents
+        .iter()
+        .map(|doc| ModuleEntry {
+            relative_path: doc.relative_path.clone(),
+            symbols: document_map_symbols(doc, kinds),
+        })
+        .filter(|m| !m.symbols.is_empty())
+        .collect()
+}
+
+fn document_map_symbols(doc: &Document, kinds: &[&str]) -> Vec<MapSymbol> {
+    doc.symbols
+        .iter()
+        .filter_map(|sym| {
+            let kind_str = format!("{:?}", sym.kind.enum_value_or_default());
+            if !kinds.is_empty() && !kinds.iter().any(|k| *k == kind_str) {
+                return None;
+            }
+            let line = doc
+                .occurrences
+                .iter()
+                .find(|o| {
+                    o.symbol == sym.symbol && (o.symbol_roles & SymbolRole::Definition as i32) != 0
+                })
+                .and_then(|o| o.range.first().copied());
+            Some(MapSymbol {
+                symbol: sym.symbol.clone(),
+                display_name: if sym.display_name.is_empty() {
+                    sym.symbol.clone()
+                } else {
+                    sym.display_name.clone()
+                },
+                kind: kind_str,
+                line,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +418,52 @@ mod tests {
     fn load_missing_file_errors() {
         let err = load(Path::new("/does/not/exist.scip")).unwrap_err();
         assert!(matches!(err, ScipError::Io { .. }));
+    }
+
+    #[test]
+    fn callers_drops_the_definition_occurrence() {
+        let idx = fake_index();
+        let helper_id = "rust-analyzer rust aide-mcp . `helper`().";
+        let hits = callers(&idx, helper_id);
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].is_definition);
+        assert_eq!(hits[0].relative_path, "src/main.rs");
+    }
+
+    #[test]
+    fn project_map_groups_defined_symbols_by_document() {
+        let idx = fake_index();
+        let map = project_map(&idx, &[]);
+        assert_eq!(map.len(), 2);
+        // Only the document that *defines* helper lists helper — not
+        // the one that merely references it.
+        let helper_docs: Vec<_> = map
+            .iter()
+            .filter(|e| e.symbols.iter().any(|s| s.display_name == "helper"))
+            .map(|e| e.relative_path.clone())
+            .collect();
+        assert_eq!(helper_docs, vec!["src/helper.rs"]);
+    }
+
+    #[test]
+    fn project_map_filters_by_kind() {
+        let idx = fake_index();
+        let map = project_map(&idx, &["Function"]);
+        // Both symbols are Functions → both docs survive.
+        assert_eq!(map.len(), 2);
+        let map = project_map(&idx, &["Class"]);
+        // Nothing matches → empty map.
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn project_map_fills_line_from_definition_occurrence() {
+        let idx = fake_index();
+        let map = project_map(&idx, &[]);
+        let main_entry = map
+            .iter()
+            .find(|e| e.relative_path == "src/main.rs")
+            .unwrap();
+        assert_eq!(main_entry.symbols[0].line, Some(0));
     }
 }

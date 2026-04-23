@@ -344,6 +344,36 @@ pub struct ScipReferencesArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectMapArgs {
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Filter symbols by SCIP `SymbolInformation.kind` (exact match,
+    /// case-sensitive — "Function", "Struct", "Enum", "Trait",
+    /// "Class", "Method", etc.). Omit or pass an empty array to
+    /// include every kind.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Commit SHA whose index to query. Defaults to the most recently
+    /// indexed Ready commit for this repo.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TaskContextArgs {
+    /// Absolute or repo-relative path of the file to orient around.
+    pub file: String,
+    /// Repository root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// How many recent commits touching `file` to include. Defaults
+    /// to 5.
+    #[serde(default)]
+    pub history_limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RunProjectArgs {
     /// Project root. If omitted, falls back to the server cwd.
     #[serde(default)]
@@ -1260,6 +1290,116 @@ impl AideServer {
             Ok(idx) => to_json(&aide_scip::references(&idx, &args.symbol)),
             Err(e) => error_json(e.to_string()),
         }
+    }
+
+    #[tool(
+        description = "Call sites of a SCIP symbol — every occurrence except the definition itself. Shorthand for `scip_references` filtered to non-definitions; use it when the question is 'who uses this?'."
+    )]
+    async fn scip_callers(&self, Parameters(args): Parameters<ScipReferencesArgs>) -> String {
+        let root = resolve_root(args.path);
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        match aide_scip::load(&index_path) {
+            Ok(idx) => to_json(&aide_scip::callers(&idx, &args.symbol)),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Per-document digest of the public API surface from the SCIP index — every document that defines at least one matching symbol, with its top-level symbols (name, kind, definition line). Replaces 'grep for `pub fn`/`class`/`interface`' reflexes. Defaults to the most recently indexed Ready commit; filter by `kinds` (e.g. [\"Function\",\"Trait\"]) to narrow the view."
+    )]
+    async fn project_map(&self, Parameters(args): Parameters<ProjectMapArgs>) -> String {
+        let root = resolve_root(args.path);
+        let repo_root = root.display().to_string();
+        let index_path = match self
+            .resolve_scip_path(&repo_root, args.sha.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_json(e),
+        };
+        match aide_scip::load(&index_path) {
+            Ok(idx) => {
+                let kinds: Vec<&str> = args.kinds.iter().map(String::as_str).collect();
+                to_json(&aide_scip::project_map(&idx, &kinds))
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Aggregate orientation data for a single file: LSP document symbols, LSP diagnostics, head-to-worktree diff for just this file, the last `history_limit` commits that touched it, and SCIP top-level symbols. One call replaces the five agents typically make when picking up work on a file. Any sub-query that fails (LSP warming up, no SCIP Ready yet) contributes a null/empty field — the rest of the response stays valid."
+    )]
+    async fn task_context(&self, Parameters(args): Parameters<TaskContextArgs>) -> String {
+        let root = resolve_root(args.root);
+        let file = PathBuf::from(&args.file);
+        let history_limit = args.history_limit.unwrap_or(5);
+
+        let relative = file
+            .strip_prefix(&root)
+            .map_or_else(|_| file.clone(), std::path::Path::to_path_buf);
+        let relative_str = relative.display().to_string();
+
+        let document_symbols = serde_json::Value::Null;
+        let diagnostics = serde_json::Value::Null;
+        let mut ctx = serde_json::json!({
+            "file": file.display().to_string(),
+            "relative_path": relative_str.clone(),
+            "document_symbols": document_symbols,
+            "diagnostics": diagnostics,
+            "head_diff": serde_json::Value::Null,
+            "recent_commits": serde_json::Value::Array(Vec::new()),
+            "scip_symbols": serde_json::Value::Array(Vec::new()),
+        });
+
+        if let Some((plugin, binary, lsp_args)) = self.language_for(&root) {
+            ctx["language"] = serde_json::Value::String(plugin.id().as_str().to_string());
+            if let Ok(client) = self
+                .pool
+                .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+                .await
+            {
+                if let Ok(syms) = lsp_ops::document_symbols(&client, &file).await {
+                    ctx["document_symbols"] = serde_json::to_value(syms).unwrap_or_default();
+                }
+                if let Ok(diag) =
+                    lsp_ops::diagnostics(&client, &file, std::time::Duration::from_millis(500))
+                        .await
+                {
+                    ctx["diagnostics"] = serde_json::to_value(diag).unwrap_or_default();
+                }
+            }
+        }
+
+        if let Ok(diff) = aide_git::diff::diff(&root, DiffMode::HeadToWorktree, Some(&relative_str))
+        {
+            ctx["head_diff"] = serde_json::to_value(diff).unwrap_or_default();
+        }
+
+        if let Ok(commits) = aide_git::log::log_for_path(&root, &relative_str, history_limit) {
+            ctx["recent_commits"] = serde_json::to_value(commits).unwrap_or_default();
+        }
+
+        let repo_root = root.display().to_string();
+        if let Ok(index_path) = self.resolve_scip_path(&repo_root, None).await {
+            if let Ok(idx) = aide_scip::load(&index_path) {
+                let entries = aide_scip::project_map(&idx, &[]);
+                let for_file: Vec<_> = entries
+                    .into_iter()
+                    .filter(|e| e.relative_path == relative_str)
+                    .flat_map(|e| e.symbols)
+                    .collect();
+                ctx["scip_symbols"] = serde_json::to_value(for_file).unwrap_or_default();
+            }
+        }
+
+        to_json(&ctx)
     }
 
     #[tool(
