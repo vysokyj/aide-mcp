@@ -314,6 +314,82 @@ most-common missing tools, ordered by frequency and recency. Close
 the loop between "what agents actually need" and "what aide
 ships." Optional: wire it to CI so every merge re-benchmarks.
 
+### Deferred from the v0.8–v0.14 batch
+
+Four items were scoped out of their parent milestones to keep each
+commit clean. Each one has a concrete blocker — none is "we forgot."
+
+- **`run_cargo_expand` (from v0.12)** — `cargo expand` would cover
+  whole-module expansion that the LSP-level `lsp_expand_macro`
+  cannot (LSP expands one invocation at a time). Blocker: the tool
+  isn't shipped with cargo; users would need `cargo install
+  cargo-expand`. Not zero-friction enough to land before a real
+  request surfaces.
+  *Proposed move:* park until a dogfood run surfaces "needs
+  whole-module expansion." Implement then as a 30-line wrapper
+  around `exec::run("cargo", ["expand", …])` with an early-return
+  pointing at the install command when the binary is missing.
+
+- **`apply_code_action` (from v0.13)** — rename is live but LSP
+  code actions ("organize imports", "add missing match arm", "fill
+  struct fields") need a `workspace/executeCommand` round-trip and
+  a per-server registry of action kinds (rust-analyzer ships its
+  own list outside the standard). Blocker is scope, not ambiguity.
+  *Proposed move:* v0.13.1, next natural slot. Plan:
+  1. `lsp_list_code_actions(file, range)` — returns available
+     actions with title + kind.
+  2. `lsp_apply_code_action(file, range, kind_or_title)` — resolves
+     the action (server may need a follow-up `codeAction/resolve`),
+     runs any `workspace/executeCommand`, applies the resulting
+     WorkspaceEdit through the same `apply_workspace_edit` path
+     that `lsp_rename_symbol` already uses.
+  3. No new plugin hooks — code actions are per-server, discovered
+     at runtime.
+
+- **`safe_edit` with diagnostic-diff (from v0.13)** — the
+  "snapshot diagnostics, apply edit, wait for server to
+  re-analyse, snapshot again, diff" flow needs a reliable
+  "analysis done" signal. rust-analyzer doesn't publish one that
+  the standard LSP client can observe; the pull-model
+  `workspace/diagnostic` request (LSP 3.17+) is the right answer
+  but not universally supported.
+  *Proposed move:* v0.13.2 or v0.15, paired with capability
+  probing. Plan:
+  1. Detect pull-diagnostics support at `initialize` time from the
+     server's `workspace.diagnostics.workDoneProgress` /
+     `diagnosticProvider` capabilities.
+  2. When supported: `snapshot → apply → poll
+     workspace/diagnostic → diff`.
+  3. When not: degrade to a fixed 1.5s settle + best-effort
+     published-diagnostics read, flag the result as
+     `confidence: best_effort`.
+  4. Response shape: `{new_errors, new_warnings, resolved,
+     unchanged_count, confidence}`.
+
+- **Dogfood CI integration (from v0.14)** — the aggregator
+  exists; what's missing is an automated GitHub Action that runs
+  the paired benchmark on each merge and turns the top-ranked
+  coverage gaps into tracked issues. Blocker is operational, not
+  technical: we need to decide when benchmarks run (every push is
+  too noisy, nightly may be cheaper), what to do with duplicate
+  issues, and who owns triage.
+  *Proposed move:* not before dogfood becomes routine (≥10 runs
+  accumulated). Then: one workflow file, nightly schedule, uses
+  `dogfood_coverage_gaps` to generate a single "weekly gap
+  report" issue that supersedes the previous week's. No
+  auto-multiplexing into per-capability issues until we see how
+  stable the bullets actually are across runs.
+
+### Proposed next milestone
+
+**v0.13.1: `apply_code_action`.** Smallest clean scope of the four
+deferrals, reuses infrastructure that just landed (the
+`apply_workspace_edit` helper is already public), and adds a tool
+that pairs naturally with `lsp_rename_symbol` from the
+agent's perspective. The other three deferrals depend on either
+capability negotiation, usage data, or operational decisions that
+this session can't resolve unilaterally.
+
 ### Legacy open items
 
 - **scip-java auto-install** — Sourcegraph distributes via coursier,
