@@ -114,9 +114,10 @@ impl Store {
     /// Returns an [`EnqueueOutcome`] so the caller knows whether to
     /// schedule fresh work.
     pub async fn enqueue(&self, repo_root: &str, sha: &str) -> Result<EnqueueOutcome, StateError> {
+        let repo_root = repo_key(repo_root);
         let now = now_unix();
         let mut guard = self.inner.lock().await;
-        let repo = guard.state.repos.entry(repo_root.to_string()).or_default();
+        let repo = guard.state.repos.entry(repo_root).or_default();
         repo.last_sha = Some(sha.to_string());
 
         let outcome = if let Some(existing) = repo.commits.get_mut(sha) {
@@ -164,13 +165,14 @@ impl Store {
         sha: &str,
         index_path: PathBuf,
     ) -> Result<Vec<PathBuf>, StateError> {
+        let repo_root = repo_key(repo_root);
         let now = now_unix();
         let path_str = index_path.display().to_string();
 
         let mut guard = self.inner.lock().await;
         let mut evicted: Vec<PathBuf> = Vec::new();
 
-        if let Some(repo) = guard.state.repos.get_mut(repo_root) {
+        if let Some(repo) = guard.state.repos.get_mut(&repo_root) {
             if let Some(entry) = repo.commits.get_mut(sha) {
                 entry.state = IndexState::Ready;
                 entry.indexed_at_unix = Some(now);
@@ -223,8 +225,9 @@ impl Store {
     where
         F: FnMut(&mut CommitEntry),
     {
+        let repo_root = repo_key(repo_root);
         let mut guard = self.inner.lock().await;
-        if let Some(repo) = guard.state.repos.get_mut(repo_root) {
+        if let Some(repo) = guard.state.repos.get_mut(&repo_root) {
             if let Some(entry) = repo.commits.get_mut(sha) {
                 f(entry);
             }
@@ -234,8 +237,9 @@ impl Store {
     }
 
     pub async fn status(&self, repo_root: &str, sha: Option<&str>) -> Option<CommitInfo> {
+        let repo_root = repo_key(repo_root);
         let guard = self.inner.lock().await;
-        let repo = guard.state.repos.get(repo_root)?;
+        let repo = guard.state.repos.get(&repo_root)?;
         let target_sha = match sha {
             Some(s) => s.to_string(),
             None => repo.last_sha.clone()?,
@@ -245,8 +249,9 @@ impl Store {
     }
 
     pub async fn last_known(&self, repo_root: &str) -> Option<CommitInfo> {
+        let repo_root = repo_key(repo_root);
         let guard = self.inner.lock().await;
-        let repo = guard.state.repos.get(repo_root)?;
+        let repo = guard.state.repos.get(&repo_root)?;
         let sha = repo.last_sha.clone()?;
         let entry = repo.commits.get(&sha)?;
         Some(entry.to_info(sha))
@@ -256,8 +261,9 @@ impl Store {
     /// `Ready` state. Used by SCIP query tools to pick the "current"
     /// index when the caller does not pin an explicit SHA.
     pub async fn last_ready(&self, repo_root: &str) -> Option<CommitInfo> {
+        let repo_root = repo_key(repo_root);
         let guard = self.inner.lock().await;
-        let repo = guard.state.repos.get(repo_root)?;
+        let repo = guard.state.repos.get(&repo_root)?;
         repo.commits
             .iter()
             .filter(|(_, e)| matches!(e.state, IndexState::Ready))
@@ -282,6 +288,21 @@ impl Store {
     }
 }
 
+/// Normalise a repository root to a single canonical string so the
+/// in-memory `HashMap` keys match regardless of whether the caller
+/// obtained the path via `git2::Repository::workdir` (which always
+/// appends `/`) or `std::env::current_dir` / a user-supplied path
+/// (which does not). Always ends with a single trailing `/`, matching
+/// the form already persisted in `indexer_state.json` for backward
+/// compatibility.
+fn repo_key(repo_root: &str) -> String {
+    if repo_root.ends_with('/') {
+        repo_root.to_string()
+    } else {
+        format!("{repo_root}/")
+    }
+}
+
 fn flush(state: &IndexerState, path: &Path) -> Result<(), StateError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -303,6 +324,30 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn repo_root_trailing_slash_is_canonical() {
+        // git2::Repository::workdir always appends `/`; callers that
+        // derived `repo_root` from env::current_dir or user args do not.
+        // Both forms must refer to the same repo.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::load(&path, 1).unwrap();
+
+        store.enqueue("/repo/", "abc").await.unwrap();
+        store.mark_in_progress("/repo/", "abc").await.unwrap();
+        store
+            .mark_ready("/repo/", "abc", PathBuf::from("/x.scip"))
+            .await
+            .unwrap();
+
+        assert!(store.status("/repo", None).await.is_some());
+        assert!(store.last_known("/repo").await.is_some());
+        assert!(store.last_ready("/repo").await.is_some());
+
+        store.enqueue("/other", "def").await.unwrap();
+        assert!(store.status("/other/", Some("def")).await.is_some());
+    }
 
     #[tokio::test]
     async fn new_enqueue_lands_as_pending() {
@@ -474,8 +519,8 @@ mod tests {
         assert_eq!(
             jobs,
             vec![
-                ("/repo".into(), "pending".into()),
-                ("/repo".into(), "running".into()),
+                ("/repo/".into(), "pending".into()),
+                ("/repo/".into(), "running".into()),
             ]
         );
     }
