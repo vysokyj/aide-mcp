@@ -77,8 +77,10 @@ version = "0.6.1"
 dependencies = [
  "aide-core",
  "aide-install",
+ "aide-proto",
  "anyhow",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

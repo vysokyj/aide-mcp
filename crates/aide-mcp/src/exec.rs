@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aide_proto::Diagnostic;
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::{Peer, RoleServer};
 use serde::Serialize;
@@ -63,6 +64,12 @@ pub struct ExecResult {
     pub stdout_log: Option<String>,
     /// Full-output stderr log file (populated when `log_dir` was given).
     pub stderr_log: Option<String>,
+    /// Parsed compiler / test diagnostics. Filled in by the caller
+    /// (e.g. `run_project` / `run_tests` in the server) when the
+    /// language plugin has a structured-output parser and the tool
+    /// was invoked with structured-output args; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 pub async fn run(
@@ -135,6 +142,7 @@ pub async fn run(
         stderr_truncated,
         stdout_log: stdout_path.map(|p| p.display().to_string()),
         stderr_log: stderr_path.map(|p| p.display().to_string()),
+        diagnostics: Vec::new(),
     })
 }
 

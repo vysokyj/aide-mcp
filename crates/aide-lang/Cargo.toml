@@ -9,8 +9,10 @@ repository.workspace = true
 [dependencies]
 aide-core.workspace = true
 aide-install.workspace = true
+aide-proto.workspace = true
 anyhow.workspace = true
 serde = { workspace = true }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -3,6 +3,7 @@ use std::path::Path;
 
 use aide_core::AidePaths;
 use aide_install::ToolSpec;
+use aide_proto::Diagnostic;
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier of a supported language (lowercase, kebab-case).
@@ -99,6 +100,27 @@ pub trait LanguagePlugin: Send + Sync {
     /// are shipped as third-party binaries. Return an empty vec if the language
     /// relies entirely on tools found on the user's `$PATH`.
     fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    /// Extra arguments to inject into the [`Self::runner`] / [`Self::test_runner`]
+    /// command line that switch the underlying build tool into a
+    /// machine-readable output mode. The MCP layer inserts these
+    /// *between* the runner's default args and any user-supplied
+    /// `extra_args`. Empty by default: the tool's output is left
+    /// human-formatted and [`Self::parse_diagnostics`] will return no
+    /// structured data.
+    fn structured_output_args(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Parse the `stdout` produced with [`Self::structured_output_args`] in
+    /// effect into a flat list of [`Diagnostic`]s. Default returns empty.
+    /// Plugins override this when their build tool emits a machine
+    /// format (cargo JSON, Maven/Gradle XML, …) that can be mapped into
+    /// aide's common diagnostic shape.
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        let _ = stdout;
         Vec::new()
     }
 }

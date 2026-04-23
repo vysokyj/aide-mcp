@@ -707,6 +707,51 @@ impl AideServer {
             }
         }
     }
+
+    /// Best-effort enrichment: for each diagnostic with a source span,
+    /// fill `enclosing_symbol` from the most recent Ready SCIP index
+    /// for `root`. Rules mirror [`Self::annotate_hits_with_scip`] —
+    /// silent no-op when no SCIP is available or the path is not
+    /// covered. Diagnostic line numbers are 1-indexed as reported by
+    /// cargo / rustc; SCIP is 0-indexed, so we subtract one.
+    async fn annotate_diagnostics_with_scip(
+        &self,
+        root: &std::path::Path,
+        diagnostics: &mut [aide_proto::Diagnostic],
+    ) {
+        if diagnostics.is_empty() {
+            return;
+        }
+        let root_str = root.display().to_string();
+        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
+            return;
+        };
+        let Ok(index) = aide_scip::load(&scip_path) else {
+            return;
+        };
+        for d in diagnostics {
+            let (Some(file), Some(line)) = (d.file.as_deref(), d.line_start) else {
+                continue;
+            };
+            let rel = relativize_path(root, file);
+            let line_0based = i32::try_from(line.saturating_sub(1)).unwrap_or(i32::MAX);
+            d.enclosing_symbol = aide_scip::enclosing_definition(&index, &rel, line_0based);
+        }
+    }
+}
+
+/// Turn a span path reported by a build tool into a repo-relative path
+/// that can be looked up in a SCIP index. cargo usually emits paths
+/// relative to the package manifest, which for single-crate repos
+/// already matches SCIP's `relative_path`; for workspaces or when a
+/// tool emits absolute paths we strip the `root` prefix. Returns the
+/// input unchanged when neither transformation applies.
+fn relativize_path(root: &std::path::Path, file: &str) -> String {
+    let p = std::path::Path::new(file);
+    if let Ok(stripped) = p.strip_prefix(root) {
+        return stripped.display().to_string();
+    }
+    file.to_string()
 }
 
 #[tool_router]
@@ -1218,7 +1263,7 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Run the project via the language plugin's runner (e.g. `cargo run`) and return the full stdout + stderr. Captures up to 1 MB per stream. Default timeout 300s; override with timeout_secs."
+        description = "Run the project via the language plugin's runner (e.g. `cargo run`) and return the full stdout + stderr. Captures up to 1 MB per stream. Default timeout 300s; override with timeout_secs. When the plugin has a structured-output parser (Rust: cargo JSON), the response also contains a `diagnostics` array — each entry tagged with its enclosing SCIP symbol when an index is Ready."
     )]
     async fn run_project(
         &self,
@@ -1231,6 +1276,7 @@ impl AideServer {
         };
         let runner = plugin.runner();
         let mut argv: Vec<OsString> = runner.args.iter().map(OsString::from).collect();
+        argv.extend(plugin.structured_output_args().iter().map(OsString::from));
         argv.extend(args.extra_args.into_iter().map(OsString::from));
         let duration = Duration::from_secs(
             args.timeout_secs
@@ -1248,13 +1294,18 @@ impl AideServer {
         )
         .await
         {
-            Ok(result) => to_json(&result),
+            Ok(mut result) => {
+                result.diagnostics = plugin.parse_diagnostics(&result.stdout);
+                self.annotate_diagnostics_with_scip(&root, &mut result.diagnostics)
+                    .await;
+                to_json(&result)
+            }
             Err(e) => error_json(format!("failed to spawn {}: {e}", runner.executable)),
         }
     }
 
     #[tool(
-        description = "Run the project's tests via the language plugin's test_runner (e.g. `cargo test [filter]`). Captures stdout/stderr and exit code. Default timeout 300s."
+        description = "Run the project's tests via the language plugin's test_runner (e.g. `cargo test [filter]`). Captures stdout/stderr and exit code. Default timeout 300s. Same structured-diagnostic enrichment as `run_project` when the plugin supports it — compile errors surface as a `diagnostics` array with enclosing-symbol tags."
     )]
     async fn run_tests(
         &self,
@@ -1267,6 +1318,7 @@ impl AideServer {
         };
         let runner = plugin.test_runner();
         let mut argv: Vec<OsString> = runner.args.iter().map(OsString::from).collect();
+        argv.extend(plugin.structured_output_args().iter().map(OsString::from));
         if let Some(filter) = args.filter {
             argv.push(OsString::from(filter));
         }
@@ -1287,7 +1339,12 @@ impl AideServer {
         )
         .await
         {
-            Ok(result) => to_json(&result),
+            Ok(mut result) => {
+                result.diagnostics = plugin.parse_diagnostics(&result.stdout);
+                self.annotate_diagnostics_with_scip(&root, &mut result.diagnostics)
+                    .await;
+                to_json(&result)
+            }
             Err(e) => error_json(format!("failed to spawn {}: {e}", runner.executable)),
         }
     }

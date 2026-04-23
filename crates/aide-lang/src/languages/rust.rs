@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use aide_install::{ArchiveFormat, Source, TargetAsset, ToolSpec};
+use aide_proto::Diagnostic;
 
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
@@ -82,6 +83,94 @@ impl LanguagePlugin for RustPlugin {
     fn tools(&self) -> Vec<ToolSpec> {
         vec![rust_analyzer_spec(), codelldb_spec()]
     }
+
+    fn structured_output_args(&self) -> &'static [&'static str] {
+        // JSON messages on stdout, rendered human diagnostics still on
+        // stderr — the stderr stream stays a drop-in replacement for
+        // the default `cargo` output so agents that only read `stderr`
+        // keep working.
+        &["--message-format=json-render-diagnostics"]
+    }
+
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        parse_cargo_json_messages(stdout)
+    }
+}
+
+/// Parse a stdout stream of cargo machine-readable output (one JSON
+/// object per line, mixed with raw program output when `cargo run` or
+/// `cargo test` has proceeded past compilation) into a flat list of
+/// [`Diagnostic`]s.
+///
+/// Non-JSON lines and JSON lines whose `reason` is not
+/// `compiler-message` are silently skipped — this is normal:
+/// `build-script-executed`, `compiler-artifact`, and libtest output
+/// all coexist on the same stdout.
+fn parse_cargo_json_messages(stdout: &str) -> Vec<Diagnostic> {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<CargoMessage>(line).ok())
+        .filter(|m| m.reason == "compiler-message")
+        .filter_map(|m| m.message.map(diagnostic_from_cargo_message))
+        .collect()
+}
+
+fn diagnostic_from_cargo_message(msg: CargoMessageBody) -> Diagnostic {
+    let primary = msg.spans.iter().find(|s| s.is_primary);
+    let file = primary.map(|s| s.file_name.clone());
+    let line_start = primary.map(|s| s.line_start);
+    let line_end = primary.map(|s| s.line_end);
+    let column_start = primary.map(|s| s.column_start);
+    let column_end = primary.map(|s| s.column_end);
+    Diagnostic {
+        level: msg.level,
+        code: msg
+            .code
+            .and_then(|c| (!c.code.is_empty()).then_some(c.code)),
+        message: msg.message,
+        file,
+        line_start,
+        line_end,
+        column_start,
+        column_end,
+        enclosing_symbol: None,
+        rendered: msg.rendered,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CargoMessage {
+    reason: String,
+    #[serde(default)]
+    message: Option<CargoMessageBody>,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoMessageBody {
+    level: String,
+    message: String,
+    #[serde(default)]
+    code: Option<CargoDiagnosticCode>,
+    #[serde(default)]
+    rendered: Option<String>,
+    #[serde(default)]
+    spans: Vec<CargoSpan>,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoDiagnosticCode {
+    #[serde(default)]
+    code: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoSpan {
+    file_name: String,
+    is_primary: bool,
+    line_start: u32,
+    line_end: u32,
+    column_start: u32,
+    column_end: u32,
 }
 
 fn rust_analyzer_spec() -> ToolSpec {
@@ -174,5 +263,54 @@ mod tests {
     fn rejects_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!RustPlugin.detect(dir.path()));
+    }
+
+    #[test]
+    fn parses_compiler_message_with_primary_span() {
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","package_id":"x","target":{"name":"x","kind":["lib"]},"profile":{},"features":[],"filenames":[],"executable":null,"fresh":true}"#,
+            "\n",
+            r#"{"reason":"compiler-message","package_id":"x","target":{"name":"x","kind":["lib"]},"message":{"rendered":"error[E0382]: borrow of moved value: `x`\n","children":[],"code":{"code":"E0382","explanation":null},"level":"error","message":"borrow of moved value: `x`","spans":[{"byte_end":120,"byte_start":100,"column_end":20,"column_start":10,"file_name":"src/foo.rs","is_primary":false,"label":null,"line_end":40,"line_start":40,"suggested_replacement":null,"suggestion_applicability":null,"text":[],"expansion":null},{"byte_end":200,"byte_start":180,"column_end":9,"column_start":5,"file_name":"src/foo.rs","is_primary":true,"label":"value used here after move","line_end":42,"line_start":42,"suggested_replacement":null,"suggestion_applicability":null,"text":[],"expansion":null}]}}"#,
+            "\n",
+            "raw stdout line that is not JSON at all\n",
+        );
+        let diags = RustPlugin.parse_diagnostics(stdout);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        assert_eq!(d.level, "error");
+        assert_eq!(d.code.as_deref(), Some("E0382"));
+        assert_eq!(d.message, "borrow of moved value: `x`");
+        assert_eq!(d.file.as_deref(), Some("src/foo.rs"));
+        assert_eq!(d.line_start, Some(42));
+        assert_eq!(d.line_end, Some(42));
+        assert_eq!(d.column_start, Some(5));
+        assert_eq!(d.column_end, Some(9));
+        assert!(d.rendered.is_some());
+        assert!(d.enclosing_symbol.is_none());
+    }
+
+    #[test]
+    fn skips_non_compiler_messages_and_garbage() {
+        let stdout = concat!(
+            r#"{"reason":"build-script-executed","package_id":"x","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[],"out_dir":"..."}"#,
+            "\n",
+            "not json at all\n",
+            r#"{"reason":"compiler-artifact","package_id":"x","target":{"name":"x","kind":["lib"]},"profile":{},"features":[],"filenames":[],"executable":null,"fresh":true}"#,
+            "\n",
+        );
+        assert!(RustPlugin.parse_diagnostics(stdout).is_empty());
+    }
+
+    #[test]
+    fn handles_message_with_no_primary_span() {
+        let stdout = concat!(
+            r#"{"reason":"compiler-message","package_id":"x","target":{"name":"x","kind":["lib"]},"message":{"rendered":"error: linking with `cc` failed","children":[],"code":null,"level":"error","message":"linking with `cc` failed","spans":[]}}"#,
+            "\n",
+        );
+        let diags = RustPlugin.parse_diagnostics(stdout);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].file.is_none());
+        assert!(diags[0].line_start.is_none());
+        assert!(diags[0].code.is_none());
     }
 }
