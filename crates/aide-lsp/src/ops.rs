@@ -218,6 +218,64 @@ pub async fn workspace_symbols(
     })
 }
 
+/// Rust-analyzer-specific: recursively expand the macro at
+/// `(line, col)` and return the expansion text plus the macro's
+/// display name. Returns `None` when the position is not inside a
+/// macro invocation or the server doesn't recognise the method.
+pub async fn expand_macro(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+) -> Result<Option<ExpandedMacro>, LspClientError> {
+    ensure_document_current(client, path).await?;
+    let uri = path_to_uri(path)?;
+    let params = ExpandMacroParams {
+        text_document: TextDocumentIdentifier { uri },
+        position: Position {
+            line,
+            character: col,
+        },
+    };
+    let result = client.request::<ExpandMacroRequest>(params).await?;
+    Ok(result.map(|r| ExpandedMacro {
+        name: r.name,
+        expansion: r.expansion,
+    }))
+}
+
+/// Custom rust-analyzer LSP request for macro expansion.
+///
+/// Documented at
+/// <https://rust-analyzer.github.io/book/contributing/lsp-extensions.html#expand-macro>
+/// and emitted by rust-analyzer's "Expand macro recursively" command.
+pub enum ExpandMacroRequest {}
+
+impl lsp_types::request::Request for ExpandMacroRequest {
+    type Params = ExpandMacroParams;
+    type Result = Option<ExpandMacroResult>;
+    const METHOD: &'static str = "rust-analyzer/expandMacro";
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExpandMacroParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExpandMacroResult {
+    pub name: String,
+    pub expansion: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExpandedMacro {
+    pub name: String,
+    pub expansion: String,
+}
+
 /// Open or refresh `path`, wait `settle` for the server to publish diagnostics,
 /// then return the current snapshot.
 pub async fn diagnostics(

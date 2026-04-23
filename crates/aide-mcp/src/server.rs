@@ -1076,6 +1076,32 @@ impl AideServer {
     }
 
     #[tool(
+        description = "Recursively expand the macro invocation at (file, line, column) using rust-analyzer's `rust-analyzer/expandMacro` extension. Returns the macro's display name and the expanded source, or null when the position is not inside a macro. Currently only wired for Rust — other languages ignore the request."
+    )]
+    async fn lsp_expand_macro(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::expand_macro(&client, &file, args.line, args.column).await {
+            Ok(Some(h)) => to_json(&h),
+            Ok(None) => "null".to_string(),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
         description = "LSP diagnostics for a single file (errors, warnings). Waits briefly for the server to finish analysing the file, then returns the published diagnostics."
     )]
     async fn lsp_diagnostics(&self, Parameters(args): Parameters<LspFileArgs>) -> String {
