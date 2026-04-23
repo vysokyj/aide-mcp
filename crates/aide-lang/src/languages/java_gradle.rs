@@ -89,10 +89,11 @@ impl LanguagePlugin for JavaGradlePlugin {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        // Share the Eclipse JDT-LS tarball with the Maven flavour so
-        // project_setup on a mixed workspace doesn't download twice
-        // (install_tool is idempotent on the same version pin).
-        vec![super::java::jdtls_spec()]
+        // Share the Eclipse JDT-LS tarball and Lombok jar with the
+        // Maven flavour so project_setup on a mixed workspace doesn't
+        // download twice (install_tool is idempotent on the same
+        // version pin).
+        vec![super::java::jdtls_spec(), super::java::lombok_spec()]
     }
 }
 
