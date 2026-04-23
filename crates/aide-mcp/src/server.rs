@@ -197,6 +197,19 @@ pub struct LspPositionArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspRenameArgs {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    /// The new identifier. The server refuses names that don't
+    /// parse as identifiers (rust-analyzer emits an error in that
+    /// case).
+    pub new_name: String,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LspFileArgs {
     /// Absolute path to the source file.
     pub file: String,
@@ -1071,6 +1084,32 @@ impl AideServer {
 
         match lsp_ops::definition(&client, &file, args.line, args.column).await {
             Ok(hits) => to_json(&hits),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Rename the symbol at (file, line, column) to `new_name` via LSP `textDocument/rename`. Applies the resulting WorkspaceEdit to disk across every touched file and keeps the language server's in-memory buffers in sync. Returns `{files, total_edits}` — per-file change counts. Unlike shell find-and-replace, this respects scope, traits, and reexports. Returns null if the symbol at that position is not renameable."
+    )]
+    async fn lsp_rename_symbol(&self, Parameters(args): Parameters<LspRenameArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::rename(&client, &file, args.line, args.column, args.new_name).await {
+            Ok(Some(summary)) => to_json(&summary),
+            Ok(None) => "null".to_string(),
             Err(e) => error_json(e.to_string()),
         }
     }

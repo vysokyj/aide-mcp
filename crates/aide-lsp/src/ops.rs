@@ -6,15 +6,16 @@ use std::time::Duration;
 
 use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
 use lsp_types::request::{
-    DocumentSymbolRequest, GotoDefinition, HoverRequest, References, WorkspaceSymbolRequest,
+    DocumentSymbolRequest, GotoDefinition, HoverRequest, References, Rename, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, HoverContents,
     HoverParams, MarkedString, PartialResultParams, Position, ReferenceContext, ReferenceParams,
-    SymbolInformation, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    RenameParams, SymbolInformation, SymbolKind, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbol,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Serialize;
 
@@ -216,6 +217,177 @@ pub async fn workspace_symbols(
             items.iter().filter_map(workspace_hit_from_nested).collect()
         }
     })
+}
+
+/// Rename the symbol at `(line, col)` to `new_name` across the
+/// whole workspace, applying the resulting [`WorkspaceEdit`] to
+/// disk (and to the server's in-memory buffers). Returns a summary
+/// of what changed — or `None` when the symbol is not renameable at
+/// that position. Errors out if applying any edit fails partway
+/// through, leaving the partial state on disk.
+pub async fn rename(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+    new_name: String,
+) -> Result<Option<RenameSummary>, LspClientError> {
+    ensure_document_current(client, path).await?;
+    let uri = path_to_uri(path)?;
+    let params = RenameParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position {
+                line,
+                character: col,
+            },
+        },
+        new_name,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    let Some(edit) = client.request::<Rename>(params).await? else {
+        return Ok(None);
+    };
+    let applied = apply_workspace_edit(client, &edit).await?;
+    Ok(Some(applied))
+}
+
+/// Write every change in `edit` back to disk, keeping the LSP
+/// server's in-memory buffers in sync. Edits for each file are
+/// applied in descending byte order so earlier ranges remain valid
+/// after later ones shift. Returns a summary for agents — which
+/// files changed, how many edits per file.
+pub async fn apply_workspace_edit(
+    client: &LspClient,
+    edit: &WorkspaceEdit,
+) -> Result<RenameSummary, LspClientError> {
+    let mut files: Vec<FileChange> = Vec::new();
+    let mut total_edits = 0usize;
+
+    if let Some(changes) = edit.changes.as_ref() {
+        for (uri, edits) in changes {
+            let path = uri_to_path(uri)?;
+            let before = tokio::fs::read_to_string(&path)
+                .await
+                .map_err(LspClientError::from_io)?;
+            let after = apply_text_edits(&before, edits);
+            let edit_count = edits.len();
+            total_edits += edit_count;
+            tokio::fs::write(&path, &after)
+                .await
+                .map_err(LspClientError::from_io)?;
+
+            let mut docs = client.opened_documents().lock().await;
+            if let Some(doc) = docs.get_mut(uri) {
+                doc.version += 1;
+                doc.text.clone_from(&after);
+                let version = doc.version;
+                drop(docs);
+                let params = DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: after.clone(),
+                    }],
+                };
+                client.notify::<DidChangeTextDocument>(params).await?;
+            }
+
+            files.push(FileChange {
+                path: path.display().to_string(),
+                edit_count,
+            });
+        }
+    }
+
+    Ok(RenameSummary { files, total_edits })
+}
+
+/// Apply a list of [`TextEdit`]s to `text` and return the result.
+/// Edits are sorted so later ranges are applied first, ensuring
+/// earlier ranges' byte offsets remain valid. Panics are impossible
+/// as long as every range refers to valid positions in `text`; if
+/// not, the original text is preserved for that edit.
+fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
+    let line_offsets = compute_line_offsets(text);
+    let mut sorted: Vec<&TextEdit> = edits.iter().collect();
+    sorted.sort_by(|a, b| {
+        (b.range.start.line, b.range.start.character)
+            .cmp(&(a.range.start.line, a.range.start.character))
+    });
+    let mut out = text.to_string();
+    for edit in sorted {
+        let Some(start) = byte_offset(&line_offsets, text, edit.range.start) else {
+            continue;
+        };
+        let Some(end) = byte_offset(&line_offsets, text, edit.range.end) else {
+            continue;
+        };
+        if start > end || end > out.len() {
+            continue;
+        }
+        out.replace_range(start..end, &edit.new_text);
+    }
+    out
+}
+
+fn compute_line_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            offsets.push(i + 1);
+        }
+    }
+    offsets
+}
+
+fn byte_offset(line_offsets: &[usize], text: &str, pos: Position) -> Option<usize> {
+    let line_start = *line_offsets.get(pos.line as usize)?;
+    // LSP position offsets are in UTF-16 code units; walk the text
+    // converting char-by-char. Most real-world code is ASCII so the
+    // hot path is trivial, but accented identifiers and emoji still
+    // have to land at the right byte boundary.
+    let mut utf16_count: u32 = 0;
+    let rest = &text[line_start..];
+    for (byte_idx, ch) in rest.char_indices() {
+        if utf16_count == pos.character {
+            return Some(line_start + byte_idx);
+        }
+        utf16_count += u32::try_from(ch.len_utf16()).ok()?;
+        if utf16_count > pos.character {
+            return Some(line_start + byte_idx + ch.len_utf8());
+        }
+    }
+    // Position is at or past end of line — clamp to end of line.
+    if utf16_count <= pos.character {
+        Some(line_start + rest.len())
+    } else {
+        None
+    }
+}
+
+fn uri_to_path(uri: &Uri) -> Result<std::path::PathBuf, LspClientError> {
+    let s = uri.as_str();
+    let stripped = s
+        .strip_prefix("file://")
+        .ok_or_else(|| LspClientError::Uri(format!("not a file:// URI: {s}")))?;
+    Ok(std::path::PathBuf::from(stripped))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameSummary {
+    pub files: Vec<FileChange>,
+    pub total_edits: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileChange {
+    pub path: String,
+    pub edit_count: usize,
 }
 
 /// Rust-analyzer-specific: recursively expand the macro at
@@ -489,5 +661,76 @@ fn marked_string_to_plain(s: &MarkedString) -> String {
         MarkedString::LanguageString(ls) => {
             format!("```{}\n{}\n```", ls.language, ls.value)
         }
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::{apply_text_edits, Position, TextEdit};
+    use lsp_types::Range;
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    fn edit(start: Position, end: Position, new_text: &str) -> TextEdit {
+        TextEdit {
+            range: Range { start, end },
+            new_text: new_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn single_edit_on_one_line() {
+        let text = "let foo = 1;\nlet bar = 2;\n";
+        let edits = vec![edit(pos(0, 4), pos(0, 7), "baz")];
+        assert_eq!(
+            apply_text_edits(text, &edits),
+            "let baz = 1;\nlet bar = 2;\n"
+        );
+    }
+
+    #[test]
+    fn two_edits_on_one_line_applied_right_to_left() {
+        // Both edits on the same line — the one earlier in the line
+        // must still see its original position after the later one
+        // is applied.
+        let text = "alpha beta gamma\n";
+        let edits = vec![
+            edit(pos(0, 0), pos(0, 5), "ALPHA"),
+            edit(pos(0, 11), pos(0, 16), "GAMMA"),
+        ];
+        assert_eq!(apply_text_edits(text, &edits), "ALPHA beta GAMMA\n");
+    }
+
+    #[test]
+    fn edit_across_lines() {
+        let text = "one\ntwo\nthree\n";
+        let edits = vec![edit(pos(0, 0), pos(2, 0), "X\n")];
+        assert_eq!(apply_text_edits(text, &edits), "X\nthree\n");
+    }
+
+    #[test]
+    fn insertion_at_end_of_line() {
+        // zero-width range at end of line: pure insertion.
+        let text = "hello\n";
+        let edits = vec![edit(pos(0, 5), pos(0, 5), " world")];
+        assert_eq!(apply_text_edits(text, &edits), "hello world\n");
+    }
+
+    #[test]
+    fn utf16_character_offsets_respect_multibyte_chars() {
+        // "α" is 1 UTF-16 code unit but 2 UTF-8 bytes. `char 1` in
+        // LSP land is after the alpha; the byte offset must skip 2.
+        let text = "αxyz\n";
+        let edits = vec![edit(pos(0, 1), pos(0, 2), "_")];
+        assert_eq!(apply_text_edits(text, &edits), "α_yz\n");
+    }
+
+    #[test]
+    fn out_of_range_edit_is_silently_dropped() {
+        let text = "abc\n";
+        let edits = vec![edit(pos(10, 0), pos(10, 3), "X")];
+        assert_eq!(apply_text_edits(text, &edits), "abc\n");
     }
 }
