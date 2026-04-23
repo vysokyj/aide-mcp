@@ -1,37 +1,53 @@
 # aide-mcp
 
-IDE-grade tools for AI agents, delivered as a pure MCP server in Rust.
+**AIDE** — **A**rtificial **I**ntelligence **D**evelopment **E**nvironment.
+Contracted from *AI* + *IDE*, dropping the redundant *Integrated* (aide-mcp
+is headless — nothing to integrate into a GUI). Also French for *help*, which
+fits the role: IDE-grade tools for AI agents, delivered as a pure MCP server
+in Rust.
 
 aide-mcp closes the gap between agents that work with `grep`/`read` primitives
 and the structured code intelligence a real IDE provides. It spawns language
-servers, indexes code, and exposes git read operations — all through a single
-MCP server over stdio.
+servers, builds SCIP indexes against committed snapshots, runs and debugs the
+project, and exposes git read operations — all through a single MCP server
+over stdio.
 
-## Capabilities (today)
+## Capabilities
 
 **Project bootstrap**
 - `project_detect` — report which supported languages live at a project root.
 - `project_setup` — download the LSP server, SCIP indexer, and debug adapter
   binaries for detected languages into `~/.aide/bin/`; idempotent.
 
-**LSP proxy** (keeps a per-workspace language server warm)
+**LSP proxy** — live working-tree code intelligence (per-workspace server kept warm)
 - `lsp_hover`, `lsp_definition`, `lsp_references`
 - `lsp_document_symbols`, `lsp_workspace_symbols`
 - `lsp_diagnostics`
 
+**SCIP index** — stable snapshots keyed by commit SHA (built in-process; no daemon)
+- `index_commit`, `index_status`, `work_last_known_state`
+- `scip_documents`, `scip_symbols`, `scip_references`
+
+**Exec** — project lifecycle against the working tree
+- `run_project`, `run_tests`, `install_package`, `read_exec_log`
+
+**DAP** — debug adapter proxy over stdio
+- `dap_launch`, `dap_terminate`
+- `dap_set_breakpoints`, `dap_continue`, `dap_pause`
+- `dap_step_over`, `dap_step_in`, `dap_step_out`
+- `dap_stack_trace`, `dap_scopes`, `dap_variables`, `dap_evaluate`
+
 **Git read ops** (libgit2 via `git2`)
 - `git_status`, `git_log`, `git_diff`, `git_blame`
 
-## Planned
-
-- `aide-indexer` daemon: builds SCIP indexes post-commit, keyed by commit SHA.
-- SCIP query tools (`scip_symbol_at`, semantic diff between commits).
-- `exec_run` / `exec_test` / `pkg_install` project lifecycle tools.
-- DAP (debug adapter) proxy: set breakpoints, step, inspect variables.
-
 ## Supported languages
 
-- **Rust** — rust-analyzer (LSP), scip-rust (SCIP), codelldb (DAP, planned).
+- **Rust** — rust-analyzer (LSP), scip-rust (SCIP), codelldb (DAP). All three
+  auto-install on `project_setup`.
+- **Java / Maven** and **Java / Gradle** — JDT-LS (LSP, auto-installed from
+  the Eclipse snapshot tarball via a generated wrapper; Lombok is fetched
+  and wired in as a javaagent), scip-java (SCIP; still expects a system
+  install via coursier), `java-debug` adapter (DAP).
 
 Languages are added one at a time via the `LanguagePlugin` trait in
 `aide-lang`. Each plugin declares which binaries to fetch, how to run/test,
@@ -59,20 +75,25 @@ for example Claude Code:
 
 Then from the agent:
 
-1. Call `project_setup` with the absolute path to your project. This downloads
-   rust-analyzer to `~/.aide/bin/rust-analyzer` on first run.
+1. Call `project_setup` with the absolute path to your project. On first run
+   this downloads the LSP / SCIP / DAP binaries for each detected language
+   into `~/.aide/bin/` (e.g. rust-analyzer + codelldb for a Rust project,
+   JDT-LS + Lombok for a Java project).
 2. Call `lsp_hover`, `git_status`, … as needed.
 
 ## Workspace layout
 
 ```
 crates/
-  aide-core/      shared paths + config (~/.aide/ layout)
-  aide-install/   binary installer (GitHub releases, gzip)
-  aide-lang/      LanguagePlugin trait + per-language specs
+  aide-core/      shared paths + config (~/.aide/ layout, TOML config)
+  aide-install/   binary installer (GitHub releases, gzip/tar.gz/zip)
+  aide-lang/      LanguagePlugin trait + built-ins (Rust, Java Maven/Gradle)
   aide-lsp/       stdio LSP client + per-workspace pool + ops
-  aide-git/       libgit2-backed read ops
-  aide-mcp/       MCP server binary (rmcp 1.5)
+  aide-dap/       Debug Adapter Protocol client over stdio
+  aide-git/       libgit2-backed read ops + commit export
+  aide-proto/     shared primitives (framing, indexer schema)
+  aide-scip/      scip protobuf loader + query helpers
+  aide-mcp/       MCP server binary (rmcp 1.5); owns the in-process indexer
 ```
 
 ## Environment
@@ -90,4 +111,4 @@ Rust MCP SDK. stdio transport only for now.
 
 ## License
 
-MIT OR Apache-2.0
+MIT — see [LICENSE](LICENSE).
