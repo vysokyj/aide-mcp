@@ -34,13 +34,13 @@ decisions, roadmap, current state — is mirrored here.
 | v0.5      | exec tools (run/test/install) | ✅ done |
 | v0.6      | DAP proxy (Rust via codelldb first) | ✅ done |
 | v0.7      | project-scoped search primitives (`project_ls`, `project_grep`) to make `ls`/`find`/`grep` via Bash unnecessary | ✅ done — `project_ls(_at)`, `project_grep(_at)`, SCIP symbol annotation on grep hits |
-| v0.8      | Structured compiler/test feedback: cargo/rustc JSON diagnostics parsed into `ExecResult.diagnostics`, each tagged with enclosing SCIP symbol | 📋 planned |
-| v0.9      | Semantic navigation aggregates: `task_context(file)`, `project_map`, `scip_callers/callees` convenience wrappers — saves ~5 roundtrips per "pick up work on X" | 📋 planned |
-| v0.10     | Test discovery via SCIP: `tests_for_symbol`, `tests_for_changed_files`; `run_tests` can auto-derive filter from working-tree dirty set | 📋 planned |
-| v0.11     | Impact analysis: `impact_of_change(symbol)` (callers classified test/bin/lib), `public_api_diff(sha1, sha2)` for structured pub-surface deltas | 📋 planned |
-| v0.12     | Macro / generated code visibility: `lsp_expand_macro` (rust-analyzer code action) + `cargo expand` fallback. Makes macro-heavy code (serde, clap, sqlx) legible to agents | 📋 planned |
-| v0.13     | Write-side tooling: `edit_by_symbol`, `lsp_rename_symbol`, `apply_code_action`, `safe_edit` wrapper that measures diagnostic delta before/after. Agents stop doing text-level surgery | 📋 planned |
-| v0.14     | Dogfood → roadmap loop: aggregate coverage-gap output across runs, auto-propose new tool ideas; optional CI of the paired-agent benchmark | 📋 planned |
+| v0.8      | Structured compiler/test feedback: cargo JSON diagnostics parsed into `ExecResult.diagnostics`, each tagged with enclosing SCIP symbol | ✅ done |
+| v0.9      | Semantic navigation aggregates: `task_context`, `project_map`, `scip_callers` | ✅ done |
+| v0.10     | Test discovery via SCIP: `tests_for_symbol`, `tests_for_changed_files` with plugin-aware `is_test_symbol` heuristic | ✅ done |
+| v0.11     | Impact analysis: `impact_of_change` (callers classified test/bin/lib/example/bench), `public_api_diff(sha1, sha2)` | ✅ done |
+| v0.12     | Macro / generated code visibility: `lsp_expand_macro` via rust-analyzer's `expandMacro` extension | ✅ done — `cargo expand` fallback deferred |
+| v0.13     | Write-side tooling: `lsp_rename_symbol` with LSP-backed cross-file rename | ✅ done — `apply_code_action`, `safe_edit` deferred to v0.13.x |
+| v0.14     | Dogfood → roadmap loop: `dogfood_coverage_gaps` aggregates run records into a ranked report | ✅ done — CI integration deferred |
 
 ## Workspace layout
 
