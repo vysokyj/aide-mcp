@@ -155,8 +155,7 @@ pub fn jdtls_spec() -> ToolSpec {
 /// (unlike `projectlombok.org/lombok.jar`, which is a rolling link).
 pub fn lombok_spec() -> ToolSpec {
     let url = format!(
-        "https://repo1.maven.org/maven2/org/projectlombok/lombok/{v}/lombok-{v}.jar",
-        v = LOMBOK_VERSION,
+        "https://repo1.maven.org/maven2/org/projectlombok/lombok/{LOMBOK_VERSION}/lombok-{LOMBOK_VERSION}.jar",
     );
     ToolSpec {
         name: "lombok".to_string(),
