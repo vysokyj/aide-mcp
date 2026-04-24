@@ -117,6 +117,92 @@ impl LanguagePlugin for JavaMavenPlugin {
         // Lombok ships as a javaagent the jdtls wrapper picks up at launch.
         vec![jdtls_spec(), lombok_spec()]
     }
+
+    fn is_test_symbol(&self, relative_path: &str, display_name: &str) -> bool {
+        is_java_test(relative_path, display_name)
+    }
+
+    fn classify_path(&self, relative_path: &str) -> &'static str {
+        classify_java_path(relative_path)
+    }
+}
+
+/// Broad path-based classification of a Java / Kotlin / Groovy source
+/// file. Picks the first matching bucket in this order:
+///
+/// - `test` — under Maven's `src/test/<lang>/` or Gradle's conventional
+///   test tree, or matching the Surefire / Failsafe filename patterns
+///   (`Test*`, `*Test`, `*Tests`, `*TestCase`, `*IT`, `*ITCase`).
+/// - `example` — under `src/main/examples/` or `examples/`.
+/// - `lib` — everything else (including `src/main/java/...`). Java
+///   lacks a `cargo`-style `bin` convention at the source layout
+///   level — any class with a `public static void main` can be a
+///   binary — so `bin` is deliberately not detected by path alone.
+///   Shared by both `JavaMavenPlugin` and `JavaGradlePlugin` via
+///   `super::java::classify_java_path`.
+pub fn classify_java_path(relative_path: &str) -> &'static str {
+    if is_java_test(relative_path, "") {
+        return "test";
+    }
+    let p = relative_path.to_ascii_lowercase();
+    if p.starts_with("examples/") || p.contains("/examples/") || p.contains("src/main/examples/") {
+        return "example";
+    }
+    "lib"
+}
+
+/// Java / Kotlin test heuristic. Covers JVM-ecosystem conventions:
+/// - Path prefix `src/test/java/`, `src/test/kotlin/`,
+///   `src/test/groovy/` (Maven + Gradle default layout).
+/// - Bare `test/` or `tests/` directories (less conventional, used by
+///   some smaller projects).
+/// - Filename patterns from Maven's Surefire / Failsafe plugins:
+///   `Test*.{java,kt}`, `*Test.{java,kt}`, `*Tests.{java,kt}`,
+///   `*TestCase.{java,kt}`, `*IT.{java,kt}` (integration tests),
+///   `*ITCase.{java,kt}`. The `IT` suffix is checked case-sensitively
+///   to avoid false positives on words that happen to end in "it"
+///   (e.g. `Transit`, `Unit`).
+/// - Symbol-name prefix `test` — catches JUnit-style method names
+///   (`testFoo`) even when the annotation isn't reflected in SCIP.
+///
+/// Shared by both `JavaMavenPlugin` and `JavaGradlePlugin` via
+/// `super::java::is_java_test`.
+pub fn is_java_test(relative_path: &str, display_name: &str) -> bool {
+    let lowered = relative_path.to_ascii_lowercase();
+    let in_test_path = lowered.starts_with("src/test/")
+        || lowered.contains("/src/test/")
+        || lowered.starts_with("test/")
+        || lowered.starts_with("tests/")
+        || lowered.contains("/test/")
+        || lowered.contains("/tests/");
+    let file_looks_like_test = java_filename_looks_like_test(relative_path);
+    // Method-level: `testFoo` covers JUnit 3-style and the common
+    // JUnit 4/5 convention. Class-level: `*Test`/`*Tests`/`*IT`
+    // suffix is caught by the filename path above.
+    let looks_like_test_fn =
+        display_name.starts_with("test") && display_name.chars().count() > "test".len();
+    in_test_path || file_looks_like_test || looks_like_test_fn
+}
+
+fn java_filename_looks_like_test(path: &str) -> bool {
+    // Work against the original case so the `IT` / `ITCase` suffix
+    // can be distinguished from innocuous lowercase `it`.
+    let filename = path.rsplit('/').next().unwrap_or("");
+    let stem = match std::path::Path::new(filename).file_stem() {
+        Some(s) => s.to_string_lossy().into_owned(),
+        None => return false,
+    };
+    // Surefire / Failsafe-shaped filenames — case-insensitive for
+    // `Test`/`Tests`/`TestCase`, case-sensitive for `IT`/`ITCase`.
+    let lowered = stem.to_ascii_lowercase();
+    if lowered.starts_with("test")
+        || lowered.ends_with("test")
+        || lowered.ends_with("tests")
+        || lowered.ends_with("testcase")
+    {
+        return true;
+    }
+    stem.ends_with("IT") || stem.ends_with("ITCase")
 }
 
 /// Spec for the Eclipse JDT Language Server. Shared by both Java
@@ -376,5 +462,87 @@ mod tests {
         // Attachment is conditional — missing jar must not fail the launch.
         assert!(script.contains(r#"if [ -f "$LOMBOK_JAR" ]; then"#));
         assert!(script.contains(r#"set -- "-javaagent:$LOMBOK_JAR" "$@""#));
+    }
+
+    #[test]
+    fn pins_are_exact_versions() {
+        // JDT-LS uses a label (`snapshot-YYYY-MM-DD`) rather than a
+        // semver tag because Eclipse ships rolling snapshots; treat
+        // label + Lombok version the same way — neither may be
+        // "latest" and both must be non-empty.
+        assert!(!LOMBOK_VERSION.is_empty());
+        assert_ne!(LOMBOK_VERSION, "latest");
+        let jdtls = jdtls_spec();
+        assert!(!jdtls.version.is_empty());
+        assert_ne!(jdtls.version, "latest");
+    }
+
+    #[test]
+    fn classify_java_path_buckets_by_convention() {
+        assert_eq!(
+            classify_java_path("src/test/java/com/example/FooTest.java"),
+            "test",
+        );
+        assert_eq!(
+            classify_java_path("src/test/kotlin/com/example/FooTest.kt"),
+            "test",
+        );
+        assert_eq!(
+            classify_java_path("subproject/src/test/java/FooIT.java"),
+            "test",
+        );
+        assert_eq!(classify_java_path("tests/FooTest.java"), "test");
+        assert_eq!(classify_java_path("examples/demo/App.java"), "example");
+        assert_eq!(
+            classify_java_path("src/main/java/com/example/App.java"),
+            "lib",
+        );
+        assert_eq!(
+            classify_java_path("src/main/java/com/example/Transit.java"),
+            "lib",
+        );
+    }
+
+    #[test]
+    fn is_java_test_picks_up_maven_surefire_conventions() {
+        // Directory-based conventions (Maven + Gradle default layout).
+        assert!(is_java_test(
+            "src/test/java/com/example/FooTest.java",
+            "anything",
+        ));
+        assert!(is_java_test(
+            "src/test/kotlin/com/example/Foo.kt",
+            "anything",
+        ));
+        assert!(is_java_test(
+            "subproject/src/test/java/Any.java",
+            "anything"
+        ));
+        assert!(is_java_test("tests/Foo.java", "anything"));
+
+        // Filename conventions — Surefire / Failsafe patterns.
+        assert!(is_java_test("a/b/TestFoo.java", "anything"));
+        assert!(is_java_test("a/b/FooTest.java", "anything"));
+        assert!(is_java_test("a/b/FooTests.java", "anything"));
+        assert!(is_java_test("a/b/FooTestCase.java", "anything"));
+        assert!(is_java_test("a/b/FooIT.java", "anything"));
+        assert!(is_java_test("a/b/FooITCase.java", "anything"));
+
+        // Method-level fallback.
+        assert!(is_java_test(
+            "src/main/java/com/example/Foo.java",
+            "testSomething",
+        ));
+
+        // Negative: innocuous names that contain "it" or "test" as a
+        // substring but aren't tests.
+        assert!(!is_java_test(
+            "src/main/java/com/example/Transit.java",
+            "anything",
+        ));
+        assert!(!is_java_test("src/main/java/com/example/Unit.java", "X"));
+        assert!(!is_java_test("src/main/java/com/example/Foo.java", "bar"));
+        // Bare "test" without a suffix is a type/const, not a method.
+        assert!(!is_java_test("src/main/java/com/example/Foo.java", "test"));
     }
 }

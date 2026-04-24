@@ -95,6 +95,15 @@ impl LanguagePlugin for JavaGradlePlugin {
         // version pin).
         vec![super::java::jdtls_spec(), super::java::lombok_spec()]
     }
+
+    fn is_test_symbol(&self, relative_path: &str, display_name: &str) -> bool {
+        // Same JVM-ecosystem conventions as Maven.
+        super::java::is_java_test(relative_path, display_name)
+    }
+
+    fn classify_path(&self, relative_path: &str) -> &'static str {
+        super::java::classify_java_path(relative_path)
+    }
 }
 
 fn slug(path: &Path) -> String {
@@ -112,6 +121,7 @@ fn slug(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn detects_build_gradle() {
@@ -132,5 +142,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
         assert!(!JavaGradlePlugin.detect(dir.path()));
+    }
+
+    #[test]
+    fn scip_args_matches_scip_java_cli_shape() {
+        let args = JavaGradlePlugin
+            .scip_args(Path::new("/p"), Path::new("/out/index.scip"))
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["index", "--output", "/out/index.scip", "/p"]);
+    }
+
+    #[test]
+    fn lsp_spawn_args_contains_workspace_data_dir() {
+        let root = std::env::temp_dir().join("aide-test-gradle");
+        let paths = aide_core::AidePaths::at(&root);
+        let args = JavaGradlePlugin.lsp_spawn_args(Path::new("/home/u/proj"), &paths);
+        assert_eq!(args[0], "-data");
+        let data = PathBuf::from(&args[1]);
+        let expected_parent = root.join("lsp-cache").join("jdtls");
+        assert!(data.starts_with(&expected_parent));
+        assert_eq!(data.file_name().unwrap().to_string_lossy(), "home_u_proj");
+    }
+
+    #[test]
+    fn tools_share_jdtls_and_lombok_specs_with_maven() {
+        let names: Vec<_> = JavaGradlePlugin
+            .tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"jdtls".to_string()));
+        assert!(names.contains(&"lombok".to_string()));
+    }
+
+    #[test]
+    fn shares_java_test_heuristic_with_maven() {
+        // Quick sanity that the Gradle plugin delegates to the shared
+        // Maven heuristic — one positive, one negative.
+        assert!(JavaGradlePlugin.is_test_symbol("src/test/java/FooTest.java", "anything"));
+        assert!(!JavaGradlePlugin.is_test_symbol("src/main/java/Transit.java", "bar"));
+    }
+
+    #[test]
+    fn shares_classify_path_with_maven() {
+        assert_eq!(
+            JavaGradlePlugin.classify_path("src/test/java/FooTest.java"),
+            "test",
+        );
+        assert_eq!(
+            JavaGradlePlugin.classify_path("src/main/java/App.java"),
+            "lib",
+        );
     }
 }

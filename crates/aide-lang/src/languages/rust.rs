@@ -396,4 +396,51 @@ mod tests {
         assert!(diags[0].line_start.is_none());
         assert!(diags[0].code.is_none());
     }
+
+    #[test]
+    fn scip_args_matches_rust_analyzer_cli_shape() {
+        let args = RustPlugin
+            .scip_args(Path::new("/repo"), Path::new("/out/index.scip"))
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["scip", "/repo", "--output", "/out/index.scip"]);
+    }
+
+    #[test]
+    fn tools_include_rust_analyzer_and_codelldb() {
+        let names: Vec<_> = RustPlugin.tools().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            vec!["rust-analyzer".to_string(), "codelldb".to_string()],
+        );
+    }
+
+    #[test]
+    fn pins_are_exact_versions() {
+        for pin in [RUST_ANALYZER_TAG, CODELLDB_TAG] {
+            assert!(!pin.is_empty(), "pin must not be empty");
+            assert_ne!(pin, "latest", "pin must be an exact version");
+        }
+    }
+
+    #[test]
+    fn github_release_assets_embed_pin_in_filename() {
+        // The per-triple asset URLs are built inside aide-install from
+        // `<repo>/releases/download/<tag>/<filename>`. Assert the
+        // specs carry the pinned tag so a pin bump always produces a
+        // new download URL rather than silently reusing a stale
+        // cached one.
+        let specs = [rust_analyzer_spec(), codelldb_spec()];
+        for spec in specs {
+            match &spec.source {
+                Source::GithubRelease { tag, .. } => {
+                    assert_eq!(tag, &spec.version, "{} tag must equal version", spec.name);
+                }
+                Source::DirectUrl { .. } => {
+                    panic!("{} must be GithubRelease-sourced", spec.name)
+                }
+            }
+        }
+    }
 }
