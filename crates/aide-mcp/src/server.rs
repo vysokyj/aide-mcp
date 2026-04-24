@@ -2552,6 +2552,91 @@ impl AideServer {
         }
     }
 
+    #[tool(
+        description = "View a single GitHub issue on the repo detected from `origin`. Returns `{issue, comments}` — issue includes the full `body` (unlike `gh_issue_list` which omits it from some endpoints) and `state_reason`; comments are every reply in chronological order (capped at GitHub's 100-per-page, no pagination beyond that yet)."
+    )]
+    async fn gh_issue_view(&self, Parameters(args): Parameters<GhIssueViewArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        let issue = match client.get_issue(&slug.owner, &slug.repo, args.number).await {
+            Ok(i) => i,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let comments = match client
+            .list_comments(&slug.owner, &slug.repo, args.number)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+        to_json(&serde_json::json!({
+            "issue": issue,
+            "comments": comments,
+        }))
+    }
+
+    #[tool(
+        description = "Post a comment on a GitHub issue. Returns the created `Comment` (id, body, user, timestamps, html_url) so the caller can link to it. Use for follow-up notes — \"also hit this in commit abc123\", \"duplicate of #N\" — instead of opening a second issue."
+    )]
+    async fn gh_issue_comment(&self, Parameters(args): Parameters<GhIssueCommentArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        match client
+            .create_comment(&slug.owner, &slug.repo, args.number, &args.body)
+            .await
+        {
+            Ok(comment) => to_json(&comment),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Close a GitHub issue. Optional `reason` is `completed` (default intent — the underlying bug is fixed) or `not_planned` (wontfix). Returns the updated Issue including its `state_reason`. Prefer `Closes #N` in a commit message's footer when the close is driven by a merge — GitHub auto-closes and this tool becomes redundant. Use this tool for human-driven closes without a commit or when reason matters."
+    )]
+    async fn gh_issue_close(&self, Parameters(args): Parameters<GhIssueCloseArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let reason = match args.reason.as_deref() {
+            None => None,
+            Some(s) => match aide_github::CloseReason::parse(s) {
+                Some(r) => Some(r),
+                None => {
+                    return error_json(format!(
+                        "unknown reason {s:?}; expected one of: completed, not_planned"
+                    ))
+                }
+            },
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        match client
+            .close_issue(&slug.owner, &slug.repo, args.number, reason)
+            .await
+        {
+            Ok(issue) => to_json(&issue),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
     async fn gh_client(&self) -> Result<aide_github::GithubClient, String> {
         let token_file = self.paths.github_token();
         let resolved = aide_github::resolve_token(&token_file)
@@ -2592,6 +2677,33 @@ pub struct GhIssueListArgs {
     /// `per_page`. GitHub caps at 100; above that the API returns 422.
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhIssueViewArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Issue number (as shown in the URL / `gh_issue_list` output).
+    pub number: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhIssueCommentArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub number: u64,
+    pub body: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhIssueCloseArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub number: u64,
+    /// One of `completed` or `not_planned`. Omit to close without a
+    /// reason (GitHub leaves `state_reason` null).
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

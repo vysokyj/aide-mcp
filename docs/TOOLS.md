@@ -203,6 +203,9 @@ GitHub OAuth App ownership decision.
 | `gh_auth_status()` | `gh auth status` | Walks the token waterfall, hits `/user` with the resolved token, returns `{source, login, scopes}`. Scopes from `x-oauth-scopes` header (empty for fine-grained tokens). Never errors — agents branch on `source`. |
 | `gh_issue_create(title, body, labels?)` | `gh issue create` | Detects `:owner/:repo` from `origin` remote (SSH or HTTPS). Labels must already exist on the repo — GitHub does not auto-create. |
 | `gh_issue_list(state?, labels?, limit?)` | `gh issue list` | `state` = open / closed / all. `labels` AND-join. `limit` mapped to `per_page` (max 100). Returns `[{number, title, state, html_url, labels}]`. |
+| `gh_issue_view(number)` | `gh issue view` | Returns `{issue, comments}` in one call — issue includes full `body` and `state_reason`, comments are every reply in chronological order (up to 100). |
+| `gh_issue_comment(number, body)` | `gh issue comment` | Post a comment. Use for "also hit this in commit X" / "duplicate of #N" instead of opening a second issue. |
+| `gh_issue_close(number, reason?)` | `gh issue close` | `reason` = `completed` (default intent) or `not_planned`. Prefer `Closes #N` in a commit footer when the close is merge-driven — GitHub auto-closes and this tool is redundant. |
 | `gh_ux_gotcha(title, body, tool, param?)` | — | Policy wrapper over `gh_issue_create`: hardcodes the `ux-gotcha` label, prefixes `title` with the implicated tool, appends a provenance footer. Use whenever dogfooding surfaces a trap. See CLAUDE.md § "Reporting UX gotchas". |
 
 ## Dogfood

@@ -103,6 +103,87 @@ impl GithubClient {
         self.parse(resp).await
     }
 
+    /// `GET /repos/:owner/:repo/issues/:number` — single issue with
+    /// full body. GitHub's list endpoint returns body too, but this
+    /// is the canonical endpoint for "view one" when you already know
+    /// the number.
+    pub async fn get_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Issue, GithubError> {
+        let url = format!("{}/repos/{owner}/{repo}/issues/{number}", self.base);
+        let resp = self.build(self.http.get(&url)).send().await?;
+        self.parse(resp).await
+    }
+
+    /// `GET /repos/:owner/:repo/issues/:number/comments` — all
+    /// comments in chronological order. GitHub paginates at 30 by
+    /// default; we ask for 100 (the REST maximum) in one call and
+    /// leave multi-page fetching for the day somebody actually hits
+    /// a 100-comment issue.
+    pub async fn list_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<Comment>, GithubError> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/issues/{number}/comments",
+            self.base
+        );
+        let req = self.http.get(&url).query(&[("per_page", "100")]);
+        let resp = self.build(req).send().await?;
+        self.parse(resp).await
+    }
+
+    /// `POST /repos/:owner/:repo/issues/:number/comments`. Returns
+    /// the created comment so callers can show the `html_url`.
+    pub async fn create_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<Comment, GithubError> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/issues/{number}/comments",
+            self.base
+        );
+        let payload = CommentCreate {
+            body: body.to_string(),
+        };
+        let resp = self
+            .build(self.http.post(&url).json(&payload))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// `PATCH /repos/:owner/:repo/issues/:number` with `state:
+    /// "closed"` and an optional `state_reason`. Returns the updated
+    /// Issue so callers can confirm the transition landed — closing
+    /// an already-closed issue is a GitHub no-op, not an error.
+    pub async fn close_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        reason: Option<CloseReason>,
+    ) -> Result<Issue, GithubError> {
+        let url = format!("{}/repos/{owner}/{repo}/issues/{number}", self.base);
+        let payload = IssueUpdate {
+            state: Some("closed".to_string()),
+            state_reason: reason.map(|r| r.as_str().to_string()),
+        };
+        let resp = self
+            .build(self.http.patch(&url).json(&payload))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
     fn build(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         req.bearer_auth(&self.token)
             .header(header::ACCEPT, ACCEPT)
@@ -154,6 +235,29 @@ pub struct Issue {
     pub html_url: String,
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// Populated by `get_issue` and (for GitHub-provided bodies) by
+    /// `list_issues` too. Can be `null` when the issue was created
+    /// without a body.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// `completed`, `not_planned`, `reopened`, or absent. Present on
+    /// every issue in recent GitHub API versions; kept optional to
+    /// survive API shape changes.
+    #[serde(default)]
+    pub state_reason: Option<String>,
+}
+
+/// One comment on an issue. `user` is who posted it, `body` is the
+/// markdown text, timestamps are ISO-8601 strings straight from
+/// GitHub.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Comment {
+    pub id: u64,
+    pub body: String,
+    pub user: User,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: String,
 }
 
 /// Request body for `POST /repos/:owner/:repo/issues`.
@@ -163,6 +267,51 @@ pub struct IssueCreate {
     pub body: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+}
+
+/// Request body for `POST /repos/:owner/:repo/issues/:number/comments`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommentCreate {
+    pub body: String,
+}
+
+/// Request body for `PATCH /repos/:owner/:repo/issues/:number`. Only
+/// the two fields v0.19.1 actually exercises — GitHub accepts many
+/// more (title, body, labels, assignees, milestone), but widening
+/// this struct without a tool that uses the field would be dead API
+/// surface.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct IssueUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_reason: Option<String>,
+}
+
+/// Allowed values for `PATCH issues/:n` `state_reason` when closing.
+/// Reopen uses `state_reason: "reopened"` but we don't expose reopen
+/// in v0.19.1 (YAGNI).
+#[derive(Debug, Clone, Copy)]
+pub enum CloseReason {
+    Completed,
+    NotPlanned,
+}
+
+impl CloseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::NotPlanned => "not_planned",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "completed" => Some(Self::Completed),
+            "not_planned" | "not planned" => Some(Self::NotPlanned),
+            _ => None,
+        }
+    }
 }
 
 /// Filters for `list_issues`. All fields optional — `None` means "no
@@ -340,5 +489,155 @@ mod tests {
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert!(v.get("labels").is_none(), "labels field should be omitted");
+    }
+
+    #[tokio::test]
+    async fn get_issue_returns_body_and_state_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/issues/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 42,
+                "title": "hello",
+                "state": "closed",
+                "html_url": "https://github.com/acme/widget/issues/42",
+                "labels": [{"name": "bug"}],
+                "body": "full issue body here",
+                "state_reason": "completed"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let got = client.get_issue("acme", "widget", 42).await.unwrap();
+        assert_eq!(got.number, 42);
+        assert_eq!(got.body.as_deref(), Some("full issue body here"));
+        assert_eq!(got.state_reason.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
+    async fn list_comments_asks_for_100_per_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/issues/7/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 111,
+                    "body": "looks good",
+                    "user": {"login": "octocat"},
+                    "created_at": "2026-04-24T12:00:00Z",
+                    "updated_at": "2026-04-24T12:00:00Z",
+                    "html_url": "https://github.com/acme/widget/issues/7#issuecomment-111"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let got = client.list_comments("acme", "widget", 7).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 111);
+        assert_eq!(got[0].user.login, "octocat");
+    }
+
+    #[tokio::test]
+    async fn create_comment_posts_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/acme/widget/issues/7/comments"))
+            .and(body_partial_json(serde_json::json!({"body": "agree"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 222,
+                "body": "agree",
+                "user": {"login": "octocat"},
+                "created_at": "2026-04-24T12:05:00Z",
+                "updated_at": "2026-04-24T12:05:00Z",
+                "html_url": "https://github.com/acme/widget/issues/7#issuecomment-222"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let got = client
+            .create_comment("acme", "widget", 7, "agree")
+            .await
+            .unwrap();
+        assert_eq!(got.id, 222);
+        assert_eq!(got.body, "agree");
+    }
+
+    #[tokio::test]
+    async fn close_issue_patches_state_and_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/acme/widget/issues/7"))
+            .and(body_partial_json(
+                serde_json::json!({"state": "closed", "state_reason": "completed"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 7,
+                "title": "bug",
+                "state": "closed",
+                "state_reason": "completed",
+                "html_url": "https://github.com/acme/widget/issues/7",
+                "labels": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let got = client
+            .close_issue("acme", "widget", 7, Some(CloseReason::Completed))
+            .await
+            .unwrap();
+        assert_eq!(got.state, "closed");
+        assert_eq!(got.state_reason.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
+    async fn close_issue_without_reason_omits_state_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/acme/widget/issues/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 7,
+                "title": "bug",
+                "state": "closed",
+                "html_url": "https://github.com/acme/widget/issues/7",
+                "labels": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let _ = client.close_issue("acme", "widget", 7, None).await.unwrap();
+
+        let payload = IssueUpdate {
+            state: Some("closed".into()),
+            state_reason: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert!(
+            v.get("state_reason").is_none(),
+            "state_reason should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn close_reason_parse_round_trip() {
+        assert_eq!(
+            CloseReason::parse("completed").unwrap().as_str(),
+            "completed"
+        );
+        assert_eq!(
+            CloseReason::parse("not_planned").unwrap().as_str(),
+            "not_planned"
+        );
+        assert_eq!(
+            CloseReason::parse("not planned").unwrap().as_str(),
+            "not_planned"
+        );
+        assert!(CloseReason::parse("nope").is_none());
     }
 }

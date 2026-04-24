@@ -23,6 +23,7 @@ pub mod ux_gotcha;
 
 pub use auth::{resolve_token, AuthError, AuthSource, ResolvedToken, NO_AUTH_REMEDIATION};
 pub use client::{
-    GithubClient, GithubError, Issue, IssueCreate, IssueListFilter, IssueState, Label, User,
+    CloseReason, Comment, CommentCreate, GithubClient, GithubError, Issue, IssueCreate,
+    IssueListFilter, IssueState, IssueUpdate, Label, User,
 };
 pub use repo::{detect_github_slug, parse_github_slug, RepoError, RepoSlug};
