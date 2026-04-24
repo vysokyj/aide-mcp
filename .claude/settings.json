@@ -1,7 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "Edit(/.claude/skills/dogfood/**)"
+      "Edit(/.claude/skills/dogfood/**)",
+      "mcp__aide__project_setup",
+      "mcp__aide__work_last_known_state",
+      "mcp__aide__index_status",
+      "mcp__aide__project_ls",
+      "mcp__aide__run_tests",
+      "mcp__aide__project_grep",
+      "mcp__aide__scip_symbols",
+      "mcp__aide__project_map",
+      "mcp__aide__git_status",
+      "mcp__aide__git_diff",
+      "Skill(update-config)",
+      "Skill(update-config:*)"
     ],
     "additionalDirectories": [
       "/home/jirka/workspace/aide-mcp/.claude/skills/dogfood/runs"
