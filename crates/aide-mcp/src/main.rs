@@ -5,6 +5,7 @@ mod dogfood;
 mod exec;
 mod indexer;
 mod jobs;
+mod processes;
 mod server;
 
 #[tokio::main]

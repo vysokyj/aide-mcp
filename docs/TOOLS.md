@@ -202,10 +202,11 @@ process aide did not spawn.
 | `job_list()` | `ps aux \| grep aide-spawn` | List tracked children: `[{id, pid, kind, executable, args, started_at_unix}]` sorted by spawn time. Empty when nothing is running. |
 | `job_info(id)` | — | Look up one job. `null` if already exited. |
 | `job_kill(id, signal?)` | `kill -TERM <pid>` | Send signal (default `term`). Accepts `term` / `kill` / `int` / `hup` / `quit`, their `SIG`-prefixed aliases, and POSIX numbers (`15`, `9`, `2`, `1`, `3`). Scope-gated: only works on jobs aide registered. |
+| `process_list(name_filter?, limit?)` | `ps aux \| grep <name>` | Read-only enumeration of current-user processes. Case-insensitive `name_filter` substring, `limit` cap (default 200). Returns `[{pid, name, exe, cmd, cwd, started_at_unix, memory_bytes, cpu_percent, status}]` sorted by PID ascending. |
 
-Generic `process_list` / `process_kill` over arbitrary PIDs is **not**
-exposed — see STATUS.md v0.20.1 for the roadmap (read-only listing is
-planned; signal-any-PID is on the "won't do" side).
+Generic `process_kill(pid)` over arbitrary PIDs is explicitly **not**
+exposed — see STATUS.md v0.20.1's "won't do" note. Agents who really
+need it fall back to Bash.
 
 ## GitHub integration
 

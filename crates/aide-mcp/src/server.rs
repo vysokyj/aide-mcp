@@ -2683,6 +2683,15 @@ impl AideServer {
     }
 
     #[tool(
+        description = "Read-only enumeration of currently-running processes owned by the user aide-mcp runs as. Optional `name_filter` matches case-insensitively against the process name (substring); `limit` caps the result count (default 200). Returns `[{pid, name, exe, cmd, cwd, started_at_unix, memory_bytes, cpu_percent, status}]` sorted by PID ascending. **No kill / signal here** — that is `job_kill` (and only for aide-spawned children). The primary use case is diagnostic (\"which PID is the running aide-mcp?\") without a Bash shell-out to `ps`."
+    )]
+    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
+    fn process_list(&self, Parameters(args): Parameters<ProcessListArgs>) -> String {
+        let limit = args.limit.unwrap_or(200);
+        to_json(&crate::processes::list(args.name_filter.as_deref(), limit))
+    }
+
+    #[tool(
         description = "Send a POSIX signal to one aide-spawned job (identified by its aide `job_id`, never by raw PID). Default signal is `term` (graceful SIGTERM); other accepted values are `kill` (SIGKILL), `int` (SIGINT), `hup` (SIGHUP), `quit` (SIGQUIT). Also accepts `SIG`-prefixed aliases and POSIX numbers (`sigterm`, `15`). Returns `{id, pid, signal}` on success. Cannot signal processes aide did not spawn — that is a deliberate scope gate, not an oversight."
     )]
     async fn job_kill(&self, Parameters(args): Parameters<JobKillArgs>) -> String {
@@ -2761,6 +2770,17 @@ pub struct GhIssueCloseArgs {
     /// reason (GitHub leaves `state_reason` null).
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProcessListArgs {
+    /// Case-insensitive substring match on the process name. `None`
+    /// returns every current-user process.
+    #[serde(default)]
+    pub name_filter: Option<String>,
+    /// Cap on the number of returned entries. Defaults to 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
