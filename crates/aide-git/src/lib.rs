@@ -57,3 +57,23 @@ pub fn resolve_head(path: &Path) -> Result<(PathBuf, String), GitError> {
     let oid = head.target().ok_or(GitError::NoHead)?;
     Ok((workdir, oid.to_string()))
 }
+
+/// Short name of the currently checked-out branch — e.g. `"master"`,
+/// `"feature/foo"`. Returns `None` on detached HEAD (libgit2 reports
+/// no shorthand in that case); the caller typically treats detached
+/// HEAD as "no branch" rather than an error. Used by `gh_pr_create`
+/// to default `head` to the working-tree branch.
+pub fn current_branch(path: &Path) -> Result<Option<String>, GitError> {
+    let repo = open_repo(path)?;
+    let head = match repo.head() {
+        Ok(h) => h,
+        Err(e)
+            if e.code() == git2::ErrorCode::UnbornBranch
+                || e.code() == git2::ErrorCode::NotFound =>
+        {
+            return Err(GitError::NoHead);
+        }
+        Err(e) => return Err(GitError::Git2(e)),
+    };
+    Ok(head.shorthand().map(String::from))
+}

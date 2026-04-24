@@ -2654,6 +2654,139 @@ impl AideServer {
         }
     }
 
+    #[tool(
+        description = "Open a pull request against the repo detected from `origin`. `head` defaults to the current git branch at `path`; pass it explicitly for cross-fork PRs (GitHub wants `owner:branch` there). `base` defaults to the repo's configured default branch (one `GET /repos/:owner/:repo` call to resolve). `draft: true` opens as a draft. Returns the full PullRequest record."
+    )]
+    async fn gh_pr_create(&self, Parameters(args): Parameters<GhPrCreateArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        let head = match args.head {
+            Some(h) => h,
+            None => match aide_git::current_branch(&root) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    return error_json(
+                        "detached HEAD and no explicit `head` branch given; \
+                         pass `head` as e.g. `feature-branch` or `fork-owner:branch`"
+                            .to_string(),
+                    );
+                }
+                Err(e) => return error_json(format!("current_branch: {e}")),
+            },
+        };
+        let base = match args.base {
+            Some(b) => b,
+            None => match client.get_repo(&slug.owner, &slug.repo).await {
+                Ok(repo) => repo.default_branch,
+                Err(e) => return error_json(format!("default-branch lookup failed: {e}")),
+            },
+        };
+        let payload = aide_github::PullRequestCreate {
+            title: args.title,
+            body: args.body,
+            head,
+            base,
+            draft: args.draft,
+        };
+        match client.create_pr(&slug.owner, &slug.repo, &payload).await {
+            Ok(pr) => to_json(&pr),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "View a single pull request. Returns the full PullRequest record — title, body, draft/merged/mergeable flags, head + base branches with their tip SHAs. For issue-style comments on the PR (PR numbers share the issues namespace on GitHub), call `gh_issue_view` with the same number."
+    )]
+    async fn gh_pr_view(&self, Parameters(args): Parameters<GhPrViewArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        match client.get_pr(&slug.owner, &slug.repo, args.number).await {
+            Ok(pr) => to_json(&pr),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "List pull requests on the repo attached to `origin`. Filters: `state` (open / closed / all — default open), `head` (`owner:branch` for cross-fork, bare branch for same-repo), `base` (target branch name), `limit` mapped to `per_page` (max 100). Returns `[{number, title, state, html_url, base, head, draft, …}]`."
+    )]
+    async fn gh_pr_list(&self, Parameters(args): Parameters<GhPrListArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let state = match args.state.as_deref() {
+            None => None,
+            Some(s) => match aide_github::IssueState::parse(s) {
+                Some(v) => Some(v),
+                None => {
+                    return error_json(format!(
+                        "unknown state {s:?}; expected one of: open, closed, all"
+                    ));
+                }
+            },
+        };
+        let filter = aide_github::PullRequestListFilter {
+            state,
+            head: args.head,
+            base: args.base,
+            limit: args.limit,
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        match client.list_prs(&slug.owner, &slug.repo, &filter).await {
+            Ok(prs) => to_json(&prs),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "CI check-run status for a pull request. Resolves the PR's head SHA (one `GET /pulls/:n`), then fetches check-runs attached to that commit. Returns `{number, head_sha, total_count, check_runs: [{id, name, status, conclusion, html_url, started_at, completed_at}]}`. `status` is `queued` / `in_progress` / `completed`; `conclusion` is populated only once status is `completed` (`success` / `failure` / `cancelled` / `skipped` / `timed_out` / `action_required` / `neutral` / `stale`)."
+    )]
+    async fn gh_pr_checks(&self, Parameters(args): Parameters<GhPrChecksArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        let pr = match client.get_pr(&slug.owner, &slug.repo, args.number).await {
+            Ok(p) => p,
+            Err(e) => return error_json(e.to_string()),
+        };
+        match client
+            .check_runs(&slug.owner, &slug.repo, &pr.head.sha)
+            .await
+        {
+            Ok(resp) => to_json(&serde_json::json!({
+                "number": pr.number,
+                "head_sha": pr.head.sha,
+                "total_count": resp.total_count,
+                "check_runs": resp.check_runs,
+            })),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
     async fn gh_client(&self) -> Result<aide_github::GithubClient, String> {
         let token_file = self.paths.github_token();
         let resolved = aide_github::resolve_token(&token_file)
@@ -2801,6 +2934,57 @@ pub struct JobKillArgs {
     /// (`15`, `9`, `2`, `1`, `3`). Case-insensitive.
     #[serde(default)]
     pub signal: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhPrCreateArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// Head branch. Defaults to the current git branch at `path`.
+    /// Use `owner:branch` for cross-fork PRs.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// Base branch. Defaults to the repo's configured default branch
+    /// (one extra GitHub API call to resolve).
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Open as draft PR. Default false.
+    #[serde(default)]
+    pub draft: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhPrViewArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub number: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhPrListArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    /// One of `open` (default on GitHub) / `closed` / `all`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Filter by head branch. `owner:branch` for cross-fork.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// Filter by base branch.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// `per_page`. GitHub caps at 100.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhPrChecksArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub number: u64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

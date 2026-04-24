@@ -225,6 +225,10 @@ GitHub OAuth App ownership decision.
 | `gh_issue_view(number)` | `gh issue view` | Returns `{issue, comments}` in one call — issue includes full `body` and `state_reason`, comments are every reply in chronological order (up to 100). |
 | `gh_issue_comment(number, body)` | `gh issue comment` | Post a comment. Use for "also hit this in commit X" / "duplicate of #N" instead of opening a second issue. |
 | `gh_issue_close(number, reason?)` | `gh issue close` | `reason` = `completed` (default intent) or `not_planned`. Prefer `Closes #N` in a commit footer when the close is merge-driven — GitHub auto-closes and this tool is redundant. |
+| `gh_pr_create(title, body, head?, base?, draft?)` | `gh pr create` | Open a PR. `head` defaults to the current git branch at `path`; `base` defaults to the repo's configured default branch (one extra API call). `draft: true` opens as draft. |
+| `gh_pr_view(number)` | `gh pr view` | Full PullRequest record: title, body, draft/merged/mergeable, head + base branches with tip SHAs. For PR comments use `gh_issue_view` with the same number (they share the issues namespace). |
+| `gh_pr_list(state?, head?, base?, limit?)` | `gh pr list` | Same state/limit shape as `gh_issue_list`, plus head/base branch filters. `head` takes `owner:branch` across forks, bare branch for same-repo. |
+| `gh_pr_checks(number)` | `gh pr checks` | CI status. Resolves the PR's head SHA, fetches every attached check-run. Returns `{number, head_sha, total_count, check_runs}`. |
 | `gh_ux_gotcha(title, body, tool, param?)` | — | Policy wrapper over `gh_issue_create`: hardcodes the `ux-gotcha` label, prefixes `title` with the implicated tool, appends a provenance footer. Use whenever dogfooding surfaces a trap. See CLAUDE.md § "Reporting UX gotchas". |
 
 ## Dogfood

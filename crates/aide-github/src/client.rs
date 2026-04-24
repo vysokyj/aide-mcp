@@ -184,6 +184,94 @@ impl GithubClient {
         self.parse(resp).await
     }
 
+    /// `POST /repos/:owner/:repo/pulls`. Returns the created PR
+    /// (includes head/base branch + sha pairs needed by other tools).
+    pub async fn create_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        payload: &PullRequestCreate,
+    ) -> Result<PullRequest, GithubError> {
+        let url = format!("{}/repos/{owner}/{repo}/pulls", self.base);
+        let resp = self
+            .build(self.http.post(&url).json(payload))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// `GET /repos/:owner/:repo/pulls/:number`. Returns the full PR
+    /// record — body, draft flag, merged flag, head/base branches,
+    /// timestamps. For issue-style comments on a PR, call
+    /// `list_comments` with the PR number (PR numbers share the
+    /// issues namespace on GitHub).
+    pub async fn get_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PullRequest, GithubError> {
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}", self.base);
+        let resp = self.build(self.http.get(&url)).send().await?;
+        self.parse(resp).await
+    }
+
+    /// `GET /repos/:owner/:repo/pulls` with state/head/base/limit
+    /// filters. `head` takes GitHub's `owner:branch` format when
+    /// filtering across forks; for same-repo branches the bare branch
+    /// name also works.
+    pub async fn list_prs(
+        &self,
+        owner: &str,
+        repo: &str,
+        filter: &PullRequestListFilter,
+    ) -> Result<Vec<PullRequest>, GithubError> {
+        let url = format!("{}/repos/{owner}/{repo}/pulls", self.base);
+        let mut req = self.http.get(&url);
+        if let Some(state) = &filter.state {
+            req = req.query(&[("state", state.as_str())]);
+        }
+        if let Some(head) = &filter.head {
+            req = req.query(&[("head", head.as_str())]);
+        }
+        if let Some(base) = &filter.base {
+            req = req.query(&[("base", base.as_str())]);
+        }
+        if let Some(limit) = filter.limit {
+            req = req.query(&[("per_page", limit.to_string())]);
+        }
+        let resp = self.build(req).send().await?;
+        self.parse(resp).await
+    }
+
+    /// `GET /repos/:owner/:repo`. Returns the `Repo` record — used
+    /// by `gh_pr_create` to default `base` to the repo's configured
+    /// default branch when the caller doesn't specify one.
+    pub async fn get_repo(&self, owner: &str, repo: &str) -> Result<Repo, GithubError> {
+        let url = format!("{}/repos/{owner}/{repo}", self.base);
+        let resp = self.build(self.http.get(&url)).send().await?;
+        self.parse(resp).await
+    }
+
+    /// `GET /repos/:owner/:repo/commits/:ref/check-runs` — every
+    /// check-run attached to the commit at `ref` (which is typically
+    /// the PR's head sha). Returns `{total_count, check_runs}`.
+    /// Accepts any git ref GitHub resolves (branch, tag, sha).
+    pub async fn check_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<CheckRunsResponse, GithubError> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/commits/{git_ref}/check-runs",
+            self.base
+        );
+        let req = self.http.get(&url).query(&[("per_page", "100")]);
+        let resp = self.build(req).send().await?;
+        self.parse(resp).await
+    }
+
     fn build(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         req.bearer_auth(&self.token)
             .header(header::ACCEPT, ACCEPT)
@@ -347,6 +435,102 @@ impl IssueState {
             _ => None,
         }
     }
+}
+
+// -------- v0.21 PR workflow types --------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub html_url: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub base: Branch,
+    pub head: Branch,
+    #[serde(default)]
+    pub draft: bool,
+    /// True/false once the PR has a merged status; absent on fresh
+    /// or intermediate states.
+    #[serde(default)]
+    pub merged: Option<bool>,
+    /// Present when the API returned its mergeability computation —
+    /// often null on `list`, populated on `get`.
+    #[serde(default)]
+    pub mergeable: Option<bool>,
+    pub user: User,
+}
+
+/// Branch side of a PR — `ref` is the branch name (`serde` rename
+/// to avoid the Rust keyword), `sha` is the tip commit.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Branch {
+    #[serde(rename = "ref")]
+    pub ref_: String,
+    pub sha: String,
+}
+
+/// Request body for `POST /repos/:owner/:repo/pulls`. `head` takes
+/// GitHub's `owner:branch` form when the PR crosses forks; for same-
+/// repo PRs the bare branch name works too.
+#[derive(Debug, Clone, Serialize)]
+pub struct PullRequestCreate {
+    pub title: String,
+    pub body: String,
+    pub head: String,
+    pub base: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
+}
+
+/// Filters for `list_prs`. All fields optional — `None` means "no
+/// constraint" (GitHub's defaults apply: `state=open`, `per_page=30`).
+#[derive(Debug, Clone, Default)]
+pub struct PullRequestListFilter {
+    pub state: Option<IssueState>,
+    pub head: Option<String>,
+    pub base: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// Minimal repo metadata — just the field `gh_pr_create` needs for
+/// default-branch resolution. Widened later only when a concrete tool
+/// demands it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Repo {
+    pub name: String,
+    pub default_branch: String,
+    #[serde(default)]
+    pub private: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CheckRun {
+    pub id: u64,
+    pub name: String,
+    /// `queued` / `in_progress` / `completed`.
+    pub status: String,
+    /// Present once `status == "completed"`: `success` / `failure` /
+    /// `neutral` / `cancelled` / `skipped` / `timed_out` /
+    /// `action_required` / `stale`.
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub html_url: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+/// Response shape of `GET /repos/:owner/:repo/commits/:ref/check-runs`.
+/// `total_count` is the full count upstream regardless of pagination;
+/// `check_runs` is capped at `per_page`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CheckRunsResponse {
+    pub total_count: u64,
+    pub check_runs: Vec<CheckRun>,
 }
 
 #[cfg(test)]
@@ -639,5 +823,181 @@ mod tests {
             "not_planned"
         );
         assert!(CloseReason::parse("nope").is_none());
+    }
+
+    // -------- v0.21 PR workflow tests --------
+
+    fn pr_response() -> serde_json::Value {
+        serde_json::json!({
+            "number": 42,
+            "title": "feat: add thing",
+            "state": "open",
+            "html_url": "https://github.com/acme/widget/pull/42",
+            "body": "the body",
+            "base": {"ref": "master", "sha": "basesha"},
+            "head": {"ref": "feature", "sha": "headsha"},
+            "draft": false,
+            "merged": false,
+            "mergeable": true,
+            "user": {"login": "octocat"}
+        })
+    }
+
+    #[tokio::test]
+    async fn create_pr_posts_to_pulls_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/acme/widget/pulls"))
+            .and(body_partial_json(serde_json::json!({
+                "title": "feat: add thing",
+                "body": "the body",
+                "head": "feature",
+                "base": "master",
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(pr_response()))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let pr = client
+            .create_pr(
+                "acme",
+                "widget",
+                &PullRequestCreate {
+                    title: "feat: add thing".into(),
+                    body: "the body".into(),
+                    head: "feature".into(),
+                    base: "master".into(),
+                    draft: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.head.ref_, "feature");
+        assert_eq!(pr.head.sha, "headsha");
+        assert_eq!(pr.base.ref_, "master");
+    }
+
+    #[tokio::test]
+    async fn get_pr_parses_branch_refs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/pulls/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pr_response()))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let pr = client.get_pr("acme", "widget", 42).await.unwrap();
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.body.as_deref(), Some("the body"));
+        assert_eq!(pr.head.sha, "headsha");
+    }
+
+    #[tokio::test]
+    async fn list_prs_passes_filters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/pulls"))
+            .and(query_param("state", "open"))
+            .and(query_param("head", "octocat:feature"))
+            .and(query_param("base", "master"))
+            .and(query_param("per_page", "10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let got = client
+            .list_prs(
+                "acme",
+                "widget",
+                &PullRequestListFilter {
+                    state: Some(IssueState::Open),
+                    head: Some("octocat:feature".into()),
+                    base: Some("master".into()),
+                    limit: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_repo_returns_default_branch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "widget",
+                "default_branch": "trunk",
+                "private": false
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let repo = client.get_repo("acme", "widget").await.unwrap();
+        assert_eq!(repo.default_branch, "trunk");
+        assert_eq!(repo.name, "widget");
+        assert!(!repo.private);
+    }
+
+    #[tokio::test]
+    async fn check_runs_asks_for_100_per_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/commits/headsha/check-runs"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 2,
+                "check_runs": [
+                    {
+                        "id": 1,
+                        "name": "fmt",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "html_url": "https://github.com/acme/widget/runs/1",
+                        "started_at": "2026-04-24T12:00:00Z",
+                        "completed_at": "2026-04-24T12:00:10Z"
+                    },
+                    {
+                        "id": 2,
+                        "name": "clippy",
+                        "status": "in_progress",
+                        "conclusion": null,
+                        "html_url": "https://github.com/acme/widget/runs/2",
+                        "started_at": "2026-04-24T12:00:10Z",
+                        "completed_at": null
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let resp = client
+            .check_runs("acme", "widget", "headsha")
+            .await
+            .unwrap();
+        assert_eq!(resp.total_count, 2);
+        assert_eq!(resp.check_runs.len(), 2);
+        assert_eq!(resp.check_runs[0].conclusion.as_deref(), Some("success"));
+        assert!(resp.check_runs[1].conclusion.is_none());
+    }
+
+    #[test]
+    fn pr_create_draft_field_is_omitted_when_none() {
+        let payload = PullRequestCreate {
+            title: "t".into(),
+            body: "b".into(),
+            head: "f".into(),
+            base: "m".into(),
+            draft: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert!(v.get("draft").is_none());
     }
 }
