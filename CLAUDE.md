@@ -84,6 +84,29 @@ unless there is a real reason (see below).
   cannot happen inside our own process boundary. Validate at system
   boundaries only (MCP inputs, network, disk).
 
+## Reporting UX gotchas
+
+When working in this repo using aide's own MCP tools (dogfooding) and
+you hit a usability trap — a confusing default, a silently-missing
+signal, an API shape that made you burn a round-trip — file it as a
+GitHub issue **immediately**, in the same turn, via `gh issue create`.
+Do not batch, do not "mention in the end-of-turn summary and hope the
+user files it later."
+
+Fresh experience produces better issue text than "I think something
+felt off last week"; and these gotchas are what the v0.14 dogfood →
+roadmap loop exists to surface. Writing them down is how they reach
+the roadmap.
+
+- Label: `ux-gotcha` (create it if missing).
+- Title: short, imperative, names the tool — e.g. `` `project_ls`
+  default scope hides newly-created files``.
+- Body: what you tried, what you got, what you expected, and which
+  tool/parameter is implicated. Concrete repro beats narrative.
+
+Still commit the rest of the work in the same turn — filing the issue
+is a side quest, not a blocker.
+
 ## End-of-turn summary
 
 Keep it terse. State what changed and what's next — one or two sentences.

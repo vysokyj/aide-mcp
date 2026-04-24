@@ -74,6 +74,11 @@ Languages are added one at a time via the `LanguagePlugin` trait in
 `aide-lang`. Each plugin declares which binaries to fetch, how to run/test,
 and how to install packages.
 
+## Tool reference
+
+Full MCP tool catalogue — cheat sheet, per-category tables with Bash
+equivalents, LSP vs SCIP model — lives in [docs/TOOLS.md](docs/TOOLS.md).
+
 ## Quick start
 
 ```bash
