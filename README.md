@@ -53,6 +53,11 @@ over stdio.
   `@sourcegraph/scip-typescript` (SCIP). All three auto-install on
   `project_setup`; `node` itself is a system prerequisite. DAP
   (vscode-js-debug) deferred.
+- **Python** — `pyright-langserver` (LSP, Microsoft) and
+  `@sourcegraph/scip-python` (SCIP), both auto-installed from the npm
+  registry. `python3` and `node` are system prerequisites. `pip` /
+  `pytest` are invoked through `python3 -m` so they honour whichever
+  virtualenv the caller has activated. DAP (`debugpy`) deferred.
 
 Languages are added one at a time via the `LanguagePlugin` trait in
 `aide-lang`. Each plugin declares which binaries to fetch, how to run/test,
@@ -92,7 +97,7 @@ Then from the agent:
 crates/
   aide-core/      shared paths + config (~/.aide/ layout, TOML config)
   aide-install/   binary installer (GitHub releases, gzip/tar.gz/zip)
-  aide-lang/      LanguagePlugin trait + built-ins (Rust, Java Maven/Gradle, Node/TS)
+  aide-lang/      LanguagePlugin trait + built-ins (Rust, Java Maven/Gradle, Node/TS, Python)
   aide-lsp/       stdio LSP client + per-workspace pool + ops
   aide-dap/       Debug Adapter Protocol client over stdio
   aide-git/       libgit2-backed read ops + commit export

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::languages::java::JavaMavenPlugin;
 use crate::languages::java_gradle::JavaGradlePlugin;
 use crate::languages::node::NodePlugin;
+use crate::languages::python::PythonPlugin;
 use crate::languages::rust::RustPlugin;
 use crate::plugin::{LanguageId, LanguagePlugin};
 
@@ -18,10 +19,14 @@ impl Registry {
     /// Detection order matters:
     /// - Maven before Gradle — hybrid project with both files still
     ///   routes through Maven.
-    /// - Rust / Java before Node — polyglot repos that contain both
-    ///   `Cargo.toml` / `pom.xml` and `package.json` (common for
-    ///   build-tooling and monorepos) keep their primary language as
-    ///   the indexer root.
+    /// - Rust / Java before Node / Python — polyglot repos that
+    ///   contain both a primary-language marker (`Cargo.toml` /
+    ///   `pom.xml`) and a `package.json` or `pyproject.toml` (common
+    ///   for build-tooling and monorepos) keep their primary language
+    ///   as the indexer root.
+    /// - Node before Python — `package.json` commonly appears in
+    ///   Python repos for frontend assets; the opposite (Python marker
+    ///   in a Node repo) is rarer.
     pub fn builtin() -> Self {
         Self {
             plugins: vec![
@@ -29,6 +34,7 @@ impl Registry {
                 Arc::new(JavaMavenPlugin),
                 Arc::new(JavaGradlePlugin),
                 Arc::new(NodePlugin),
+                Arc::new(PythonPlugin),
             ],
         }
     }
