@@ -189,6 +189,24 @@ languages deferred (Node via `js-debug`, Python via `debugpy`, Go via
 | `index_status(path?, sha?)` | State: `Pending` / `InProgress` / `Ready` / `Failed`. |
 | `work_last_known_state(path?)` | Last commit the indexer has Ready for this repo. |
 
+## Job management
+
+Every `run_project` / `run_tests` / `install_package` invocation registers
+its child process in an in-process registry for the duration of the spawn.
+Tools below take the aide-assigned `job_id` (never a raw PID) and operate
+exclusively on those registered jobs — there is no API path to signal a
+process aide did not spawn.
+
+| Tool | Replaces | What it does |
+|---|---|---|
+| `job_list()` | `ps aux \| grep aide-spawn` | List tracked children: `[{id, pid, kind, executable, args, started_at_unix}]` sorted by spawn time. Empty when nothing is running. |
+| `job_info(id)` | — | Look up one job. `null` if already exited. |
+| `job_kill(id, signal?)` | `kill -TERM <pid>` | Send signal (default `term`). Accepts `term` / `kill` / `int` / `hup` / `quit`, their `SIG`-prefixed aliases, and POSIX numbers (`15`, `9`, `2`, `1`, `3`). Scope-gated: only works on jobs aide registered. |
+
+Generic `process_list` / `process_kill` over arbitrary PIDs is **not**
+exposed — see STATUS.md v0.20.1 for the roadmap (read-only listing is
+planned; signal-any-PID is on the "won't do" side).
+
 ## GitHub integration
 
 Token resolution walks `$GITHUB_TOKEN` → `gh auth token` subprocess →

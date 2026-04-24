@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 mod dogfood;
 mod exec;
 mod indexer;
+mod jobs;
 mod server;
 
 #[tokio::main]

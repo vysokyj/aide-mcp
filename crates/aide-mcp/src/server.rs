@@ -752,6 +752,10 @@ pub struct AideServer {
     config: Arc<RwLock<Config>>,
     pool: Arc<LspPool>,
     indexer: Indexer,
+    /// Registry of aide-spawned child processes — populated by
+    /// `exec::run` between spawn and exit. Read/signalled by the
+    /// `job_list` / `job_info` / `job_kill` MCP tools.
+    jobs: Arc<crate::jobs::Registry>,
     /// Active DAP sessions keyed by a user-chosen name (default
     /// `"default"`). A fresh launch uses the name supplied in the
     /// request; existing names are refused until the caller explicitly
@@ -781,6 +785,7 @@ impl AideServer {
             config,
             pool: Arc::new(LspPool::new()),
             indexer,
+            jobs: Arc::new(crate::jobs::Registry::new()),
             dap_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         })
@@ -2023,6 +2028,10 @@ impl AideServer {
             duration,
             Some(&self.paths.logs()),
             progress,
+            Some(exec::JobBinding {
+                registry: &self.jobs,
+                kind: "run_project",
+            }),
         )
         .await
         {
@@ -2068,6 +2077,10 @@ impl AideServer {
             duration,
             Some(&self.paths.logs()),
             progress,
+            Some(exec::JobBinding {
+                registry: &self.jobs,
+                kind: "run_tests",
+            }),
         )
         .await
         {
@@ -2112,6 +2125,10 @@ impl AideServer {
             duration,
             Some(&self.paths.logs()),
             progress,
+            Some(exec::JobBinding {
+                registry: &self.jobs,
+                kind: "install_package",
+            }),
         )
         .await
         {
@@ -2645,6 +2662,46 @@ impl AideServer {
             .ok_or_else(|| aide_github::NO_AUTH_REMEDIATION.to_string())?;
         aide_github::GithubClient::new(resolved.token).map_err(|e| e.to_string())
     }
+
+    // ---------- v0.20 job management ----------
+
+    #[tool(
+        description = "List every aide-spawned child process currently tracked by the in-process jobs registry. Jobs appear the moment `run_project` / `run_tests` / `install_package` spawns a child and disappear when that call returns. Returns `[{id, pid, kind, executable, args, started_at_unix}]` sorted by spawn time. Empty when nothing is running."
+    )]
+    async fn job_list(&self, Parameters(_args): Parameters<JobListArgs>) -> String {
+        to_json(&self.jobs.list().await)
+    }
+
+    #[tool(
+        description = "Look up one job by its aide-assigned id (e.g. `job-3` from `job_list`). Returns the `Job` record or `null` when no such job is tracked — jobs deregister as soon as the spawning tool call returns, so a null result often means the job already exited."
+    )]
+    async fn job_info(&self, Parameters(args): Parameters<JobInfoArgs>) -> String {
+        match self.jobs.get(&args.id).await {
+            Some(job) => to_json(&job),
+            None => "null".to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Send a POSIX signal to one aide-spawned job (identified by its aide `job_id`, never by raw PID). Default signal is `term` (graceful SIGTERM); other accepted values are `kill` (SIGKILL), `int` (SIGINT), `hup` (SIGHUP), `quit` (SIGQUIT). Also accepts `SIG`-prefixed aliases and POSIX numbers (`sigterm`, `15`). Returns `{id, pid, signal}` on success. Cannot signal processes aide did not spawn — that is a deliberate scope gate, not an oversight."
+    )]
+    async fn job_kill(&self, Parameters(args): Parameters<JobKillArgs>) -> String {
+        let signal = match args.signal.as_deref() {
+            None => crate::jobs::Signal::Term,
+            Some(s) => match crate::jobs::Signal::parse(s) {
+                Some(sig) => sig,
+                None => {
+                    return error_json(format!(
+                        "unknown signal {s:?}; expected one of: term, kill, int, hup, quit (or sigterm/15 etc.)"
+                    ));
+                }
+            },
+        };
+        match self.jobs.signal(&args.id, signal).await {
+            Ok(result) => to_json(&result),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
@@ -2704,6 +2761,26 @@ pub struct GhIssueCloseArgs {
     /// reason (GitHub leaves `state_reason` null).
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct JobListArgs {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct JobInfoArgs {
+    /// aide job id such as `job-3` — as returned by `job_list`.
+    pub id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct JobKillArgs {
+    /// aide job id such as `job-3` — as returned by `job_list`.
+    pub id: String,
+    /// Signal name. One of `term` (default), `kill`, `int`, `hup`,
+    /// `quit`. Also accepts `sigterm` etc. and POSIX numbers
+    /// (`15`, `9`, `2`, `1`, `3`). Case-insensitive.
+    #[serde(default)]
+    pub signal: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

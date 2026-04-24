@@ -72,6 +72,16 @@ pub struct ExecResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Opt-in binding that registers the spawned child in a
+/// [`crate::jobs::Registry`] for the duration of the run, so
+/// `job_list` / `job_info` / `job_kill` MCP tools can observe and
+/// signal it. The `kind` string becomes the job's `kind` field —
+/// one of `"run_project"`, `"run_tests"`, `"install_package"`.
+pub struct JobBinding<'a> {
+    pub registry: &'a crate::jobs::Registry,
+    pub kind: &'static str,
+}
+
 pub async fn run(
     bin: &str,
     args: &[OsString],
@@ -79,6 +89,7 @@ pub async fn run(
     duration: Duration,
     log_dir: Option<&Path>,
     progress: Option<Progress>,
+    job_binding: Option<JobBinding<'_>>,
 ) -> std::io::Result<ExecResult> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
@@ -90,6 +101,20 @@ pub async fn run(
     let (stdout_path, stderr_path) = resolve_log_paths(log_dir, bin)?;
 
     let mut child = cmd.spawn()?;
+
+    // Register in the jobs registry the moment we have a PID. Kept
+    // as `Option<(Registry, id)>` so every exit path can deregister
+    // with one helper at the bottom of the function.
+    let job_ticket: Option<(&crate::jobs::Registry, String)> = match (&job_binding, child.id()) {
+        (Some(binding), Some(pid)) => {
+            let job = crate::jobs::build_job(binding.registry, pid, binding.kind, bin, args);
+            let id = job.id.clone();
+            binding.registry.register(job).await;
+            Some((binding.registry, id))
+        }
+        _ => None,
+    };
+
     let stdout = child
         .stdout
         .take()
@@ -113,6 +138,9 @@ pub async fn run(
             if let Some(h) = heartbeat {
                 h.abort();
             }
+            if let Some((registry, id)) = &job_ticket {
+                registry.deregister(id).await;
+            }
             return Err(e);
         }
         Err(_) => {
@@ -131,6 +159,10 @@ pub async fn run(
 
     let command = format_command(bin, args);
     let exit_code = status.and_then(|s| s.code());
+
+    if let Some((registry, id)) = job_ticket {
+        registry.deregister(&id).await;
+    }
 
     Ok(ExecResult {
         command,
@@ -284,6 +316,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -305,6 +338,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -323,6 +357,7 @@ mod tests {
             Duration::from_millis(200),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -338,6 +373,7 @@ mod tests {
             &os_args(&["-c", "yes a | head -c 2097152; printf '\\nend\\n' >&2"]),
             tmp.path(),
             Duration::from_secs(10),
+            None,
             None,
             None,
         )
@@ -358,6 +394,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -374,6 +411,7 @@ mod tests {
             tmp.path(),
             Duration::from_secs(10),
             Some(&logs),
+            None,
             None,
         )
         .await
