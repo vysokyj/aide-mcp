@@ -62,6 +62,13 @@ over stdio.
   golang.org/x/tools/gopls@<ver>`; `scip-go` (SCIP) auto-installs
   from sourcegraph/scip-go GitHub releases (Linux + Apple Silicon
   macOS). `go` itself is a system prerequisite. DAP (`delve`) deferred.
+- **C / C++** — `clangd` (LSP, LLVM release zips) and `scip-clang`
+  (SCIP, Sourcegraph) auto-install for the triples upstream
+  publishes; Intel-Mac and Linux arm64 fall back to a system install
+  of `scip-clang`. DAP is `codelldb` shared with the Rust plugin
+  (idempotent install). clangd requires a `compile_commands.json` —
+  configure CMake with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` before
+  asking aide for semantic navigation.
 
 Languages are added one at a time via the `LanguagePlugin` trait in
 `aide-lang`. Each plugin declares which binaries to fetch, how to run/test,
@@ -101,7 +108,7 @@ Then from the agent:
 crates/
   aide-core/      shared paths + config (~/.aide/ layout, TOML config)
   aide-install/   binary installer (GitHub releases, gzip/tar.gz/zip)
-  aide-lang/      LanguagePlugin trait + built-ins (Rust, Java Maven/Gradle, Node/TS, Python, Go)
+  aide-lang/      LanguagePlugin trait + built-ins (Rust, Java Maven/Gradle, Node/TS, Python, Go, C/C++)
   aide-lsp/       stdio LSP client + per-workspace pool + ops
   aide-dap/       Debug Adapter Protocol client over stdio
   aide-git/       libgit2-backed read ops + commit export

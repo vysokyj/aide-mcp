@@ -1,6 +1,6 @@
 # Project status snapshot
 
-Last updated: 2026-04-24 (v0.17).
+Last updated: 2026-04-24 (v0.18).
 
 ## Purpose of this file
 
@@ -46,6 +46,7 @@ decisions, roadmap, current state — is mirrored here.
 | v0.15     | Second-language support: Node.js / TypeScript plugin (`typescript-language-server` + `typescript` + `scip-typescript` auto-install via npm tarballs) | ✅ done — DAP (`js-debug`) deferred |
 | v0.16     | Third-language support: Python plugin (`pyright` + `scip-python` auto-install via npm tarballs; `python3 -m {pip,pytest}` for package / tests) | ✅ done — DAP (`debugpy`) deferred |
 | v0.17     | Fourth-language support: Go plugin (`scip-go` auto-install from GitHub releases; `gopls` system-install, matching scip-java posture). Indexer worker now sets `current_dir(workdir)` so scip-go and any future cwd-sensitive indexer work unchanged. | ✅ done — DAP (`delve`) + gopls auto-install deferred |
+| v0.18     | Fifth-language support: C / C++ plugin (`clangd` + `scip-clang` auto-install from GitHub releases; `codelldb` DAP reused from the Rust plugin — one binary, two languages). Detects `CMakeLists.txt`, `compile_commands.json`, `meson.build`, or `.clangd`. | ✅ done — requires user-supplied `compile_commands.json`; Intel-Mac / Linux arm64 scip-clang fall back to system install |
 
 ## Workspace layout
 
@@ -59,7 +60,7 @@ crates/
                   hook, manifest.json
   aide-lang/      LanguagePlugin trait + Registry; built-ins: RustPlugin,
                   JavaMavenPlugin, JavaGradlePlugin, NodePlugin, PythonPlugin,
-                  GoPlugin
+                  GoPlugin, CppPlugin
   aide-lsp/       LspClient (spawn takes plugin-supplied args), LspPool,
                   ops (hover/def/refs/symbols/diagnostics)
   aide-dap/       DapClient speaking Debug Adapter Protocol over stdio
@@ -83,20 +84,23 @@ crates/
 1. **SDK** = `rmcp` 1.5 (official Anthropic Rust MCP SDK, Tier 2 stable).
 2. **Transport** = stdio only.
 3. **Languages** = Rust (dogfood) + Java (Maven and Gradle) + Node/TS
-   + Python + Go. Added via the `LanguagePlugin` trait; each declares
-   its LSP / SCIP / DAP / package manager / runner, plus the full
-   command line for its SCIP indexer (`scip_args`) and optional LSP
-   launch flags (`lsp_spawn_args`). Rust auto-installs rust-analyzer +
-   codelldb. Java auto-installs JDT-LS from the Eclipse snapshot
-   tarball via a generated wrapper script. scip-java still expects a
-   system install. Node/TS auto-installs `typescript-language-server`,
-   `typescript`, and `scip-typescript` via pinned npm registry
-   tarballs with generated shell wrappers (node runtime is a system
-   prerequisite). Python auto-installs `pyright` and `scip-python`
-   through the same npm-tarball path (node + python3 are system
-   prerequisites). Go auto-installs `scip-go` from GitHub releases;
-   `gopls` and the Go toolchain itself are system prerequisites —
-   matching the scip-java posture.
+   + Python + Go + C/C++. Added via the `LanguagePlugin` trait; each
+   declares its LSP / SCIP / DAP / package manager / runner, plus the
+   full command line for its SCIP indexer (`scip_args`) and optional
+   LSP launch flags (`lsp_spawn_args`). Rust auto-installs
+   rust-analyzer + codelldb. Java auto-installs JDT-LS from the
+   Eclipse snapshot tarball via a generated wrapper script. scip-java
+   still expects a system install. Node/TS auto-installs
+   `typescript-language-server`, `typescript`, and `scip-typescript`
+   via pinned npm registry tarballs with generated shell wrappers
+   (node runtime is a system prerequisite). Python auto-installs
+   `pyright` and `scip-python` through the same npm-tarball path
+   (node + python3 are system prerequisites). Go auto-installs
+   `scip-go` from GitHub releases; `gopls` and the Go toolchain
+   itself are system prerequisites — matching the scip-java posture.
+   C/C++ auto-installs `clangd` (zip) + `scip-clang` (raw binary)
+   from GitHub releases and reuses `codelldb` from the Rust plugin
+   as its DAP adapter (one download, two languages).
 4. **Execution model** = MCP tools operate directly against the user's
    working tree. SCIP is built against a commit snapshot exported to a
    TempDir — never against the dirty working tree.
@@ -372,18 +376,21 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
 
 ### Proposed next milestone
 
-The v0.8–v0.17 batch plus v0.13.1 and v0.13.2 all shipped. The
+The v0.8–v0.18 batch plus v0.13.1 and v0.13.2 all shipped. The
 remaining deferrals (`run_cargo_expand`, pull-diagnostics refinement,
 dogfood CI, `js-debug` DAP for Node, `debugpy` DAP for Python,
-`delve` DAP for Go, `gopls` auto-install) are each gated on evidence
-that isn't yet in the repo — a run that demands whole-module macro
-expansion, a safe_edit call whose fixed wait genuinely misses
-reanalysis, enough dogfood runs to make CI worthwhile, a real project
-where debugging is the friction, or a second ecosystem (Ruby gems,
-Haskell cabal) that needs `<lang> install`-style auto-install and
-would justify extending aide-install with a `Source::Custom` variant.
-Rather than speculate, hold and let the dogfood loop tell us what to
-pick up next.
+`delve` DAP for Go, `gopls` auto-install, C/C++ compile-database
+auto-generation) are each gated on evidence that isn't yet in the
+repo — a run that demands whole-module macro expansion, a
+safe_edit call whose fixed wait genuinely misses reanalysis, enough
+dogfood runs to make CI worthwhile, a real project where debugging
+is the friction, a second ecosystem (Ruby gems, Haskell cabal) that
+needs `<lang> install`-style auto-install and would justify
+extending aide-install with a `Source::Custom` variant, or a C/C++
+project where asking the user to run `cmake
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` is the main friction. Rather
+than speculate, hold and let the dogfood loop tell us what to pick
+up next.
 
 A good next *research* pass (not implementation) is a paired
 benchmark over a real multi-file refactor — something that

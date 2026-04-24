@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::languages::cpp::CppPlugin;
 use crate::languages::go::GoPlugin;
 use crate::languages::java::JavaMavenPlugin;
 use crate::languages::java_gradle::JavaGradlePlugin;
@@ -20,17 +21,19 @@ impl Registry {
     /// Detection order matters:
     /// - Maven before Gradle — hybrid project with both files still
     ///   routes through Maven.
-    /// - Rust / Java before Node / Python / Go — polyglot repos that
-    ///   contain both a primary-language marker (`Cargo.toml` /
+    /// - Rust / Java before Node / Python / Go / C++ — polyglot repos
+    ///   that contain both a primary-language marker (`Cargo.toml` /
     ///   `pom.xml`) and a `package.json` / `pyproject.toml` / `go.mod`
-    ///   (common for build-tooling and monorepos) keep their primary
-    ///   language as the indexer root.
-    /// - Node before Python and Go — `package.json` commonly appears
-    ///   in Python and Go repos for frontend assets; the opposite
-    ///   (Python/Go marker in a Node repo) is rarer.
-    /// - Go last — Go repos are almost always pure Go; the detection
-    ///   position only matters for unusual polyglot cases where
-    ///   another marker happens to be present.
+    ///   / `CMakeLists.txt` (common for build-tooling, monorepos, or
+    ///   native extensions) keep their primary language as the
+    ///   indexer root.
+    /// - Node before Python, Go, and C++ — `package.json` commonly
+    ///   appears in other-language repos for frontend assets; the
+    ///   opposite (other-language marker in a Node repo) is rarer.
+    /// - C++ last — C/C++ markers (especially `CMakeLists.txt`) often
+    ///   appear in polyglot native-extension flows where the primary
+    ///   language is something else; keeping C++ at the end lets the
+    ///   host language win.
     pub fn builtin() -> Self {
         Self {
             plugins: vec![
@@ -40,6 +43,7 @@ impl Registry {
                 Arc::new(NodePlugin),
                 Arc::new(PythonPlugin),
                 Arc::new(GoPlugin),
+                Arc::new(CppPlugin),
             ],
         }
     }

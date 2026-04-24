@@ -253,7 +253,10 @@ fn rust_analyzer_spec() -> ToolSpec {
     }
 }
 
-fn codelldb_spec() -> ToolSpec {
+/// Spec for codelldb — the LLDB-backed DAP adapter. Exposed `pub` so
+/// the C/C++ plugin can reuse the same download instead of pinning a
+/// separate copy.
+pub fn codelldb_spec() -> ToolSpec {
     // codelldb ships a `.vsix` per platform (really a zip) containing
     // `extension/adapter/codelldb` plus the bundled lldb libraries.
     let assets = vec![
