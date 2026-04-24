@@ -135,6 +135,11 @@ async fn run_indexer(
     let args: Vec<OsString> = plugin.scip_args(workdir, output);
     let output_res = Command::new(bin)
         .args(&args)
+        // scip-go (and likely future indexers) read configuration from
+        // the working directory even when passed `--module-root`; set
+        // cwd explicitly so the indexer runs inside the exported
+        // snapshot rather than wherever the MCP server was launched.
+        .current_dir(workdir)
         .output()
         .await
         .map_err(IndexError::Io)?;

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::languages::go::GoPlugin;
 use crate::languages::java::JavaMavenPlugin;
 use crate::languages::java_gradle::JavaGradlePlugin;
 use crate::languages::node::NodePlugin;
@@ -19,14 +20,17 @@ impl Registry {
     /// Detection order matters:
     /// - Maven before Gradle — hybrid project with both files still
     ///   routes through Maven.
-    /// - Rust / Java before Node / Python — polyglot repos that
+    /// - Rust / Java before Node / Python / Go — polyglot repos that
     ///   contain both a primary-language marker (`Cargo.toml` /
-    ///   `pom.xml`) and a `package.json` or `pyproject.toml` (common
-    ///   for build-tooling and monorepos) keep their primary language
-    ///   as the indexer root.
-    /// - Node before Python — `package.json` commonly appears in
-    ///   Python repos for frontend assets; the opposite (Python marker
-    ///   in a Node repo) is rarer.
+    ///   `pom.xml`) and a `package.json` / `pyproject.toml` / `go.mod`
+    ///   (common for build-tooling and monorepos) keep their primary
+    ///   language as the indexer root.
+    /// - Node before Python and Go — `package.json` commonly appears
+    ///   in Python and Go repos for frontend assets; the opposite
+    ///   (Python/Go marker in a Node repo) is rarer.
+    /// - Go last — Go repos are almost always pure Go; the detection
+    ///   position only matters for unusual polyglot cases where
+    ///   another marker happens to be present.
     pub fn builtin() -> Self {
         Self {
             plugins: vec![
@@ -35,6 +39,7 @@ impl Registry {
                 Arc::new(JavaGradlePlugin),
                 Arc::new(NodePlugin),
                 Arc::new(PythonPlugin),
+                Arc::new(GoPlugin),
             ],
         }
     }
