@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit(/.claude/skills/dogfood/**)"
+    ],
+    "additionalDirectories": [
+      "/home/jirka/workspace/aide-mcp/.claude/skills/dogfood/runs"
+    ]
+  }
+}
