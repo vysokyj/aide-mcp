@@ -81,9 +81,10 @@ pub struct ProjectLsArgs {
     /// Repository root. If omitted, falls back to the server cwd.
     #[serde(default)]
     pub path: Option<String>,
-    /// One of "tracked" (default, reads libgit2 index), "all" (gitignore-aware
-    /// walk of the working tree), "dirty" (files with non-clean status), or
-    /// "staged" (files whose index entry differs from HEAD).
+    /// One of "all" (default, gitignore-aware walk — includes untracked
+    /// files), "tracked" (libgit2 index, tracked files only — fastest),
+    /// "dirty" (files with non-clean status), or "staged" (files whose
+    /// index entry differs from HEAD).
     #[serde(default)]
     pub scope: Option<String>,
     /// Glob over the repo-relative path, e.g. `crates/*/src/**/*.rs`.
@@ -106,6 +107,53 @@ pub struct ProjectLsResult {
     pub truncated: bool,
 }
 
+/// Indexer's view of a repo, attached to tool responses whose behaviour
+/// depends on whether a Ready SCIP index exists (`project_grep`, today).
+///
+/// Serialised as `{state, sha?, reason?}`:
+/// - `state` is one of `ready` / `pending` / `in_progress` / `failed` /
+///   `no_index` — one stable set of `snake_case` strings agents can switch on.
+/// - `sha` is populated for every state except `no_index` (the indexer
+///   knows *some* commit for this repo, just not necessarily Ready).
+/// - `reason` is only set when `state == "failed"` and carries the
+///   human-readable failure string from [`aide_proto::IndexState::Failed`].
+///
+/// Rationale: ux-gotcha #2 — a SCIP-enriched response with no hits looked
+/// identical to "SCIP not Ready, silent fallback to bare matches". Agents
+/// had no signal to distinguish "try again later" from "genuinely empty".
+#[derive(Debug, serde::Serialize)]
+pub struct ScipMeta {
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ScipMeta {
+    fn no_index() -> Self {
+        Self {
+            state: "no_index",
+            sha: None,
+            reason: None,
+        }
+    }
+
+    fn from_commit_info(info: &aide_proto::CommitInfo) -> Self {
+        let (state, reason) = match &info.state {
+            aide_proto::IndexState::Pending => ("pending", None),
+            aide_proto::IndexState::InProgress => ("in_progress", None),
+            aide_proto::IndexState::Ready => ("ready", None),
+            aide_proto::IndexState::Failed(r) => ("failed", Some(r.clone())),
+        };
+        Self {
+            state,
+            sha: Some(info.sha.clone()),
+            reason,
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProjectGrepArgs {
     /// Regex pattern. Smart-case by default — lowercase pattern matches
@@ -114,7 +162,8 @@ pub struct ProjectGrepArgs {
     /// Repository root. If omitted, falls back to the server cwd.
     #[serde(default)]
     pub path: Option<String>,
-    /// Same scopes as `project_ls`. Defaults to "tracked".
+    /// Same scopes as `project_ls`. Defaults to "all" (gitignore-aware
+    /// working-tree walk — includes untracked files).
     #[serde(default)]
     pub scope: Option<String>,
     /// Glob over repo-relative paths to restrict the file set.
@@ -847,26 +896,36 @@ impl AideServer {
 
     /// Best-effort enrichment: for each grep hit, attach the enclosing
     /// definition's display name to every line, using the most recent
-    /// Ready SCIP index for `root`. Silently no-ops if no index is
-    /// Ready, the `.scip` file cannot be loaded, or the hit's path is
-    /// not covered by the index. Hits whose file is dirty relative to
-    /// the indexed commit will see best-effort annotations that may
-    /// point at a neighbouring symbol — good enough for orientation,
-    /// not a substitute for `lsp_*` tools on the live tree.
+    /// Ready SCIP index for `root`. Skips annotation (returns meta with
+    /// non-ready state) when nothing is Ready, the `.scip` file cannot be
+    /// loaded, or the hit's path is not covered. Hits whose file is
+    /// dirty relative to the indexed commit will see best-effort
+    /// annotations that may point at a neighbouring symbol — good enough
+    /// for orientation, not a substitute for `lsp_*` tools on the live
+    /// tree.
+    ///
+    /// Returns a [`ScipMeta`] describing the indexer's view of this repo
+    /// so `project_grep` can surface `scip.state` to the caller — silent
+    /// downgrade from "annotated" to "bare matches" used to look the same
+    /// as "no matching symbol", see ux-gotcha #2.
     async fn annotate_hits_with_scip(
         &self,
         root: &std::path::Path,
         hits: &mut [aide_search::GrepHit],
-    ) {
-        if hits.is_empty() {
-            return;
-        }
+    ) -> ScipMeta {
         let root_str = root.display().to_string();
-        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
-            return;
+        let Some(info) = self.indexer.last_known(&root_str).await else {
+            return ScipMeta::no_index();
         };
-        let Ok(index) = aide_scip::load(&scip_path) else {
-            return;
+        let meta = ScipMeta::from_commit_info(&info);
+        if !matches!(info.state, aide_proto::IndexState::Ready) {
+            return meta;
+        }
+        let Some(index_path) = info.index_path.as_ref() else {
+            return meta;
+        };
+        let Ok(index) = aide_scip::load(std::path::Path::new(index_path)) else {
+            return meta;
         };
         for hit in hits {
             for line in &mut hit.lines {
@@ -874,6 +933,7 @@ impl AideServer {
                 line.symbol = aide_scip::enclosing_definition(&index, &hit.path, line_0based);
             }
         }
+        meta
     }
 
     /// Best-effort enrichment: for each diagnostic with a source span,
@@ -1017,7 +1077,7 @@ impl AideServer {
     }
 
     #[tool(
-        description = "List files under the project root. Replaces `ls`/`find` with a gitignore-aware, git-scoped enumerator. Scope: \"tracked\" (default, fastest — reads libgit2 index), \"all\" (working tree minus .gitignore), \"dirty\" (anything non-clean), \"staged\" (index vs HEAD). Optional glob filter applies to repo-relative paths."
+        description = "List files under the project root. Replaces `ls`/`find` with a gitignore-aware, git-scoped enumerator. Scope: \"all\" (default — gitignore-aware working-tree walk, INCLUDES untracked files so newly-created files are visible), \"tracked\" (libgit2 index, tracked files only — fastest but silent on untracked), \"dirty\" (anything non-clean), \"staged\" (index vs HEAD). Optional glob filter applies to repo-relative paths."
     )]
     #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
     fn project_ls(&self, Parameters(args): Parameters<ProjectLsArgs>) -> String {
@@ -1050,7 +1110,7 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Regex search across project files. Replaces `grep`/`rg` with a gitignore-aware, git-scoped searcher powered by the ripgrep engine (grep-regex + grep-searcher). Smart-case by default, binary files skipped, per-file and total result caps. Returns match lines with optional before/after context tagged by kind. When a SCIP index is Ready for the project, each line is annotated with `symbol` (the enclosing definition's display name) — a semantic layer no plain grep can provide."
+        description = "Regex search across project files. Replaces `grep`/`rg` with a gitignore-aware, git-scoped searcher powered by the ripgrep engine (grep-regex + grep-searcher). Smart-case by default, binary files skipped, per-file and total result caps. Default scope = \"all\" (working-tree walk incl. untracked files); pass `scope: \"tracked\"` to restrict to committed files. Returns match lines with optional before/after context tagged by kind. When a SCIP index is Ready for the project, each line is annotated with `symbol` (the enclosing definition's display name) — a semantic layer no plain grep can provide; the response also carries a top-level `scip: {state, sha?}` field so callers know whether enrichment was applied."
     )]
     async fn project_grep(&self, Parameters(args): Parameters<ProjectGrepArgs>) -> String {
         let root = resolve_root(args.path);
@@ -1069,8 +1129,14 @@ impl AideServer {
         };
         match aide_search::grep(&root, &args.pattern, &scope, &options) {
             Ok(mut result) => {
-                self.annotate_hits_with_scip(&root, &mut result.hits).await;
-                to_json(&result)
+                let scip_meta = self.annotate_hits_with_scip(&root, &mut result.hits).await;
+                let mut value = serde_json::to_value(&result).unwrap_or_default();
+                if let Some(obj) = value.as_object_mut() {
+                    if let Ok(meta_value) = serde_json::to_value(&scip_meta) {
+                        obj.insert("scip".to_string(), meta_value);
+                    }
+                }
+                value.to_string()
             }
             Err(e) => error_json(e.to_string()),
         }
@@ -2557,7 +2623,11 @@ impl ServerHandler for AideServer {
 }
 
 fn parse_scope(raw: Option<&str>) -> Result<aide_search::Scope, String> {
-    match raw.unwrap_or("tracked") {
+    // Default: `all` (gitignore-aware walk of the working tree). Previously
+    // defaulted to `tracked` (libgit2 index), which silently hid newly-
+    // created files — see ux-gotcha #1. `all` matches the `ls`/`find`
+    // intuition agents bring in from shell.
+    match raw.unwrap_or("all") {
         "tracked" => Ok(aide_search::Scope::Tracked),
         "all" => Ok(aide_search::Scope::All),
         "dirty" => Ok(aide_search::Scope::Dirty),
