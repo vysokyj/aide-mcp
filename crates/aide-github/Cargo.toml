@@ -1,0 +1,26 @@
+[package]
+name = "aide-github"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aide-core.workspace = true
+
+anyhow.workspace = true
+git2.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

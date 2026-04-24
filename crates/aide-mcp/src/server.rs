@@ -2364,6 +2364,184 @@ impl AideServer {
             }
         }
     }
+
+    // ---------- v0.19 GitHub integration ----------
+
+    #[tool(
+        description = "Report the current GitHub auth state. Walks $GITHUB_TOKEN → `gh auth token` → ~/.aide/auth/github.token, then hits /user with the resolved token to produce `{source, login, scopes}`. Scopes come from the `x-oauth-scopes` response header — empty for fine-grained tokens. When no source resolves, returns `{source: \"none\", remediation: <three-step actionable message>}` instead of erroring, so agents can branch on it."
+    )]
+    async fn gh_auth_status(&self, Parameters(_args): Parameters<GhAuthStatusArgs>) -> String {
+        let token_file = self.paths.github_token();
+        match aide_github::resolve_token(&token_file).await {
+            Err(e) => error_json(e.to_string()),
+            Ok(None) => to_json(&serde_json::json!({
+                "source": "none",
+                "login": serde_json::Value::Null,
+                "scopes": Vec::<String>::new(),
+                "remediation": aide_github::NO_AUTH_REMEDIATION,
+            })),
+            Ok(Some(resolved)) => {
+                let client = match aide_github::GithubClient::new(resolved.token) {
+                    Ok(c) => c,
+                    Err(e) => return error_json(e.to_string()),
+                };
+                match client.current_user_with_scopes().await {
+                    Ok((user, scopes)) => to_json(&serde_json::json!({
+                        "source": resolved.source.as_str(),
+                        "login": user.login,
+                        "scopes": scopes,
+                    })),
+                    Err(e) => to_json(&serde_json::json!({
+                        "source": resolved.source.as_str(),
+                        "login": serde_json::Value::Null,
+                        "scopes": Vec::<String>::new(),
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+        }
+    }
+
+    #[tool(
+        description = "Create an issue on the GitHub repo whose `origin` remote resolves to `:owner/:repo`. Requires a token via the waterfall — call `gh_auth_status` first if unsure. For dogfood-gotcha reports prefer `gh_ux_gotcha`, which enforces the `ux-gotcha` label and the CLAUDE.md body template."
+    )]
+    async fn gh_issue_create(&self, Parameters(args): Parameters<GhIssueCreateArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        let payload = aide_github::IssueCreate {
+            title: args.title,
+            body: args.body,
+            labels: args.labels.unwrap_or_default(),
+        };
+        match client.create_issue(&slug.owner, &slug.repo, &payload).await {
+            Ok(issue) => to_json(&issue),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "List issues on the repo attached to `origin`. Filters: `state` (open / closed / all — default open on GitHub's side), `labels` (AND-joined), `limit` mapped to `per_page` (max 100). Returns `[{number, title, state, html_url, labels}]` — same shape `gh_issue_create` returns for the single-issue case."
+    )]
+    async fn gh_issue_list(&self, Parameters(args): Parameters<GhIssueListArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let state = match args.state.as_deref() {
+            None => None,
+            Some(s) => match aide_github::IssueState::parse(s) {
+                Some(v) => Some(v),
+                None => {
+                    return error_json(format!(
+                        "unknown state {s:?}; expected one of: open, closed, all"
+                    ))
+                }
+            },
+        };
+        let filter = aide_github::IssueListFilter {
+            state,
+            labels: args.labels.unwrap_or_default(),
+            limit: args.limit,
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        match client.list_issues(&slug.owner, &slug.repo, &filter).await {
+            Ok(issues) => to_json(&issues),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "File a UX-gotcha issue with the CLAUDE.md policy baked in. Policy (all automatic): (1) label `ux-gotcha` is always added; (2) `title` is prefixed with the implicated `tool` in backticks unless already so; (3) a provenance footer — `Filed via gh_ux_gotcha from <tool>[/<param>] per CLAUDE.md § \"Reporting UX gotchas\"` — is appended to `body`. Agent supplies the narrative (Repro / Why it bites / Suggested fix), the policy handles the shell."
+    )]
+    async fn gh_ux_gotcha(&self, Parameters(args): Parameters<GhUxGotchaArgs>) -> String {
+        let root = resolve_root(args.path);
+        let slug = match aide_github::detect_github_slug(&root) {
+            Ok(s) => s,
+            Err(e) => return error_json(e.to_string()),
+        };
+        let client = match self.gh_client().await {
+            Ok(c) => c,
+            Err(msg) => return error_json(msg),
+        };
+        let payload = aide_github::ux_gotcha::build(
+            &args.title,
+            &args.body,
+            &args.tool,
+            args.param.as_deref(),
+        );
+        match client.create_issue(&slug.owner, &slug.repo, &payload).await {
+            Ok(issue) => to_json(&issue),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    async fn gh_client(&self) -> Result<aide_github::GithubClient, String> {
+        let token_file = self.paths.github_token();
+        let resolved = aide_github::resolve_token(&token_file)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| aide_github::NO_AUTH_REMEDIATION.to_string())?;
+        aide_github::GithubClient::new(resolved.token).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhAuthStatusArgs {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhIssueCreateArgs {
+    /// Project root whose `origin` remote is parsed for `owner/repo`. If
+    /// omitted, the server cwd is used.
+    #[serde(default)]
+    pub path: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// Optional labels to attach. The repo must already have them; GitHub
+    /// does not auto-create labels on issue create.
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhIssueListArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    /// One of `open` (default on GitHub) / `closed` / `all`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// AND-filter: only issues carrying every label in this list.
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    /// `per_page`. GitHub caps at 100; above that the API returns 422.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GhUxGotchaArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// The aide MCP tool whose behaviour surfaced the gotcha —
+    /// `project_ls` / `project_grep` / etc. Used for title prefix and
+    /// provenance footer.
+    pub tool: String,
+    /// Optional parameter name (e.g. `scope` on `project_ls`) to narrow
+    /// the provenance when the gotcha is specific to one argument.
+    #[serde(default)]
+    pub param: Option<String>,
 }
 
 #[tool_handler]

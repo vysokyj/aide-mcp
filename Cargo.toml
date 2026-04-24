@@ -4,6 +4,7 @@ members = [
     "crates/aide-core",
     "crates/aide-dap",
     "crates/aide-git",
+    "crates/aide-github",
     "crates/aide-install",
     "crates/aide-lang",
     "crates/aide-lsp",
@@ -24,6 +25,7 @@ repository = "https://github.com/vysokyj/aide-mcp"
 aide-core = { path = "crates/aide-core" }
 aide-dap = { path = "crates/aide-dap" }
 aide-git = { path = "crates/aide-git" }
+aide-github = { path = "crates/aide-github" }
 aide-install = { path = "crates/aide-install" }
 aide-lang = { path = "crates/aide-lang" }
 aide-lsp = { path = "crates/aide-lsp" }
@@ -57,6 +59,7 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 globset = "0.4"
+wiremock = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

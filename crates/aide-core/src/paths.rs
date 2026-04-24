@@ -16,6 +16,7 @@ pub enum PathsError {
 /// - `sock/`    — unix-domain sockets for IPC.
 /// - `queue/`   — durable queue for pending indexer work.
 /// - `logs/`    — captured stdout/stderr of `run_*` / `install_package`.
+/// - `auth/`    — user-supplied credentials (e.g. `github.token`).
 /// - `config.toml` — user-wide configuration.
 #[derive(Debug, Clone)]
 pub struct AidePaths {
@@ -64,6 +65,18 @@ impl AidePaths {
         self.root.join("logs")
     }
 
+    pub fn auth(&self) -> PathBuf {
+        self.root.join("auth")
+    }
+
+    /// Path to the manual-drop-in GitHub token file — third tier of the
+    /// auth waterfall after `$GITHUB_TOKEN` and `gh auth token`. Callers
+    /// are expected to create it with mode 0600; aide-mcp never writes
+    /// to it.
+    pub fn github_token(&self) -> PathBuf {
+        self.auth().join("github.token")
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.root.join("config.toml")
     }
@@ -82,6 +95,11 @@ mod tests {
         assert_eq!(paths.sock(), Path::new("/tmp/aide-test/sock"));
         assert_eq!(paths.queue(), Path::new("/tmp/aide-test/queue"));
         assert_eq!(paths.logs(), Path::new("/tmp/aide-test/logs"));
+        assert_eq!(paths.auth(), Path::new("/tmp/aide-test/auth"));
+        assert_eq!(
+            paths.github_token(),
+            Path::new("/tmp/aide-test/auth/github.token")
+        );
         assert_eq!(paths.config_file(), Path::new("/tmp/aide-test/config.toml"));
     }
 }
