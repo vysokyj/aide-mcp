@@ -44,6 +44,10 @@ The Bash habits that have a first-class aide equivalent:
 | `sed` / find-and-replace | `lsp_rename_symbol` | scope-correct cross-file rename |
 | plain `Edit` for risky change | `safe_edit` | before/after diagnostic delta |
 | `tail -f target/…log` | `read_exec_log` | |
+| `gh auth status` | `gh_auth_status` | resolves token via env → `gh` subprocess → file, reports `{source, login, scopes}` |
+| `gh issue create` | `gh_issue_create` | detects repo from `origin`, no repo flag needed |
+| `gh issue list` | `gh_issue_list` | structured JSON straight from REST |
+| ad-hoc `gh issue create --label ux-gotcha …` | `gh_ux_gotcha` | policy-as-code: label + title prefix + provenance footer guaranteed |
 
 ---
 
@@ -184,6 +188,22 @@ languages deferred (Node via `js-debug`, Python via `debugpy`, Go via
 | `index_commit(path?, sha?)` | Force-enqueue a commit (HEAD by default) for SCIP indexing. |
 | `index_status(path?, sha?)` | State: `Pending` / `InProgress` / `Ready` / `Failed`. |
 | `work_last_known_state(path?)` | Last commit the indexer has Ready for this repo. |
+
+## GitHub integration
+
+Token resolution walks `$GITHUB_TOKEN` → `gh auth token` subprocess →
+`~/.aide/auth/github.token` (chmod 0600). If all three miss, the write
+tools error with a three-step actionable remediation; `gh_auth_status`
+returns `{source: "none", remediation: …}` instead of erroring. No
+OAuth of our own — device flow (variant C) is deferred pending a
+GitHub OAuth App ownership decision.
+
+| Tool | Replaces | What it does |
+|---|---|---|
+| `gh_auth_status()` | `gh auth status` | Walks the token waterfall, hits `/user` with the resolved token, returns `{source, login, scopes}`. Scopes from `x-oauth-scopes` header (empty for fine-grained tokens). Never errors — agents branch on `source`. |
+| `gh_issue_create(title, body, labels?)` | `gh issue create` | Detects `:owner/:repo` from `origin` remote (SSH or HTTPS). Labels must already exist on the repo — GitHub does not auto-create. |
+| `gh_issue_list(state?, labels?, limit?)` | `gh issue list` | `state` = open / closed / all. `labels` AND-join. `limit` mapped to `per_page` (max 100). Returns `[{number, title, state, html_url, labels}]`. |
+| `gh_ux_gotcha(title, body, tool, param?)` | — | Policy wrapper over `gh_issue_create`: hardcodes the `ux-gotcha` label, prefixes `title` with the implicated tool, appends a provenance footer. Use whenever dogfooding surfaces a trap. See CLAUDE.md § "Reporting UX gotchas". |
 
 ## Dogfood
 
