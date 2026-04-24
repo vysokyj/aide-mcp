@@ -1,6 +1,6 @@
 # Project status snapshot
 
-Last updated: 2026-04-23.
+Last updated: 2026-04-24.
 
 ## Purpose of this file
 
@@ -43,6 +43,7 @@ decisions, roadmap, current state — is mirrored here.
 | v0.13.1   | `lsp_list_code_actions` + `lsp_apply_code_action` (point or range, select by kind or title substring); `apply_workspace_edit` extended to handle `document_changes` | ✅ done |
 | v0.13.2   | `safe_edit` — apply unique `old_string → new_string`, snapshot LSP diagnostics before/after, return the classified delta | ✅ done |
 | v0.14     | Dogfood → roadmap loop: `dogfood_coverage_gaps` aggregates run records into a ranked report | ✅ done — CI integration deferred |
+| v0.15     | Second-language support: Node.js / TypeScript plugin (`typescript-language-server` + `typescript` + `scip-typescript` auto-install via npm tarballs) | ✅ done — DAP (`js-debug`) deferred |
 
 ## Workspace layout
 
@@ -55,7 +56,7 @@ crates/
                   gzip/tar.gz/zip extract, post-extract `custom_install`
                   hook, manifest.json
   aide-lang/      LanguagePlugin trait + Registry; built-ins: RustPlugin,
-                  JavaMavenPlugin, JavaGradlePlugin
+                  JavaMavenPlugin, JavaGradlePlugin, NodePlugin
   aide-lsp/       LspClient (spawn takes plugin-supplied args), LspPool,
                   ops (hover/def/refs/symbols/diagnostics)
   aide-dap/       DapClient speaking Debug Adapter Protocol over stdio
@@ -78,13 +79,16 @@ crates/
 
 1. **SDK** = `rmcp` 1.5 (official Anthropic Rust MCP SDK, Tier 2 stable).
 2. **Transport** = stdio only.
-3. **Languages** = Rust (dogfood) + Java (Maven and Gradle). Added
-   via the `LanguagePlugin` trait; each declares its LSP / SCIP / DAP
-   / package manager / runner, plus the full command line for its
-   SCIP indexer (`scip_args`) and optional LSP launch flags
+3. **Languages** = Rust (dogfood) + Java (Maven and Gradle) + Node/TS.
+   Added via the `LanguagePlugin` trait; each declares its LSP / SCIP
+   / DAP / package manager / runner, plus the full command line for
+   its SCIP indexer (`scip_args`) and optional LSP launch flags
    (`lsp_spawn_args`). Rust auto-installs rust-analyzer + codelldb.
    Java auto-installs JDT-LS from the Eclipse snapshot tarball via a
    generated wrapper script. scip-java still expects a system install.
+   Node/TS auto-installs `typescript-language-server`, `typescript`,
+   and `scip-typescript` via pinned npm registry tarballs with
+   generated shell wrappers (node runtime is a system prerequisite).
 4. **Execution model** = MCP tools operate directly against the user's
    working tree. SCIP is built against a commit snapshot exported to a
    TempDir — never against the dirty working tree.
@@ -360,13 +364,15 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
 
 ### Proposed next milestone
 
-The v0.8–v0.14 batch plus v0.13.1 and v0.13.2 all shipped. The
+The v0.8–v0.15 batch plus v0.13.1 and v0.13.2 all shipped. The
 remaining deferrals (`run_cargo_expand`, pull-diagnostics refinement,
-dogfood CI) are each gated on evidence that isn't yet in the
-repo — a run that demands whole-module macro expansion, a
-safe_edit call whose fixed wait genuinely misses reanalysis, or
-enough dogfood runs to make CI worthwhile. Rather than speculate,
-hold and let the dogfood loop tell us what to pick up next.
+dogfood CI, `js-debug` DAP for Node) are each gated on evidence that
+isn't yet in the repo — a run that demands whole-module macro
+expansion, a safe_edit call whose fixed wait genuinely misses
+reanalysis, enough dogfood runs to make CI worthwhile, or a real
+Node.js project where debugging is the friction. Rather than
+speculate, hold and let the dogfood loop tell us what to pick up
+next.
 
 A good next *research* pass (not implementation) is a paired
 benchmark over a real multi-file refactor — something that

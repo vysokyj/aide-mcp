@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::languages::java::JavaMavenPlugin;
 use crate::languages::java_gradle::JavaGradlePlugin;
+use crate::languages::node::NodePlugin;
 use crate::languages::rust::RustPlugin;
 use crate::plugin::{LanguageId, LanguagePlugin};
 
@@ -14,14 +15,20 @@ pub struct Registry {
 
 impl Registry {
     /// Registry preloaded with every language plugin shipped with aide-mcp.
-    /// Detection order matters — Maven is checked before Gradle so a
-    /// hybrid project with both files still routes through Maven.
+    /// Detection order matters:
+    /// - Maven before Gradle — hybrid project with both files still
+    ///   routes through Maven.
+    /// - Rust / Java before Node — polyglot repos that contain both
+    ///   `Cargo.toml` / `pom.xml` and `package.json` (common for
+    ///   build-tooling and monorepos) keep their primary language as
+    ///   the indexer root.
     pub fn builtin() -> Self {
         Self {
             plugins: vec![
                 Arc::new(RustPlugin),
                 Arc::new(JavaMavenPlugin),
                 Arc::new(JavaGradlePlugin),
+                Arc::new(NodePlugin),
             ],
         }
     }

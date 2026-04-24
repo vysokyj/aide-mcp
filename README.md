@@ -48,6 +48,11 @@ over stdio.
   the Eclipse snapshot tarball via a generated wrapper; Lombok is fetched
   and wired in as a javaagent), scip-java (SCIP; still expects a system
   install via coursier), `java-debug` adapter (DAP).
+- **Node.js / TypeScript** — `typescript-language-server` (LSP) bundled
+  with a pinned `typescript` runtime via the npm registry;
+  `@sourcegraph/scip-typescript` (SCIP). All three auto-install on
+  `project_setup`; `node` itself is a system prerequisite. DAP
+  (vscode-js-debug) deferred.
 
 Languages are added one at a time via the `LanguagePlugin` trait in
 `aide-lang`. Each plugin declares which binaries to fetch, how to run/test,
@@ -87,7 +92,7 @@ Then from the agent:
 crates/
   aide-core/      shared paths + config (~/.aide/ layout, TOML config)
   aide-install/   binary installer (GitHub releases, gzip/tar.gz/zip)
-  aide-lang/      LanguagePlugin trait + built-ins (Rust, Java Maven/Gradle)
+  aide-lang/      LanguagePlugin trait + built-ins (Rust, Java Maven/Gradle, Node/TS)
   aide-lsp/       stdio LSP client + per-workspace pool + ops
   aide-dap/       Debug Adapter Protocol client over stdio
   aide-git/       libgit2-backed read ops + commit export
