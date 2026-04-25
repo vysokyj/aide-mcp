@@ -59,17 +59,11 @@ pub fn detect_github_slug(path: &Path) -> Result<RepoSlug, RepoError> {
 /// else — the caller decides whether that's fatal.
 pub fn parse_github_slug(url: &str) -> Option<RepoSlug> {
     let trimmed = url.trim();
-    let rest = if let Some(r) = trimmed.strip_prefix("git@github.com:") {
-        r
-    } else if let Some(r) = trimmed.strip_prefix("https://github.com/") {
-        r
-    } else if let Some(r) = trimmed.strip_prefix("http://github.com/") {
-        r
-    } else if let Some(r) = trimmed.strip_prefix("ssh://git@github.com/") {
-        r
-    } else {
-        return None;
-    };
+    let rest = trimmed
+        .strip_prefix("git@github.com:")
+        .or_else(|| trimmed.strip_prefix("https://github.com/"))
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))?;
     let rest = rest.trim_end_matches('/').trim_end_matches(".git");
     let (owner, repo) = rest.split_once('/')?;
     if owner.is_empty() || repo.is_empty() || repo.contains('/') {

@@ -38,6 +38,13 @@ pub struct LocationHit {
     pub start_col: u32,
     pub end_line: u32,
     pub end_col: u32,
+    /// Display name of the enclosing definition (function / struct /
+    /// method) at this location, populated server-side from the
+    /// most-recent Ready SCIP index. `None` when no SCIP index is
+    /// available, the location's file isn't covered by the index, or
+    /// the line falls outside any indexed definition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_symbol: Option<String>,
 }
 
 /// A node in a file's symbol tree (function, struct, method, …).
@@ -73,6 +80,12 @@ pub struct PublishedDiagnostic {
     pub end_col: u32,
     pub message: String,
     pub source: Option<String>,
+    /// Display name of the enclosing definition that owns this
+    /// diagnostic, populated server-side from the most-recent Ready
+    /// SCIP index. Same semantics as
+    /// [`LocationHit::enclosing_symbol`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_symbol: Option<String>,
 }
 
 /// Open or refresh `path` in the server, then return its hover info at `(line, col)`.
@@ -133,6 +146,7 @@ pub async fn definition(
                 start_col: l.target_selection_range.start.character,
                 end_line: l.target_selection_range.end.line,
                 end_col: l.target_selection_range.end.character,
+                enclosing_symbol: None,
             })
             .collect(),
     })
@@ -316,6 +330,7 @@ async fn snapshot_published_diagnostics(
                     .map_or_else(|| "Unknown".to_string(), |s| format!("{s:?}")),
                 message: d.message,
                 source: d.source,
+                enclosing_symbol: None,
             });
         }
     }
@@ -385,6 +400,12 @@ pub struct DiagnosticSnapshot {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Display name of the enclosing definition that owns this
+    /// diagnostic. Same semantics as
+    /// [`LocationHit::enclosing_symbol`] — populated server-side
+    /// from the latest Ready SCIP index, `None` when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -921,6 +942,7 @@ pub async fn diagnostics(
             end_col: d.range.end.character,
             message: d.message,
             source: d.source,
+            enclosing_symbol: None,
         })
         .collect())
 }
@@ -997,6 +1019,7 @@ fn location_hit(loc: &lsp_types::Location) -> LocationHit {
         start_col: loc.range.start.character,
         end_line: loc.range.end.line,
         end_col: loc.range.end.character,
+        enclosing_symbol: None,
     }
 }
 
@@ -1182,5 +1205,81 @@ mod edit_tests {
         let text = "abc\n";
         let edits = vec![edit(pos(10, 0), pos(10, 3), "X")];
         assert_eq!(apply_text_edits(text, &edits), "abc\n");
+    }
+}
+
+#[cfg(test)]
+mod scip_field_tests {
+    //! Wire tests for the `enclosing_symbol` field that the server
+    //! enriches after the LSP call returns. The structs themselves
+    //! never set the field — `None` is the construction-time
+    //! default and must serialize as a missing JSON key so MCP
+    //! clients that don't know about the field aren't surprised by
+    //! a `"enclosing_symbol":null` either.
+
+    use super::{DiagnosticSnapshot, LocationHit, PublishedDiagnostic};
+
+    #[test]
+    fn published_diagnostic_skips_enclosing_symbol_when_none() {
+        let d = PublishedDiagnostic {
+            severity: "Error".into(),
+            line: 0,
+            col: 0,
+            end_line: 0,
+            end_col: 1,
+            message: "x".into(),
+            source: None,
+            enclosing_symbol: None,
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("enclosing_symbol"));
+    }
+
+    #[test]
+    fn published_diagnostic_emits_enclosing_symbol_when_set() {
+        let d = PublishedDiagnostic {
+            severity: "Error".into(),
+            line: 0,
+            col: 0,
+            end_line: 0,
+            end_col: 1,
+            message: "x".into(),
+            source: None,
+            enclosing_symbol: Some("Foo::process".into()),
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            json.as_object().unwrap().get("enclosing_symbol"),
+            Some(&serde_json::Value::String("Foo::process".into())),
+        );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_skips_enclosing_symbol_when_none() {
+        let s = DiagnosticSnapshot {
+            file: "a/b/c.rs".into(),
+            line: 0,
+            col: 0,
+            severity: "Error".into(),
+            message: "x".into(),
+            source: None,
+            enclosing_symbol: None,
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("enclosing_symbol"));
+    }
+
+    #[test]
+    fn location_hit_skips_enclosing_symbol_when_none() {
+        let h = LocationHit {
+            uri: "file:///a/b.rs".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 1,
+            enclosing_symbol: None,
+        };
+        let json = serde_json::to_value(&h).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("enclosing_symbol"));
     }
 }

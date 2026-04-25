@@ -1,6 +1,6 @@
 # Project status snapshot
 
-Last updated: 2026-04-24 (v0.18).
+Last updated: 2026-04-26 (v0.22).
 
 ## Purpose of this file
 
@@ -52,6 +52,7 @@ decisions, roadmap, current state — is mirrored here.
 | v0.20     | Job management for aide-spawned processes: every `run_project` / `run_tests` / `install_package` gets an aide-assigned `job_id` and is tracked in an in-process `Registry` for the spawn's duration. Three new MCP tools — `job_list`, `job_info(id)`, `job_kill(id, signal?)` — operate exclusively on those registered jobs. Signalling uses `nix::sys::signal::kill` (added workspace dep) and accepts `term` (default) / `kill` / `int` / `hup` / `quit` plus `SIG`-prefixed aliases and POSIX numbers. **Scope gate:** tools take `job_id`, never raw PID, so there is no API path for an agent to signal a process aide did not spawn. | ✅ done |
 | v0.20.1   | Read-only system process listing: `process_list(name_filter?, limit?)` over `sysinfo` 0.33, scoped to the current user's processes, with a case-insensitive name-substring filter and a result cap (default 200). Returns `{pid, name, exe, cmd, cwd, started_at_unix, memory_bytes, cpu_percent, status}` per process, sorted by PID ascending. Complements v0.20 by answering "which PID is the running aide-mcp?" without a Bash shell-out to `ps`. Generic `process_kill(pid)` remains explicitly rejected — Bash escape hatch stays for that. | ✅ done |
 | v0.21     | PR workflow — four MCP tools (`gh_pr_create`, `gh_pr_view`, `gh_pr_list`, `gh_pr_checks`). `gh_pr_create` auto-detects `head` from the current git branch (new `aide_git::current_branch` helper) and `base` from the repo's configured default branch (new `get_repo` client method). `gh_pr_checks` bundles PR → head SHA → check-runs in one tool call. New types in `aide-github`: `PullRequest` + `Branch` + `PullRequestCreate` + `PullRequestListFilter` + `Repo` + `CheckRun` + `CheckRunsResponse`. Reuses `IssueState` for state filtering so the same "open/closed/all" parsing applies. | ✅ done — PR review comments, merge / reopen actions, fine-grained commits-in-PR view deferred to later if dogfood surfaces need |
+| v0.22     | SCIP↔LSP enrichment parity: `lsp_diagnostics`, `lsp_references`, `lsp_definition`, `safe_edit`, and `task_context` diagnostics now carry `enclosing_symbol` from the latest Ready SCIP index — same trick that already enriched `project_grep` and `run_*` diagnostics. Closes the inconsistency where some location/diagnostic results reached the agent semantically tagged and others didn't. | ✅ done |
 
 ## Workspace layout
 
@@ -381,7 +382,7 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
 
 ### Proposed next milestone
 
-The v0.8–v0.18 batch plus v0.13.1 and v0.13.2 all shipped. The
+The v0.8–v0.22 batch plus v0.13.1 and v0.13.2 all shipped. The
 remaining deferrals (`run_cargo_expand`, pull-diagnostics refinement,
 dogfood CI, `js-debug` DAP for Node, `debugpy` DAP for Python,
 `delve` DAP for Go, `gopls` auto-install, C/C++ compile-database

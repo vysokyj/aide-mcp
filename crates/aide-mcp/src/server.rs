@@ -971,6 +971,93 @@ impl AideServer {
             d.enclosing_symbol = aide_scip::enclosing_definition(&index, &rel, line_0based);
         }
     }
+
+    /// Best-effort enrichment for LSP-published diagnostics. The
+    /// MCP surface for `lsp_diagnostics` is "ask the live LSP what
+    /// it thinks of this file" — but agents almost always want the
+    /// next bit of context too: which function does this error live
+    /// in? Same trick as the build-side path: load the latest Ready
+    /// SCIP index, look up the enclosing definition. LSP reports
+    /// line numbers 0-indexed, so no off-by-one here.
+    async fn annotate_published_diagnostics_with_scip(
+        &self,
+        root: &std::path::Path,
+        file: &std::path::Path,
+        diagnostics: &mut [aide_lsp::ops::PublishedDiagnostic],
+    ) {
+        if diagnostics.is_empty() {
+            return;
+        }
+        let root_str = root.display().to_string();
+        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
+            return;
+        };
+        let Ok(index) = aide_scip::load(&scip_path) else {
+            return;
+        };
+        let rel = relativize_path(root, &file.display().to_string());
+        for d in diagnostics {
+            let line_0based = i32::try_from(d.line).unwrap_or(i32::MAX);
+            d.enclosing_symbol = aide_scip::enclosing_definition(&index, &rel, line_0based);
+        }
+    }
+
+    /// Best-effort enrichment for the diagnostic-snapshot rows
+    /// returned by `safe_edit`. Each snapshot already carries its
+    /// own file path, so no extra arg from the caller. Called once
+    /// for each of `new_errors`, `new_warnings`, `resolved` so the
+    /// SCIP index is loaded once per group, not once per snapshot.
+    async fn annotate_diagnostic_snapshots_with_scip(
+        &self,
+        root: &std::path::Path,
+        snapshots: &mut [aide_lsp::ops::DiagnosticSnapshot],
+    ) {
+        if snapshots.is_empty() {
+            return;
+        }
+        let root_str = root.display().to_string();
+        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
+            return;
+        };
+        let Ok(index) = aide_scip::load(&scip_path) else {
+            return;
+        };
+        for snap in snapshots {
+            let rel = relativize_path(root, &snap.file);
+            let line_0based = i32::try_from(snap.line).unwrap_or(i32::MAX);
+            snap.enclosing_symbol = aide_scip::enclosing_definition(&index, &rel, line_0based);
+        }
+    }
+
+    /// Best-effort enrichment for `lsp_references` / `lsp_definition`
+    /// hit lists. Each hit's `uri` is a `file://` URI; we strip the
+    /// scheme and relativize to the workspace root before the SCIP
+    /// lookup. Hits whose URI doesn't follow `file://` (rare —
+    /// remote-LSP futures) get left unannotated.
+    async fn annotate_location_hits_with_scip(
+        &self,
+        root: &std::path::Path,
+        hits: &mut [aide_lsp::ops::LocationHit],
+    ) {
+        if hits.is_empty() {
+            return;
+        }
+        let root_str = root.display().to_string();
+        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
+            return;
+        };
+        let Ok(index) = aide_scip::load(&scip_path) else {
+            return;
+        };
+        for hit in hits {
+            let Some(path) = hit.uri.strip_prefix("file://") else {
+                continue;
+            };
+            let rel = relativize_path(root, path);
+            let line_0based = i32::try_from(hit.start_line).unwrap_or(i32::MAX);
+            hit.enclosing_symbol = aide_scip::enclosing_definition(&index, &rel, line_0based);
+        }
+    }
 }
 
 /// Turn a span path reported by a build tool into a repo-relative path
@@ -1243,7 +1330,11 @@ impl AideServer {
         };
 
         match lsp_ops::definition(&client, &file, args.line, args.column).await {
-            Ok(hits) => to_json(&hits),
+            Ok(mut hits) => {
+                self.annotate_location_hits_with_scip(&root, &mut hits)
+                    .await;
+                to_json(&hits)
+            }
             Err(e) => error_json(e.to_string()),
         }
     }
@@ -1280,7 +1371,15 @@ impl AideServer {
         )
         .await
         {
-            Ok(report) => to_json(&report),
+            Ok(mut report) => {
+                self.annotate_diagnostic_snapshots_with_scip(&root, &mut report.new_errors)
+                    .await;
+                self.annotate_diagnostic_snapshots_with_scip(&root, &mut report.new_warnings)
+                    .await;
+                self.annotate_diagnostic_snapshots_with_scip(&root, &mut report.resolved)
+                    .await;
+                to_json(&report)
+            }
             Err(e) => error_json(e.to_string()),
         }
     }
@@ -1424,7 +1523,11 @@ impl AideServer {
         };
 
         match lsp_ops::diagnostics(&client, &file, std::time::Duration::from_millis(500)).await {
-            Ok(d) => to_json(&d),
+            Ok(mut d) => {
+                self.annotate_published_diagnostics_with_scip(&root, &file, &mut d)
+                    .await;
+                to_json(&d)
+            }
             Err(e) => error_json(e.to_string()),
         }
     }
@@ -1457,7 +1560,11 @@ impl AideServer {
         )
         .await
         {
-            Ok(hits) => to_json(&hits),
+            Ok(mut hits) => {
+                self.annotate_location_hits_with_scip(&root, &mut hits)
+                    .await;
+                to_json(&hits)
+            }
             Err(e) => error_json(e.to_string()),
         }
     }
@@ -1969,10 +2076,12 @@ impl AideServer {
                 if let Ok(syms) = lsp_ops::document_symbols(&client, &file).await {
                     ctx["document_symbols"] = serde_json::to_value(syms).unwrap_or_default();
                 }
-                if let Ok(diag) =
+                if let Ok(mut diag) =
                     lsp_ops::diagnostics(&client, &file, std::time::Duration::from_millis(500))
                         .await
                 {
+                    self.annotate_published_diagnostics_with_scip(&root, &file, &mut diag)
+                        .await;
                     ctx["diagnostics"] = serde_json::to_value(diag).unwrap_or_default();
                 }
             }

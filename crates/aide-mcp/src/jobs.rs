@@ -95,7 +95,7 @@ impl Registry {
         let mut out: Vec<Job> = self.jobs.lock().await.values().cloned().collect();
         // Stable, monotonic id order — easier to diff across calls and
         // scan visually in a tool response.
-        out.sort_by(|a, b| a.started_at_unix.cmp(&b.started_at_unix));
+        out.sort_by_key(|a| a.started_at_unix);
         out
     }
 
