@@ -36,9 +36,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,15 +69,9 @@ jobs:
           NAME="aide-mcp-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
           mkdir -p "$NAME"
           cp README.md LICENSE "$NAME/"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            cp "target/${{ matrix.target }}/release/aide-mcp.exe" "$NAME/"
-            7z a "${NAME}.zip" "$NAME" >/dev/null
-            echo "artefact=${NAME}.zip" >> "$GITHUB_OUTPUT"
-          else
-            cp "target/${{ matrix.target }}/release/aide-mcp" "$NAME/"
-            tar czf "${NAME}.tar.gz" "$NAME"
-            echo "artefact=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
+          cp "target/${{ matrix.target }}/release/aide-mcp" "$NAME/"
+          tar czf "${NAME}.tar.gz" "$NAME"
+          echo "artefact=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
