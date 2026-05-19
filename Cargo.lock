@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "aide-core"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aide-dap"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "aide-proto",
  "anyhow",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "aide-git"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "git2",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "aide-github"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "aide-core",
  "anyhow",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "aide-install"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "aide-core",
  "anyhow",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "aide-lang"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "aide-core",
  "aide-install",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "aide-lsp"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "aide-proto",
  "anyhow",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "aide-mcp"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "aide-core",
  "aide-dap",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "aide-proto"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "aide-scip"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "protobuf",
  "scip",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "aide-search"
-version = "0.6.1"
+version = "0.22.0"
 dependencies = [
  "aide-git",
  "git2",

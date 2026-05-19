@@ -5,10 +5,27 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "AIDE — MCP server delivering IDE-grade code intelligence (LSP, SCIP, git, exec, DAP) to AI agents."
 
 [[bin]]
 name = "aide-mcp"
 path = "src/main.rs"
+
+[package.metadata.deb]
+maintainer = "Jiri Vysoky <jiri.vysoky@gmail.com>"
+copyright = "2026 Jiri Vysoky"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+aide-mcp is a headless Model Context Protocol server written in Rust that
+exposes IDE-grade tools (LSP proxy, SCIP index, git read ops, project
+exec/test/run, DAP debug, GitHub issue/PR workflow) to AI agents over stdio."""
+section = "devel"
+priority = "optional"
+assets = [
+    ["target/release/aide-mcp", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/aide-mcp/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/aide-mcp/LICENSE", "644"],
+]
 
 [dependencies]
 aide-core.workspace = true

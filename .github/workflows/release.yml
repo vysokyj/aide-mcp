@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag name to publish (e.g. v0.6.0). Must already exist in git.'
+        description: 'Tag name to publish (e.g. v0.22.0). Must already exist in git.'
         required: true
 
 permissions:
@@ -26,6 +26,13 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            deb: true
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            deb: true
+            deb_arch: arm64
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
@@ -57,7 +64,7 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Package
+      - name: Package archive
         id: pkg
         shell: bash
         run: |
@@ -75,11 +82,37 @@ jobs:
             echo "artefact=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload as workflow artefact
+      - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pkg.outputs.artefact }}
           path: ${{ steps.pkg.outputs.artefact }}
+          if-no-files-found: error
+
+      - name: Install cargo-deb
+        if: matrix.deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build .deb
+        id: deb
+        if: matrix.deb
+        shell: bash
+        run: |
+          set -eux
+          cargo deb -p aide-mcp --no-build --target ${{ matrix.target }}
+          DEB_PATH=$(ls target/${{ matrix.target }}/debian/aide-mcp_*.deb | head -n1)
+          DEB_NAME="aide-mcp_${{ steps.ver.outputs.version }}_${{ matrix.deb_arch }}.deb"
+          cp "$DEB_PATH" "$DEB_NAME"
+          echo "artefact=${DEB_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .deb
+        if: matrix.deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.deb.outputs.artefact }}
+          path: ${{ steps.deb.outputs.artefact }}
           if-no-files-found: error
 
   release:
@@ -102,7 +135,7 @@ jobs:
 
       - name: Compute SHA256SUMS
         working-directory: dist
-        run: sha256sum aide-mcp-* > SHA256SUMS
+        run: sha256sum aide-mcp* > SHA256SUMS
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
