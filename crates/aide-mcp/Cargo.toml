@@ -8,7 +8,7 @@ repository.workspace = true
 description = "AIDE — MCP server delivering IDE-grade code intelligence (LSP, SCIP, git, exec, DAP) to AI agents."
 
 [[bin]]
-name = "aide-mcp"
+name = "mcp-aide"
 path = "src/main.rs"
 
 [package.metadata.deb]
@@ -22,9 +22,9 @@ exec/test/run, DAP debug, GitHub issue/PR workflow) to AI agents over stdio."""
 section = "devel"
 priority = "optional"
 assets = [
-    ["target/release/aide-mcp", "usr/bin/", "755"],
-    ["../../README.md", "usr/share/doc/aide-mcp/README.md", "644"],
-    ["../../LICENSE", "usr/share/doc/aide-mcp/LICENSE", "644"],
+    ["target/release/mcp-aide", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/mcp-aide/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/mcp-aide/LICENSE", "644"],
 ]
 
 [dependencies]

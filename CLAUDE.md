@@ -129,7 +129,7 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git_status","arguments":{}}}' \
-  | AIDE_HOME="$SMOKE_HOME" ./target/debug/aide-mcp 2>/dev/null
+  | AIDE_HOME="$SMOKE_HOME" ./target/debug/mcp-aide 2>/dev/null
 ```
 
 For LSP tools, first call `project_setup` to seed rust-analyzer, then wait

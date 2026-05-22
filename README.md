@@ -83,7 +83,7 @@ equivalents, LSP vs SCIP model — lives in [docs/TOOLS.md](docs/TOOLS.md).
 
 ```bash
 cargo build --release
-./target/release/aide-mcp
+./target/release/mcp-aide
 ```
 
 aide-mcp speaks MCP over stdio. Point an MCP-capable client at the binary,
@@ -93,7 +93,7 @@ for example Claude Code:
 {
   "mcpServers": {
     "aide": {
-      "command": "/absolute/path/to/aide-mcp"
+      "command": "/absolute/path/to/mcp-aide"
     }
   }
 }

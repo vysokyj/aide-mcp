@@ -435,7 +435,7 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"project_setup","arguments":{"path":"'$PWD'"}}}' \
-  | AIDE_HOME="$SMOKE_HOME" ./target/debug/aide-mcp
+  | AIDE_HOME="$SMOKE_HOME" ./target/debug/mcp-aide
 ```
 
 For LSP tools, give rust-analyzer ~30 s to index before the second
