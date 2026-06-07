@@ -18,10 +18,16 @@ use rmcp::{
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
-    transport::stdio,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+        },
+    },
     RoleServer, ServerHandler, ServiceExt,
 };
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::dogfood::aggregate_coverage_gaps;
 use crate::exec::{self, Progress};
@@ -32,6 +38,52 @@ pub async fn run() -> Result<()> {
     let handler = AideServer::new()?;
     let service = handler.serve(stdio()).await?;
     service.waiting().await?;
+    Ok(())
+}
+
+/// Serve the MCP API over HTTP (Streamable HTTP transport).
+///
+/// `addr` accepts `:PORT` (binds 127.0.0.1) or a full `host:port`. One
+/// `AideServer` is constructed up front and cloned per session so the
+/// indexer worker, LSP pool, and DAP sessions persist across HTTP
+/// connections — `--http` is a daemon-style transport, not per-request.
+pub async fn run_http(addr: &str) -> Result<()> {
+    let bind = if let Some(port) = addr.strip_prefix(':') {
+        format!("127.0.0.1:{port}")
+    } else {
+        addr.to_string()
+    };
+
+    let shared = AideServer::new()?;
+
+    let cancel = CancellationToken::new();
+    let config = StreamableHttpServerConfig::default().with_cancellation_token(cancel.clone());
+    let service = StreamableHttpService::new(
+        {
+            let shared = shared.clone();
+            move || Ok(shared.clone())
+        },
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let local = listener.local_addr()?;
+    tracing::info!(%local, "listening on http://{local}/mcp");
+
+    let shutdown = {
+        let cancel = cancel.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("shutdown signal received");
+            cancel.cancel();
+        }
+    };
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod dogfood;
@@ -9,8 +10,23 @@ mod memory;
 mod processes;
 mod server;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "mcp-aide",
+    version,
+    about = "AIDE — MCP server (LSP/SCIP/git/exec/DAP)"
+)]
+struct Cli {
+    /// Serve over HTTP instead of stdio. Accepts `:PORT` (binds 127.0.0.1)
+    /// or a full `host:port`. Default transport is stdio.
+    #[arg(long, value_name = "ADDR")]
+    http: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -22,5 +38,8 @@ async fn main() -> Result<()> {
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting aide-mcp");
 
-    server::run().await
+    match cli.http {
+        Some(addr) => server::run_http(&addr).await,
+        None => server::run().await,
+    }
 }
