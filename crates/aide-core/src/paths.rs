@@ -69,6 +69,14 @@ impl AidePaths {
         self.root.join("auth")
     }
 
+    /// Per-project memory directory. `repo_root_slug` is a
+    /// filesystem-safe slug of the project's absolute path — get one
+    /// from [`slugify_repo_root`]. Each memory is a single `.md` file
+    /// in this directory with YAML frontmatter (`name`, `description`).
+    pub fn memory(&self, repo_root_slug: &str) -> PathBuf {
+        self.root.join("memory").join(repo_root_slug)
+    }
+
     /// Path to the manual-drop-in GitHub token file — third tier of the
     /// auth waterfall after `$GITHUB_TOKEN` and `gh auth token`. Callers
     /// are expected to create it with mode 0600; aide-mcp never writes
@@ -80,6 +88,22 @@ impl AidePaths {
     pub fn config_file(&self) -> PathBuf {
         self.root.join("config.toml")
     }
+}
+
+/// Turn an absolute repo path into a filename-safe directory name.
+/// Collisions are avoided because two absolute paths always differ at
+/// some character. Used by both the SCIP index store (`~/.aide/scip/
+/// <slug>/<sha>.scip`) and per-project memory (`~/.aide/memory/
+/// <slug>/<name>.md`).
+pub fn slugify_repo_root(repo_root: &str) -> String {
+    repo_root
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| match c {
+            '/' | ':' | '\\' | ' ' => '_',
+            other => other,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -101,5 +125,17 @@ mod tests {
             Path::new("/tmp/aide-test/auth/github.token")
         );
         assert_eq!(paths.config_file(), Path::new("/tmp/aide-test/config.toml"));
+        assert_eq!(
+            paths.memory("home_jirka_workspace_aide-mcp"),
+            Path::new("/tmp/aide-test/memory/home_jirka_workspace_aide-mcp")
+        );
+    }
+
+    #[test]
+    fn slugify_root_escapes_separators_and_spaces() {
+        assert_eq!(
+            slugify_repo_root("/home/jirka/workspace/aide mcp"),
+            "home_jirka_workspace_aide_mcp"
+        );
     }
 }

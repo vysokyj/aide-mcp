@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aide_core::AidePaths;
+use aide_core::{slugify_repo_root, AidePaths};
 use aide_git::export::export_commit;
 use aide_lang::{LanguagePlugin, Registry};
 use tempfile::TempDir;
@@ -163,22 +163,8 @@ async fn run_indexer(
 fn index_file_path(paths: &AidePaths, repo_root: &str, sha: &str) -> PathBuf {
     paths
         .scip()
-        .join(slugify_repo(repo_root))
+        .join(slugify_repo_root(repo_root))
         .join(format!("{sha}.scip"))
-}
-
-/// Turn an absolute repo path into a filename-safe directory name.
-/// Collisions are avoided because two absolute paths always differ at
-/// some character.
-fn slugify_repo(repo_root: &str) -> String {
-    repo_root
-        .trim_start_matches('/')
-        .chars()
-        .map(|c| match c {
-            '/' | ':' | '\\' | ' ' => '_',
-            other => other,
-        })
-        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,15 +188,6 @@ enum IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slug_escapes_path_separators() {
-        assert_eq!(
-            slugify_repo("/home/jirka/workspace/aide-mcp"),
-            "home_jirka_workspace_aide-mcp"
-        );
-        assert_eq!(slugify_repo("/a b/c:d"), "a_b_c_d");
-    }
 
     #[test]
     fn index_file_path_layout() {

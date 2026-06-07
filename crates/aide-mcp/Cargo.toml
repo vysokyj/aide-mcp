@@ -42,6 +42,7 @@ aide-search.workspace = true
 anyhow.workspace = true
 lsp-types.workspace = true
 nix.workspace = true
+regex.workspace = true
 rmcp = { workspace = true }
 sysinfo.workspace = true
 schemars.workspace = true

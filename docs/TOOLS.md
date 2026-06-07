@@ -239,6 +239,22 @@ GitHub OAuth App ownership decision.
 | `gh_pr_checks(number)` | `gh pr checks` | CI status. Resolves the PR's head SHA, fetches every attached check-run. Returns `{number, head_sha, total_count, check_runs}`. |
 | `gh_ux_gotcha(title, body, tool, param?)` | — | Policy wrapper over `gh_issue_create`: hardcodes the `ux-gotcha` label, prefixes `title` with the implicated tool, appends a provenance footer. Use whenever dogfooding surfaces a trap. See CLAUDE.md § "Reporting UX gotchas". |
 
+## Memory — per-project persistent notes
+
+Markdown files under `~/.aide/memory/<repo_slug>/<name>.md`, each with
+YAML frontmatter (`name`, optional `description`). Mirrors Claude
+Code's host-level memory format for portability across agent
+transports. Per-repo: switching projects gives a fresh namespace.
+
+| Tool | Replaces | What it does |
+|---|---|---|
+| `memory_write(name, description?, content, path?)` | host-side memory file | Write/overwrite. Frontmatter is added on disk — `content` is plain markdown without `---` blocks. Use `description` for one-line summaries. Names: no `/`, `\\`, `..`, or leading dot. |
+| `memory_read(name, path?)` | — | Parse frontmatter, return `{name, description?, content}`. |
+| `memory_list(filter?, path?)` | — | Sorted summaries — `{name, description?, size_bytes}` per entry, body skipped. Optional case-insensitive substring `filter` over name + description. |
+| `memory_delete(name, path?)` | — | Hard-delete. Errors if no memory of that name exists — never silently no-ops. |
+| `memory_rename(old_name, new_name, path?)` | — | Filesystem rename + sync the `name:` frontmatter field. Refuses to overwrite — caller must `memory_delete` the target first if they really want that. |
+| `memory_edit(name, pattern, replacement, path?)` | `safe_edit` over a memory file | Regex replace in the body (frontmatter preserved). Returns the substitution count. |
+
 ## Dogfood
 
 | Tool | What it does |

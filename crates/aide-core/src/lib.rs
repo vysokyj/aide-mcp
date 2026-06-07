@@ -4,4 +4,4 @@ pub mod config;
 pub mod paths;
 
 pub use config::{Config, ConfigError, DapConfig, ExecConfig, ScipConfig};
-pub use paths::AidePaths;
+pub use paths::{slugify_repo_root, AidePaths};

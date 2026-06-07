@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aide_core::{AidePaths, Config};
+use aide_core::{slugify_repo_root, AidePaths, Config};
 use aide_dap::DapClient;
 use aide_git::diff::DiffMode;
 use aide_install::{install_tool, InstallOutcome};
@@ -26,6 +26,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use crate::dogfood::aggregate_coverage_gaps;
 use crate::exec::{self, Progress};
 use crate::indexer::Indexer;
+use crate::memory;
 
 pub async fn run() -> Result<()> {
     let handler = AideServer::new()?;
@@ -639,6 +640,67 @@ pub struct ProjectOnboardArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MemoryWriteArgs {
+    /// Memory name (no `/`, `..`, or leading dot). Used as the
+    /// filename `<name>.md`.
+    pub name: String,
+    /// One-line description used by `memory_list` so callers don't
+    /// have to read the body to decide whether to load it.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Markdown body. Frontmatter is added on disk; do not include
+    /// `---` blocks yourself.
+    pub content: String,
+    /// Project root the memory belongs to. Falls back to the server
+    /// cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MemoryReadArgs {
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MemoryListArgs {
+    /// Optional case-insensitive substring filter applied to name +
+    /// description. Empty matches everything.
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MemoryDeleteArgs {
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MemoryRenameArgs {
+    pub old_name: String,
+    pub new_name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MemoryEditArgs {
+    pub name: String,
+    /// Regex (re2 syntax via the `regex` crate). Anchors allowed; the
+    /// pattern is applied across the whole body.
+    pub pattern: String,
+    pub replacement: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RunProjectArgs {
     /// Project root. If omitted, falls back to the server cwd.
     #[serde(default)]
@@ -1184,6 +1246,16 @@ impl AideServer {
         };
         let refs = aide_scip::callers(&index, &symbol_id);
         Ok(Some(refs))
+    }
+
+    /// Resolve the per-project memory directory for `path` (defaulting
+    /// to the server cwd when `None`). Slug matches the SCIP layout so
+    /// `~/.aide/memory/<slug>/` and `~/.aide/scip/<slug>/` line up
+    /// per repo.
+    fn memory_dir_for(&self, path: Option<&str>) -> PathBuf {
+        let root = resolve_root(path.map(String::from));
+        let slug = slugify_repo_root(&root.display().to_string());
+        self.paths.memory(&slug)
     }
 }
 
@@ -2665,6 +2737,93 @@ impl AideServer {
         }
 
         to_json(&ctx)
+    }
+
+    #[tool(
+        description = "Write (or overwrite) a per-project memory under ~/.aide/memory/<slug>/<name>.md. Frontmatter (`name`, optional `description`) is added on disk — pass `content` as plain markdown without `---` blocks. Use `description` for one-line summaries so `memory_list` can answer 'do I want this?' without reading bodies. Names must be non-empty, contain no `/`, `\\`, or `..`, and not start with a dot."
+    )]
+    async fn memory_write(&self, Parameters(args): Parameters<MemoryWriteArgs>) -> String {
+        let dir = self.memory_dir_for(args.path.as_deref());
+        match memory::write(&dir, &args.name, args.description.as_deref(), &args.content) {
+            Ok(()) => to_json(
+                &serde_json::json!({ "name": args.name, "path": dir.join(format!("{}.md", args.name)) }),
+            ),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Read a per-project memory by name. Returns `{name, description?, content}` — frontmatter parsed into structured fields, body returned as the raw markdown that follows the frontmatter block."
+    )]
+    async fn memory_read(&self, Parameters(args): Parameters<MemoryReadArgs>) -> String {
+        let dir = self.memory_dir_for(args.path.as_deref());
+        match memory::read(&dir, &args.name) {
+            Ok(m) => to_json(&m),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "List per-project memories. Returns one `{name, description?, size_bytes}` entry per `.md` file, sorted by name. `filter`, when set, applies a case-insensitive substring match to the combined `name` + `description` text — agents can use it to narrow without paging the full list."
+    )]
+    async fn memory_list(&self, Parameters(args): Parameters<MemoryListArgs>) -> String {
+        let dir = self.memory_dir_for(args.path.as_deref());
+        match memory::list(&dir) {
+            Ok(items) => {
+                let filtered: Vec<_> =
+                    if let Some(f) = args.filter.as_deref().filter(|s| !s.is_empty()) {
+                        let needle = f.to_lowercase();
+                        items
+                            .into_iter()
+                            .filter(|m| {
+                                let hay = format!(
+                                    "{} {}",
+                                    m.name.to_lowercase(),
+                                    m.description.as_deref().unwrap_or("").to_lowercase()
+                                );
+                                hay.contains(&needle)
+                            })
+                            .collect()
+                    } else {
+                        items
+                    };
+                to_json(&filtered)
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Delete a per-project memory by name. Returns an error when no memory of that name exists — the tool never silently no-ops, so callers can be sure they removed what they meant to."
+    )]
+    async fn memory_delete(&self, Parameters(args): Parameters<MemoryDeleteArgs>) -> String {
+        let dir = self.memory_dir_for(args.path.as_deref());
+        match memory::delete(&dir, &args.name) {
+            Ok(()) => to_json(&serde_json::json!({ "deleted": args.name })),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Rename a per-project memory. Updates both the filename and the `name:` frontmatter field. Refuses if the target name already exists — callers must `memory_delete` the old target first if they really want to clobber it."
+    )]
+    async fn memory_rename(&self, Parameters(args): Parameters<MemoryRenameArgs>) -> String {
+        let dir = self.memory_dir_for(args.path.as_deref());
+        match memory::rename(&dir, &args.old_name, &args.new_name) {
+            Ok(()) => to_json(&serde_json::json!({ "old": args.old_name, "new": args.new_name })),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Replace every match of `pattern` (regex, re2 syntax) in a memory's body with `replacement`. Frontmatter is preserved untouched. Returns the substitution count so the caller can verify the edit landed."
+    )]
+    async fn memory_edit(&self, Parameters(args): Parameters<MemoryEditArgs>) -> String {
+        let dir = self.memory_dir_for(args.path.as_deref());
+        match memory::edit(&dir, &args.name, &args.pattern, &args.replacement) {
+            Ok(count) => to_json(&serde_json::json!({ "name": args.name, "substitutions": count })),
+            Err(e) => error_json(e.to_string()),
+        }
     }
 
     #[tool(
