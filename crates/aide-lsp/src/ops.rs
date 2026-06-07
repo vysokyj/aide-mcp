@@ -7,7 +7,8 @@ use std::time::Duration;
 use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
 use lsp_types::request::{
     CodeActionRequest, CodeActionResolveRequest, DocumentSymbolRequest, ExecuteCommand,
-    GotoDefinition, HoverRequest, References, Rename, WorkspaceSymbolRequest,
+    GotoDeclaration, GotoDefinition, GotoImplementation, HoverRequest, References, Rename,
+    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
@@ -16,9 +17,10 @@ use lsp_types::{
     ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams,
     MarkedString, PartialResultParams, Position, Range, ReferenceContext, ReferenceParams,
     RenameParams, SymbolInformation, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbol,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    WorkspaceEdit, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Serialize;
 
@@ -68,6 +70,45 @@ pub struct WorkspaceSymbolHit {
     pub kind: &'static str,
     pub container: Option<String>,
     pub location: LocationHit,
+}
+
+/// A single entry in a type hierarchy — one supertype or subtype.
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeHierarchyHit {
+    pub name: String,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub uri: String,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+/// Result of a type-hierarchy query — the symbol(s) at the cursor
+/// position plus the requested supertypes / subtypes lists.
+///
+/// `supertypes` and `subtypes` are `None` when that direction wasn't
+/// requested (vs. `Some(vec![])` when requested but the server returned
+/// nothing). `origin` mirrors LSP's `textDocument/prepareTypeHierarchy`
+/// — usually one entry, but can be empty when the cursor isn't on a
+/// type, or several when overload resolution is ambiguous.
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeHierarchyResult {
+    pub origin: Vec<TypeHierarchyHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supertypes: Option<Vec<TypeHierarchyHit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtypes: Option<Vec<TypeHierarchyHit>>,
+}
+
+/// Which direction to walk a prepared type hierarchy.
+#[derive(Debug, Clone, Copy)]
+pub enum TypeHierarchyDirection {
+    Supertypes,
+    Subtypes,
+    Both,
 }
 
 /// A single diagnostic simplified for MCP consumers.
@@ -120,9 +161,54 @@ pub async fn definition(
     line: u32,
     col: u32,
 ) -> Result<Vec<LocationHit>, LspClientError> {
+    let params = goto_position_params(client, path, line, col).await?;
+    let result = client.request::<GotoDefinition>(params).await?;
+    Ok(goto_response_to_hits(result))
+}
+
+/// Open or refresh `path` and return goto-declaration results at `(line, col)`.
+///
+/// Distinct from [`definition`] for languages that separate forward
+/// declarations from definitions — most prominently C/C++ headers and
+/// TypeScript ambient `declare` blocks. For Rust the answer is usually
+/// identical to `definition`, but the LSP method is wired through for
+/// parity.
+pub async fn declaration(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+) -> Result<Vec<LocationHit>, LspClientError> {
+    let params = goto_position_params(client, path, line, col).await?;
+    let result = client.request::<GotoDeclaration>(params).await?;
+    Ok(goto_response_to_hits(result))
+}
+
+/// Open or refresh `path` and return goto-implementation results at `(line, col)`.
+///
+/// For trait methods and interfaces this returns every concrete
+/// implementor — what `lsp_definition` on a trait method cannot
+/// answer.
+pub async fn implementations(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+) -> Result<Vec<LocationHit>, LspClientError> {
+    let params = goto_position_params(client, path, line, col).await?;
+    let result = client.request::<GotoImplementation>(params).await?;
+    Ok(goto_response_to_hits(result))
+}
+
+async fn goto_position_params(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+) -> Result<GotoDefinitionParams, LspClientError> {
     ensure_document_current(client, path).await?;
     let uri = path_to_uri(path)?;
-    let params = GotoDefinitionParams {
+    Ok(GotoDefinitionParams {
         text_document_position_params: TextDocumentPositionParams {
             text_document: TextDocumentIdentifier { uri },
             position: Position {
@@ -132,9 +218,102 @@ pub async fn definition(
         },
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: PartialResultParams::default(),
+    })
+}
+
+/// Prepare a type hierarchy at `(line, col)` and resolve the requested
+/// direction(s). LSP splits this into two requests
+/// (`prepareTypeHierarchy` then `supertypes` / `subtypes`); this
+/// helper does both in one round-trip from the caller's perspective.
+///
+/// `Both` issues one supertypes and one subtypes request per origin
+/// item — the cost is one extra round-trip vs. picking a single
+/// direction.
+pub async fn type_hierarchy(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+    direction: TypeHierarchyDirection,
+) -> Result<TypeHierarchyResult, LspClientError> {
+    ensure_document_current(client, path).await?;
+    let uri = path_to_uri(path)?;
+    let prepare = TypeHierarchyPrepareParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position {
+                line,
+                character: col,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
     };
-    let result = client.request::<GotoDefinition>(params).await?;
-    Ok(match result {
+    let origin_items = client
+        .request::<TypeHierarchyPrepare>(prepare)
+        .await?
+        .unwrap_or_default();
+
+    let want_super = matches!(
+        direction,
+        TypeHierarchyDirection::Supertypes | TypeHierarchyDirection::Both
+    );
+    let want_sub = matches!(
+        direction,
+        TypeHierarchyDirection::Subtypes | TypeHierarchyDirection::Both
+    );
+
+    let mut supertypes = if want_super { Some(Vec::new()) } else { None };
+    let mut subtypes = if want_sub { Some(Vec::new()) } else { None };
+
+    for item in &origin_items {
+        if let Some(supers) = supertypes.as_mut() {
+            let params = TypeHierarchySupertypesParams {
+                item: item.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            let result = client
+                .request::<TypeHierarchySupertypes>(params)
+                .await?
+                .unwrap_or_default();
+            supers.extend(result.iter().map(type_hierarchy_hit));
+        }
+        if let Some(subs) = subtypes.as_mut() {
+            let params = TypeHierarchySubtypesParams {
+                item: item.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            let result = client
+                .request::<TypeHierarchySubtypes>(params)
+                .await?
+                .unwrap_or_default();
+            subs.extend(result.iter().map(type_hierarchy_hit));
+        }
+    }
+
+    Ok(TypeHierarchyResult {
+        origin: origin_items.iter().map(type_hierarchy_hit).collect(),
+        supertypes,
+        subtypes,
+    })
+}
+
+fn type_hierarchy_hit(item: &TypeHierarchyItem) -> TypeHierarchyHit {
+    TypeHierarchyHit {
+        name: item.name.clone(),
+        kind: symbol_kind_name(item.kind),
+        detail: item.detail.clone(),
+        uri: item.uri.to_string(),
+        start_line: item.selection_range.start.line,
+        start_col: item.selection_range.start.character,
+        end_line: item.selection_range.end.line,
+        end_col: item.selection_range.end.character,
+    }
+}
+
+fn goto_response_to_hits(result: Option<GotoDefinitionResponse>) -> Vec<LocationHit> {
+    match result {
         None => Vec::new(),
         Some(GotoDefinitionResponse::Scalar(loc)) => vec![location_hit(&loc)],
         Some(GotoDefinitionResponse::Array(locs)) => locs.iter().map(location_hit).collect(),
@@ -149,7 +328,7 @@ pub async fn definition(
                 enclosing_symbol: None,
             })
             .collect(),
-    })
+    }
 }
 
 /// Open or refresh `path` and return the symbol references at `(line, col)`.

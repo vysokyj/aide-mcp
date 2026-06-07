@@ -349,6 +349,22 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LspTypeHierarchyArgs {
+    /// Absolute path to the source file.
+    pub file: String,
+    /// 0-indexed line number.
+    pub line: u32,
+    /// 0-indexed UTF-16 column within the line.
+    pub column: u32,
+    /// Direction to walk: `"supertypes"`, `"subtypes"`, or `"both"`. Defaults to `"both"`.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LspWorkspaceSymbolsArgs {
     /// Fuzzy query string (empty string = return all top-level symbols).
     pub query: String,
@@ -1565,6 +1581,103 @@ impl AideServer {
                     .await;
                 to_json(&hits)
             }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP goto-implementation: for the symbol at (file, line, column), return every concrete implementation site. For trait methods and interface members this returns every implementor — what `lsp_definition` on a trait method cannot answer."
+    )]
+    async fn lsp_implementations(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::implementations(&client, &file, args.line, args.column).await {
+            Ok(mut hits) => {
+                self.annotate_location_hits_with_scip(&root, &mut hits)
+                    .await;
+                to_json(&hits)
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP goto-declaration: for the symbol at (file, line, column), return the declaration location(s). Distinct from `lsp_definition` for languages that separate forward declarations from definitions — most notably C/C++ headers and TypeScript ambient `declare` blocks. For Rust the result is usually identical to `lsp_definition`."
+    )]
+    async fn lsp_declaration(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::declaration(&client, &file, args.line, args.column).await {
+            Ok(mut hits) => {
+                self.annotate_location_hits_with_scip(&root, &mut hits)
+                    .await;
+                to_json(&hits)
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "LSP type hierarchy: prepare a type hierarchy at (file, line, column) and resolve supertypes / subtypes. `direction` is one of `\"supertypes\"`, `\"subtypes\"`, `\"both\"` (default). Returns `{origin, supertypes?, subtypes?}` where `origin` is the resolved type(s) at the cursor and the other two lists are populated only for the directions requested."
+    )]
+    async fn lsp_type_hierarchy(
+        &self,
+        Parameters(args): Parameters<LspTypeHierarchyArgs>,
+    ) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let direction = match args.direction.as_deref().unwrap_or("both") {
+            "supertypes" => aide_lsp::ops::TypeHierarchyDirection::Supertypes,
+            "subtypes" => aide_lsp::ops::TypeHierarchyDirection::Subtypes,
+            "both" => aide_lsp::ops::TypeHierarchyDirection::Both,
+            other => {
+                return error_json(format!(
+                    "unknown direction `{other}`; expected supertypes / subtypes / both"
+                ));
+            }
+        };
+
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        match lsp_ops::type_hierarchy(&client, &file, args.line, args.column, direction).await {
+            Ok(result) => to_json(&result),
             Err(e) => error_json(e.to_string()),
         }
     }

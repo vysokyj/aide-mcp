@@ -90,6 +90,9 @@ First query after opening a fresh workspace may return `null` — retry in
 |---|---|---|
 | `lsp_hover(file, line, column, root?)` | — | Hover text, or null. |
 | `lsp_definition(file, line, column, root?)` | — | Jump-to-definition. |
+| `lsp_declaration(file, line, column, root?)` | — | Jump-to-declaration. Distinct from `lsp_definition` for C/C++ forward decls and TS ambient `declare` blocks; usually identical for Rust. |
+| `lsp_implementations(file, line, column, root?)` | — | Every concrete implementor of a trait method / interface member. What `lsp_definition` can't answer when the cursor is on a trait method. |
+| `lsp_type_hierarchy(file, line, column, direction?, root?)` | — | Supertypes / subtypes / both for the type at the cursor. Returns `{origin, supertypes?, subtypes?}`; direction defaults to `"both"`. |
 | `lsp_references(file, line, column, include_declaration?, root?)` | `grep <name>` | All call sites, semantically scoped. |
 | `lsp_document_symbols(file, root?)` | — | Hierarchical outline of one file. |
 | `lsp_workspace_symbols(query, root?)` | `grep` for a name | Fuzzy symbol search. Empty query = top-level symbols. |
