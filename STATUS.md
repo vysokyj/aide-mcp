@@ -53,6 +53,35 @@ decisions, roadmap, current state — is mirrored here.
 | v0.20.1   | Read-only system process listing: `process_list(name_filter?, limit?)` over `sysinfo` 0.33, scoped to the current user's processes, with a case-insensitive name-substring filter and a result cap (default 200). Returns `{pid, name, exe, cmd, cwd, started_at_unix, memory_bytes, cpu_percent, status}` per process, sorted by PID ascending. Complements v0.20 by answering "which PID is the running aide-mcp?" without a Bash shell-out to `ps`. Generic `process_kill(pid)` remains explicitly rejected — Bash escape hatch stays for that. | ✅ done |
 | v0.21     | PR workflow — four MCP tools (`gh_pr_create`, `gh_pr_view`, `gh_pr_list`, `gh_pr_checks`). `gh_pr_create` auto-detects `head` from the current git branch (new `aide_git::current_branch` helper) and `base` from the repo's configured default branch (new `get_repo` client method). `gh_pr_checks` bundles PR → head SHA → check-runs in one tool call. New types in `aide-github`: `PullRequest` + `Branch` + `PullRequestCreate` + `PullRequestListFilter` + `Repo` + `CheckRun` + `CheckRunsResponse`. Reuses `IssueState` for state filtering so the same "open/closed/all" parsing applies. | ✅ done — PR review comments, merge / reopen actions, fine-grained commits-in-PR view deferred to later if dogfood surfaces need |
 | v0.22     | SCIP↔LSP enrichment parity: `lsp_diagnostics`, `lsp_references`, `lsp_definition`, `safe_edit`, and `task_context` diagnostics now carry `enclosing_symbol` from the latest Ready SCIP index — same trick that already enriched `project_grep` and `run_*` diagnostics. Closes the inconsistency where some location/diagnostic results reached the agent semantically tagged and others didn't. | ✅ done |
+| v0.23     | LSP query primitives parity with serena: `lsp_implementations` (`textDocument/implementation`), `lsp_declaration` (`textDocument/declaration`, distinct from definition for forward-declared C/C++ and TS ambient decls), `lsp_type_hierarchy` (`textDocument/prepareTypeHierarchy` + `typeHierarchy/supertypes`/`subtypes`). All three carry the v0.22 `enclosing_symbol` annotation. Closes the obvious LSP query gap surfaced by the serena comparison. | ⏳ planned |
+| v0.24     | Symbolic edit primitives: `replace_symbol_body(symbol_id, body)`, `insert_before_symbol(symbol_id, content)`, `insert_after_symbol(symbol_id, content)`, `safe_delete_symbol(symbol_id)`. Symbol → file range resolved via SCIP `Occurrence.range` (fallback: LSP `documentSymbol`); apply path reuses `safe_edit`'s diagnostic-delta wrap so every write returns the classified before/after diagnostic diff. `safe_delete_symbol` preflights `scip_references` and refuses with the reference list if any call sites remain. Fills the write-side gap the serena comparison flagged. | ⏳ planned |
+| v0.25     | `project_onboard(path?)` aggregate — one MCP call returns: detected languages (`project_detect`), public API digest (`project_map`), README excerpt (first ~2 KB), recent commits (`git_log` limit 10), test entry points (test discovery from each plugin), build/config files (Cargo.toml / package.json / go.mod / pom.xml / etc.), and the indexer state for HEAD. Replaces the 5–8 round-trips an agent burns when arriving at a new repo. Pure composition over existing tools, no new backend. | ⏳ planned |
+| v0.26     | Memory tools as MCP: `memory_write`, `memory_read`, `memory_list`, `memory_delete`, `memory_rename`, `memory_edit` (regex-based content edit) over `~/.aide/memory/<project_slug>/`. Each memory is a markdown file with name + description frontmatter. For Claude Code this duplicates host-level memory; the point is portability for Codex / Cursor / custom agents without a built-in memory layer. | ⏳ planned |
+| v0.27     | HTTP transport — rmcp 1.5's HTTP/SSE mode behind a `--http :PORT` CLI flag (default stays stdio). One `AideServer` instance shared across HTTP sessions; per-call MCP progress notifications flow over the SSE stream. Enables shared / remote / CI deployments. Session lifetime: per HTTP connection; daemon-style state (indexer, LSP pool) persists across sessions inside the single server process. | ⏳ planned |
+| v0.28     | Contexts and modes — `~/.aide/config.toml` gains `[context.<name>]` sections with `enabled_tools` / `disabled_tools` (glob match against tool name). Selected via `--context=<name>` CLI flag at server start, hot-reloads with the rest of the config. Lets one binary serve different client profiles (e.g. Claude Code wants the lot, a code-review bot wants only read tools). | ⏳ planned |
+| v0.29     | Multi-project query — `~/.aide/config.toml` gains `[project.<name>]` with `path =` entries; new `projects_list()` enumerates them and `query_project(name, tool, args)` runs a whitelisted read-only tool against the named project's root. Helps monorepos and cross-project navigation. Whitelist is hardcoded to read-only tools — no `safe_edit` / `run_*` / `install_package` cross-project. | ⏳ planned |
+| v0.30     | Web dashboard — minimal browser UI served by the same HTTP transport (v0.27): live tool call log (tail of recent invocations), config view (read-only), project switcher, indexer status, exec log links. Static HTML + small JS, no SPA framework. Lowest priority of the serena-parity batch; defer indefinitely if v0.23–v0.29 ship and no user asks. | ⏳ planned |
+
+### Why this order
+
+Each milestone is ranked by ROI (how much agent friction it removes
+per unit of implementation cost), then by dependency. v0.23 is first
+because it is the smallest possible win — three near-copy-paste LSP
+methods using existing plumbing — and closes a gap any side-by-side
+comparison with serena makes obvious. v0.24 is the biggest write-side
+correctness win still missing from aide; it depends on v0.23's
+plumbing patterns but not on its output. v0.25 is pure composition
+over what already exists and benefits every onboarding flow. The
+back half (v0.26–v0.30) is gated on a second real client appearing
+that isn't Claude Code — none of memory / HTTP / contexts /
+multi-project / dashboard moves the needle for the current dogfood
+loop. Land v0.23–v0.25 first, then let usage decide whether the
+back half is real demand or speculation.
+
+The earlier "hold and let the dogfood loop tell us what to pick up
+next" stance from the v0.22 retrospective is now superseded for the
+v0.23–v0.25 trio (serena comparison provided the evidence the
+dogfood loop hadn't yet). v0.26–v0.30 remain dogfood-gated.
 
 ## Workspace layout
 
@@ -383,27 +412,25 @@ commit clean. Each one has a concrete blocker — none is "we forgot."
 ### Proposed next milestone
 
 The v0.8–v0.22 batch plus v0.13.1 and v0.13.2 all shipped. The
-remaining deferrals (`run_cargo_expand`, pull-diagnostics refinement,
-dogfood CI, `js-debug` DAP for Node, `debugpy` DAP for Python,
-`delve` DAP for Go, `gopls` auto-install, C/C++ compile-database
-auto-generation) are each gated on evidence that isn't yet in the
-repo — a run that demands whole-module macro expansion, a
-safe_edit call whose fixed wait genuinely misses reanalysis, enough
-dogfood runs to make CI worthwhile, a real project where debugging
-is the friction, a second ecosystem (Ruby gems, Haskell cabal) that
-needs `<lang> install`-style auto-install and would justify
-extending aide-install with a `Source::Custom` variant, or a C/C++
-project where asking the user to run `cmake
--DCMAKE_EXPORT_COMPILE_COMMANDS=ON` is the main friction. Rather
-than speculate, hold and let the dogfood loop tell us what to pick
-up next.
+**next planned batch is v0.23–v0.30** — see the roadmap table
+above and `docs/COMPARISON-SERENA.md` for the evidence trail.
+Start with **v0.23** (three near-trivial LSP query methods)
+because it is the smallest possible win and closes a gap any
+side-by-side comparison with serena makes obvious.
+
+The earlier deferrals (`run_cargo_expand`, pull-diagnostics
+refinement, dogfood CI, `js-debug` DAP for Node, `debugpy` DAP
+for Python, `delve` DAP for Go, `gopls` auto-install, C/C++
+compile-database auto-generation) remain dogfood-gated — each
+one needs a real run that demands it. Hold on those.
 
 A good next *research* pass (not implementation) is a paired
 benchmark over a real multi-file refactor — something that
 exercises rename, apply_code_action, and safe_edit end-to-end —
 to see whether the write-side trio actually bends the
-tool-call-count curve on the aide side. That's the kind of data
-that justifies picking one of the remaining deferrals.
+tool-call-count curve on the aide side. That data also informs
+v0.24's symbolic-edit primitives: if `safe_edit` already wins
+on its own, the symbolic layer is less urgent.
 
 ### Legacy open items
 
