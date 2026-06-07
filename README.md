@@ -79,6 +79,10 @@ and how to install packages.
 Full MCP tool catalogue — cheat sheet, per-category tables with Bash
 equivalents, LSP vs SCIP model — lives in [docs/TOOLS.md](docs/TOOLS.md).
 
+Comparison with the closest competing project,
+[oraios/serena](https://github.com/oraios/serena), is in
+[docs/COMPARISON-SERENA.md](docs/COMPARISON-SERENA.md).
+
 ## Quick start
 
 ```bash
