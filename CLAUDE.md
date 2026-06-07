@@ -62,12 +62,6 @@ unless there is a real reason (see below).
 - Commit messages describe **why**, not what (the diff shows what). Follow
   the style of existing history: imperative mood, first line ≤72 chars,
   body wrapping at ~72.
-- Every commit ends with:
-
-  ```
-  Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-  ```
-
 - Never `--force`, never `--no-verify`. If a hook fails, fix the underlying
   issue and create a new commit.
 
@@ -116,8 +110,8 @@ The diff already shows what; commit messages and STATUS.md already show where.
 
 - `*.md` docs: only on explicit user request. The user owns documentation
   scope.
-- `tmp/` is gitignored for scratch files; use it, not `/tmp`, when the
-  content is project-related.
+- `_local/` is gitignored (global `~/.config/git/ignore`) for scratch
+  files; use it, not `/tmp`, when the content is project-related.
 - Never commit `.env`, credentials, or large binaries. `target/` is
   gitignored.
 

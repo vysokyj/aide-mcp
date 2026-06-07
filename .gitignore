@@ -8,6 +8,3 @@ Cargo.lock.bak
 
 # OS
 .DS_Store
-
-# Project temp
-/tmp
