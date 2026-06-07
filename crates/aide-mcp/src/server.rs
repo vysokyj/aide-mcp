@@ -626,6 +626,19 @@ pub struct TaskContextArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectOnboardArgs {
+    /// Project root. If omitted, falls back to the server cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// How many recent commits to include. Defaults to 10.
+    #[serde(default)]
+    pub history_limit: Option<usize>,
+    /// Cap on README excerpt size in bytes. Defaults to 2048 (~2 KB).
+    #[serde(default)]
+    pub readme_bytes: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RunProjectArgs {
     /// Project root. If omitted, falls back to the server cwd.
     #[serde(default)]
@@ -1279,6 +1292,102 @@ fn range_from_args(
         character: end_column.unwrap_or(column),
     };
     lsp_types::Range { start, end }
+}
+
+/// Well-known build / config files per language id. Used by
+/// `project_onboard` to surface "what controls this build" without
+/// asking the agent to grep for it. Polyglot repos overlap across
+/// multiple ids — `project_onboard` dedupes after collecting.
+fn known_config_files(lang_id: &str) -> &'static [&'static str] {
+    match lang_id {
+        "rust" => &[
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+        ],
+        "node" => &[
+            "package.json",
+            "package-lock.json",
+            "tsconfig.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "deno.json",
+        ],
+        "python" => &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+            "Pipfile",
+            "Pipfile.lock",
+            "uv.lock",
+        ],
+        "go" => &["go.mod", "go.sum", "go.work"],
+        "java-maven" => &["pom.xml", ".mvn/maven.config"],
+        "java-gradle" => &[
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradle.properties",
+        ],
+        "cpp" => &[
+            "CMakeLists.txt",
+            "compile_commands.json",
+            "meson.build",
+            "Makefile",
+            "conanfile.txt",
+            "conanfile.py",
+            ".clangd",
+        ],
+        _ => &[],
+    }
+}
+
+/// Try a small ordered list of conventional README filenames at
+/// `root` and return the first that exists, capped at `max_bytes`
+/// UTF-8 bytes (clamped to a char boundary). Returns the relative
+/// filename so the caller can fetch the full text via `Read` if it
+/// wants more than the excerpt.
+fn read_readme_excerpt(root: &std::path::Path, max_bytes: usize) -> Option<serde_json::Value> {
+    const CANDIDATES: &[&str] = &[
+        "README.md",
+        "readme.md",
+        "README",
+        "README.txt",
+        "README.rst",
+        "Readme.md",
+    ];
+    for name in CANDIDATES {
+        let p = root.join(name);
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(full) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let total = full.len();
+        let (excerpt, truncated) = if total > max_bytes {
+            let mut cut = max_bytes;
+            while cut > 0 && !full.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            (full[..cut].to_string(), true)
+        } else {
+            (full, false)
+        };
+        return Some(serde_json::json!({
+            "path": *name,
+            "excerpt": excerpt,
+            "truncated": truncated,
+            "total_bytes": total,
+        }));
+    }
+    None
 }
 
 #[tool_router]
@@ -2470,6 +2579,95 @@ impl AideServer {
     }
 
     #[tool(
+        description = "One-call orientation digest for arriving at a project: detected languages, README excerpt (first ~2 KB), build/config files at the root, branch + HEAD SHA, last `history_limit` commits (default 10), indexer state for HEAD, project_map of public symbols, and a flat list of test entry points (plugin's is_test_symbol over the project_map). Each sub-query is best-effort — missing pieces become null / empty without failing the whole call. Replaces 5–8 round-trips an agent typically burns when starting fresh on a repo."
+    )]
+    async fn project_onboard(&self, Parameters(args): Parameters<ProjectOnboardArgs>) -> String {
+        let root = resolve_root(args.path);
+        let history_limit = args.history_limit.unwrap_or(10);
+        let readme_bytes = args.readme_bytes.unwrap_or(2048);
+
+        let mut ctx = serde_json::json!({
+            "root": root.display().to_string(),
+            "languages": Vec::<String>::new(),
+            "branch": serde_json::Value::Null,
+            "head_sha": serde_json::Value::Null,
+            "readme": serde_json::Value::Null,
+            "config_files": Vec::<String>::new(),
+            "recent_commits": Vec::<serde_json::Value>::new(),
+            "indexer_state": serde_json::Value::Null,
+            "indexer_head_sha": serde_json::Value::Null,
+            "project_map": Vec::<serde_json::Value>::new(),
+            "test_entry_points": Vec::<serde_json::Value>::new(),
+        });
+
+        let plugins = self.registry.detect(&root);
+        let language_ids: Vec<String> = plugins
+            .iter()
+            .map(|p| p.id().as_str().to_string())
+            .collect();
+        ctx["languages"] = serde_json::to_value(&language_ids).unwrap_or_default();
+
+        let mut config_files = Vec::new();
+        for lang_id in &language_ids {
+            for name in known_config_files(lang_id) {
+                if root.join(name).exists() {
+                    config_files.push((*name).to_string());
+                }
+            }
+        }
+        config_files.sort();
+        config_files.dedup();
+        ctx["config_files"] = serde_json::to_value(config_files).unwrap_or_default();
+
+        if let Some(readme) = read_readme_excerpt(&root, readme_bytes) {
+            ctx["readme"] = serde_json::to_value(readme).unwrap_or_default();
+        }
+
+        if let Ok(Some(branch)) = aide_git::current_branch(&root) {
+            ctx["branch"] = serde_json::Value::String(branch);
+        }
+        if let Ok((_resolved, sha)) = aide_git::resolve_head(&root) {
+            ctx["head_sha"] = serde_json::Value::String(sha);
+        }
+        if let Ok(commits) = aide_git::log::log(&root, history_limit) {
+            ctx["recent_commits"] = serde_json::to_value(commits).unwrap_or_default();
+        }
+
+        let repo_root = root.display().to_string();
+        if let Some(info) = self.indexer.last_ready(&repo_root).await {
+            ctx["indexer_state"] = serde_json::Value::String(format!("{:?}", info.state));
+            ctx["indexer_head_sha"] = serde_json::Value::String(info.sha);
+        }
+
+        if let Ok(index_path) = self.resolve_scip_path(&repo_root, None).await {
+            if let Ok(idx) = aide_scip::load(&index_path) {
+                let map = aide_scip::project_map(&idx, &[]);
+
+                if let Some(plugin) = plugins.first() {
+                    let mut tests = Vec::new();
+                    for module in &map {
+                        for sym in &module.symbols {
+                            if plugin.is_test_symbol(&module.relative_path, &sym.display_name) {
+                                tests.push(serde_json::json!({
+                                    "symbol": sym.symbol,
+                                    "display_name": sym.display_name,
+                                    "kind": sym.kind,
+                                    "relative_path": module.relative_path,
+                                    "line": sym.line,
+                                }));
+                            }
+                        }
+                    }
+                    ctx["test_entry_points"] = serde_json::Value::Array(tests);
+                }
+                ctx["project_map"] = serde_json::to_value(map).unwrap_or_default();
+            }
+        }
+
+        to_json(&ctx)
+    }
+
+    #[tool(
         description = "Run the project via the language plugin's runner (e.g. `cargo run`) and return the full stdout + stderr. Captures up to 1 MB per stream. Default timeout 300s; override with timeout_secs. When the plugin has a structured-output parser (Rust: cargo JSON), the response also contains a `diagnostics` array — each entry tagged with its enclosing SCIP symbol when an index is Ready."
     )]
     async fn run_project(
@@ -3570,4 +3768,72 @@ fn spawn_config_reloader(
 
 fn file_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+#[cfg(test)]
+mod onboard_tests {
+    use super::{known_config_files, read_readme_excerpt};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn known_config_files_covers_rust() {
+        let names = known_config_files("rust");
+        assert!(names.contains(&"Cargo.toml"));
+    }
+
+    #[test]
+    fn known_config_files_polyglot_empty_for_unknown() {
+        assert!(known_config_files("ada-spark").is_empty());
+    }
+
+    #[test]
+    fn readme_excerpt_picks_first_existing_candidate() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), "hello world\n").unwrap();
+        let v = read_readme_excerpt(dir.path(), 2048).expect("README.md should be found");
+        assert_eq!(v["path"], "README.md");
+        assert_eq!(v["excerpt"], "hello world\n");
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["total_bytes"], 12);
+    }
+
+    #[test]
+    fn readme_excerpt_returns_none_when_absent() {
+        let dir = tempdir().unwrap();
+        assert!(read_readme_excerpt(dir.path(), 2048).is_none());
+    }
+
+    #[test]
+    fn readme_excerpt_truncates_to_cap() {
+        let dir = tempdir().unwrap();
+        let big = "x".repeat(5000);
+        fs::write(dir.path().join("README.md"), &big).unwrap();
+        let v = read_readme_excerpt(dir.path(), 2048).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total_bytes"], 5000);
+        assert_eq!(v["excerpt"].as_str().unwrap().len(), 2048);
+    }
+
+    #[test]
+    fn readme_excerpt_respects_utf8_char_boundary() {
+        let dir = tempdir().unwrap();
+        // 'é' is two bytes — cap at an odd byte should pull back to a
+        // char boundary, not panic.
+        let s = "héllo".repeat(2000);
+        fs::write(dir.path().join("README.md"), &s).unwrap();
+        let v = read_readme_excerpt(dir.path(), 101).unwrap();
+        let excerpt = v["excerpt"].as_str().unwrap();
+        assert!(excerpt.is_char_boundary(excerpt.len()));
+        assert!(excerpt.len() <= 101);
+    }
+
+    #[test]
+    fn readme_excerpt_prefers_uppercase_over_lowercase_filename() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), "uppercase\n").unwrap();
+        fs::write(dir.path().join("readme.md"), "lowercase\n").unwrap();
+        let v = read_readme_excerpt(dir.path(), 2048).unwrap();
+        assert_eq!(v["path"], "README.md");
+    }
 }

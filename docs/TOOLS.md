@@ -117,6 +117,7 @@ LSP: LSP is live, SCIP is stable with a full pre-computed call graph. If
 | Tool | Replaces | What it does |
 |---|---|---|
 | `task_context(file, history_limit?)` | `lsp_document_symbols` + `lsp_diagnostics` + `git_diff` + `git_log` + SCIP top-level | One call to orient around a file. Partial failure (LSP cold, no SCIP Ready) leaves that field null/empty; the rest stays valid. |
+| `project_onboard(path?, history_limit?, readme_bytes?)` | `project_detect` + README probe + `git_log` + `project_map` + indexer status + test discovery | One call to orient around a whole repo: detected languages, README excerpt (capped at `readme_bytes`, default 2 KB, UTF-8-safe), build/config files at root, branch + HEAD SHA, last 10 commits, indexer state for HEAD, public symbol digest, and a flat list of test entry points (plugin `is_test_symbol` over the digest). Every sub-query best-effort. |
 | `project_map(kinds?, sha?)` | `grep 'pub fn' / 'class '` | Public-API digest from the last Ready SCIP: per-document top-level symbols (name, kind, definition line). Filter by kinds `[Function, Struct, Enum, Trait, Class, Method, …]`. |
 
 ## Test discovery
