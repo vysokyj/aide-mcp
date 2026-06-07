@@ -451,12 +451,34 @@ pub async fn safe_edit(
         });
     }
 
+    let after_contents = before_contents.replacen(old_string, new_string, 1);
+    apply_and_snapshot(client, path, after_contents, related_paths, settle).await
+}
+
+/// Write `after_contents` to `path`, push the change to the LSP server,
+/// wait `settle`, and return the published-diagnostic delta across
+/// `path` plus `related_paths` (snapshot taken just before the write,
+/// then again after the settle).
+///
+/// Shared backend for [`safe_edit`] and the four symbolic-edit ops
+/// (`replace_symbol_body` / `insert_before_symbol` /
+/// `insert_after_symbol` / `delete_symbol_range`). The caller is
+/// responsible for computing `after_contents` — this fn only handles
+/// the apply + snapshot dance.
+async fn apply_and_snapshot(
+    client: &LspClient,
+    path: &Path,
+    after_contents: String,
+    related_paths: &[std::path::PathBuf],
+    settle: Duration,
+) -> Result<SafeEditReport, LspClientError> {
+    ensure_document_current(client, path).await?;
+
     let all_paths: Vec<std::path::PathBuf> = std::iter::once(path.to_path_buf())
         .chain(related_paths.iter().cloned())
         .collect();
     let before = snapshot_published_diagnostics(client, &all_paths).await?;
 
-    let after_contents = before_contents.replacen(old_string, new_string, 1);
     tokio::fs::write(path, &after_contents)
         .await
         .map_err(LspClientError::from_io)?;
@@ -482,7 +504,6 @@ pub async fn safe_edit(
         client.notify::<DidChangeTextDocument>(params).await?;
     } else {
         drop(docs);
-        // File wasn't open yet; ensure_document_current at next read.
     }
 
     tokio::time::sleep(settle).await;
@@ -604,6 +625,228 @@ pub struct SafeEditReport {
     /// when the report is non-trivial.
     pub confidence: String,
     pub settle_ms: u64,
+}
+
+/// Replace the full definition of the symbol that owns `(line, col)`
+/// in `path` with `new_body`. Range is resolved via LSP `documentSymbol`
+/// — the deepest symbol whose `selection_range` or `range` contains
+/// the position wins. The replacement covers the symbol's full
+/// `range` (signature + body), so the caller must supply the complete
+/// new definition.
+pub async fn replace_symbol_body(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+    new_body: &str,
+    related_paths: &[std::path::PathBuf],
+    settle: Duration,
+) -> Result<SafeEditReport, LspClientError> {
+    let (range, _name) = require_symbol_at(client, path, line, col).await?;
+    let before = tokio::fs::read_to_string(path)
+        .await
+        .map_err(LspClientError::from_io)?;
+    let after = splice_range(&before, range, new_body, path)?;
+    apply_and_snapshot(client, path, after, related_paths, settle).await
+}
+
+/// Insert `content` immediately before the start of the symbol that
+/// owns `(line, col)`. Caller controls newlines — supply a trailing
+/// `\n` if the new content should sit on its own line.
+pub async fn insert_before_symbol(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+    content: &str,
+    related_paths: &[std::path::PathBuf],
+    settle: Duration,
+) -> Result<SafeEditReport, LspClientError> {
+    let (range, _name) = require_symbol_at(client, path, line, col).await?;
+    let before = tokio::fs::read_to_string(path)
+        .await
+        .map_err(LspClientError::from_io)?;
+    let start = position_to_byte_offset(&before, range.start).ok_or_else(|| invalid_pos(path))?;
+    let mut after = String::with_capacity(before.len() + content.len());
+    after.push_str(&before[..start]);
+    after.push_str(content);
+    after.push_str(&before[start..]);
+    apply_and_snapshot(client, path, after, related_paths, settle).await
+}
+
+/// Insert `content` immediately after the end of the symbol that owns
+/// `(line, col)`. Caller controls newlines.
+pub async fn insert_after_symbol(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+    content: &str,
+    related_paths: &[std::path::PathBuf],
+    settle: Duration,
+) -> Result<SafeEditReport, LspClientError> {
+    let (range, _name) = require_symbol_at(client, path, line, col).await?;
+    let before = tokio::fs::read_to_string(path)
+        .await
+        .map_err(LspClientError::from_io)?;
+    let end = position_to_byte_offset(&before, range.end).ok_or_else(|| invalid_pos(path))?;
+    let mut after = String::with_capacity(before.len() + content.len());
+    after.push_str(&before[..end]);
+    after.push_str(content);
+    after.push_str(&before[end..]);
+    apply_and_snapshot(client, path, after, related_paths, settle).await
+}
+
+/// Delete the full definition of the symbol that owns `(line, col)`.
+/// Does NOT trim surrounding blank lines — the caller can clean up
+/// with a follow-up `safe_edit` if needed. The reference-safety check
+/// (refuse if call sites remain) lives at the MCP layer where SCIP
+/// is available; this op is the raw delete.
+pub async fn delete_symbol_range(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+    related_paths: &[std::path::PathBuf],
+    settle: Duration,
+) -> Result<SafeEditReport, LspClientError> {
+    let (range, _name) = require_symbol_at(client, path, line, col).await?;
+    let before = tokio::fs::read_to_string(path)
+        .await
+        .map_err(LspClientError::from_io)?;
+    let after = splice_range(&before, range, "", path)?;
+    apply_and_snapshot(client, path, after, related_paths, settle).await
+}
+
+/// Locate the deepest LSP `DocumentSymbol` whose `selection_range`
+/// (and failing that, full `range`) contains `(line, col)`. Returns
+/// the symbol's full `range` and its `name`.
+pub async fn locate_symbol(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+) -> Result<Option<(Range, String)>, LspClientError> {
+    ensure_document_current(client, path).await?;
+    let uri = path_to_uri(path)?;
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let response = client.request::<DocumentSymbolRequest>(params).await?;
+    let symbols = match response {
+        Some(DocumentSymbolResponse::Nested(syms)) => syms,
+        Some(DocumentSymbolResponse::Flat(_)) | None => return Ok(None),
+    };
+    let position = Position {
+        line,
+        character: col,
+    };
+    Ok(find_enclosing_symbol(&symbols, position))
+}
+
+async fn require_symbol_at(
+    client: &LspClient,
+    path: &Path,
+    line: u32,
+    col: u32,
+) -> Result<(Range, String), LspClientError> {
+    locate_symbol(client, path, line, col)
+        .await?
+        .ok_or_else(|| LspClientError::LspError {
+            code: -32_000,
+            message: format!(
+                "no symbol at {}:{}:{} (LSP documentSymbol returned no enclosing node)",
+                path.display(),
+                line + 1,
+                col + 1
+            ),
+        })
+}
+
+fn find_enclosing_symbol(syms: &[DocumentSymbol], position: Position) -> Option<(Range, String)> {
+    for sym in syms {
+        let in_range = position_in_range(position, sym.range);
+        if !in_range && !position_in_range(position, sym.selection_range) {
+            continue;
+        }
+        if let Some(children) = &sym.children {
+            if let Some(deeper) = find_enclosing_symbol(children, position) {
+                return Some(deeper);
+            }
+        }
+        return Some((sym.range, sym.name.clone()));
+    }
+    None
+}
+
+fn position_in_range(pos: Position, range: Range) -> bool {
+    let after_start = pos.line > range.start.line
+        || (pos.line == range.start.line && pos.character >= range.start.character);
+    let before_end = pos.line < range.end.line
+        || (pos.line == range.end.line && pos.character <= range.end.character);
+    after_start && before_end
+}
+
+fn splice_range(
+    content: &str,
+    range: Range,
+    replacement: &str,
+    path: &Path,
+) -> Result<String, LspClientError> {
+    let start = position_to_byte_offset(content, range.start).ok_or_else(|| invalid_pos(path))?;
+    let end = position_to_byte_offset(content, range.end).ok_or_else(|| invalid_pos(path))?;
+    if end < start {
+        return Err(invalid_pos(path));
+    }
+    let mut out = String::with_capacity(content.len() + replacement.len() - (end - start));
+    out.push_str(&content[..start]);
+    out.push_str(replacement);
+    out.push_str(&content[end..]);
+    Ok(out)
+}
+
+fn invalid_pos(path: &Path) -> LspClientError {
+    LspClientError::LspError {
+        code: -32_000,
+        message: format!(
+            "could not map LSP position to byte offset in {} — file may have changed since the LSP query",
+            path.display()
+        ),
+    }
+}
+
+/// Convert an LSP `Position` (0-based line + UTF-16 column) to a
+/// UTF-8 byte offset in `content`. Returns `None` when `position`
+/// is past the end of the file. Multi-byte chars on the target line
+/// are honoured via `len_utf16` accumulation.
+fn position_to_byte_offset(content: &str, position: Position) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut line_start = 0;
+    let mut current_line = 0u32;
+    while current_line < position.line {
+        let nl = bytes.iter().skip(line_start).position(|&b| b == b'\n')?;
+        line_start += nl + 1;
+        current_line += 1;
+    }
+    if line_start > bytes.len() {
+        return None;
+    }
+    let line_str = &content[line_start..];
+    let mut utf16_offset = 0u32;
+    let mut byte_in_line = 0;
+    for c in line_str.chars() {
+        if utf16_offset >= position.character {
+            break;
+        }
+        if c == '\n' {
+            break;
+        }
+        utf16_offset += u32::try_from(c.len_utf16()).unwrap_or(2);
+        byte_in_line += c.len_utf8();
+    }
+    Some(line_start + byte_in_line)
 }
 
 /// Rename the symbol at `(line, col)` to `new_name` across the
@@ -1384,6 +1627,118 @@ mod edit_tests {
         let text = "abc\n";
         let edits = vec![edit(pos(10, 0), pos(10, 3), "X")];
         assert_eq!(apply_text_edits(text, &edits), "abc\n");
+    }
+}
+
+#[cfg(test)]
+mod symbol_edit_tests {
+    use super::{
+        find_enclosing_symbol, position_to_byte_offset, splice_range, DocumentSymbol, Position,
+        Range, SymbolKind,
+    };
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    fn range(start: Position, end: Position) -> Range {
+        Range { start, end }
+    }
+
+    fn sym(name: &str, sel: Range, full: Range, children: Vec<DocumentSymbol>) -> DocumentSymbol {
+        #[allow(deprecated)]
+        DocumentSymbol {
+            name: name.to_string(),
+            detail: None,
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: None,
+            range: full,
+            selection_range: sel,
+            children: if children.is_empty() {
+                None
+            } else {
+                Some(children)
+            },
+        }
+    }
+
+    #[test]
+    fn position_to_byte_handles_ascii_lines() {
+        let content = "fn foo() {\n    bar();\n}\n";
+        // Start of line 1 ("    bar();") = byte 11
+        assert_eq!(position_to_byte_offset(content, pos(1, 0)), Some(11));
+        // Column 4 on line 1 ("bar()") = byte 15
+        assert_eq!(position_to_byte_offset(content, pos(1, 4)), Some(15));
+        // End of file: line 3 col 0
+        assert_eq!(position_to_byte_offset(content, pos(3, 0)), Some(24));
+    }
+
+    #[test]
+    fn position_to_byte_returns_none_past_eof() {
+        let content = "a\nb\n";
+        assert_eq!(position_to_byte_offset(content, pos(10, 0)), None);
+    }
+
+    #[test]
+    fn position_to_byte_honours_utf16_columns() {
+        // "héllo" — 'é' is one char, 1 UTF-16 unit, 2 UTF-8 bytes.
+        // Column 2 (after 'h' + 'é') should land at byte 3.
+        let content = "héllo\n";
+        assert_eq!(position_to_byte_offset(content, pos(0, 2)), Some(3));
+    }
+
+    #[test]
+    fn find_enclosing_picks_deepest_match() {
+        let outer = sym(
+            "Foo",
+            range(pos(0, 5), pos(0, 8)),
+            range(pos(0, 0), pos(10, 1)),
+            vec![sym(
+                "bar",
+                range(pos(2, 7), pos(2, 10)),
+                range(pos(2, 4), pos(4, 5)),
+                vec![],
+            )],
+        );
+        // Position inside the inner method's range — expect "bar".
+        let (got_range, name) = find_enclosing_symbol(&[outer], pos(3, 8)).unwrap();
+        assert_eq!(name, "bar");
+        assert_eq!(got_range, range(pos(2, 4), pos(4, 5)));
+    }
+
+    #[test]
+    fn find_enclosing_falls_back_to_outer_when_no_child_matches() {
+        let outer = sym(
+            "Foo",
+            range(pos(0, 5), pos(0, 8)),
+            range(pos(0, 0), pos(10, 1)),
+            vec![sym(
+                "bar",
+                range(pos(2, 7), pos(2, 10)),
+                range(pos(2, 4), pos(4, 5)),
+                vec![],
+            )],
+        );
+        // Position outside the child's range but inside the outer's.
+        let (_, name) = find_enclosing_symbol(&[outer], pos(6, 0)).unwrap();
+        assert_eq!(name, "Foo");
+    }
+
+    #[test]
+    fn splice_range_replaces_inside_content() {
+        let content = "alpha beta gamma\n";
+        let r = range(pos(0, 6), pos(0, 10));
+        let out = splice_range(content, r, "BETA", std::path::Path::new("x")).unwrap();
+        assert_eq!(out, "alpha BETA gamma\n");
+    }
+
+    #[test]
+    fn splice_range_can_delete() {
+        let content = "alpha beta gamma\n";
+        let r = range(pos(0, 5), pos(0, 10));
+        let out = splice_range(content, r, "", std::path::Path::new("x")).unwrap();
+        assert_eq!(out, "alpha gamma\n");
     }
 }
 

@@ -104,6 +104,15 @@ pub fn enclosing_definition(index: &Index, path: &str, line_0based: i32) -> Opti
     enclosing_definition_in_doc(doc, line_0based)
 }
 
+/// Like [`enclosing_definition`] but returns the raw SCIP symbol id
+/// instead of the display name. Useful when the caller needs to feed
+/// the id back into [`references`] / [`callers`] — for example a
+/// `safe_delete_symbol` preflight that needs to count call sites.
+pub fn enclosing_definition_id(index: &Index, path: &str, line_0based: i32) -> Option<String> {
+    let doc = index.documents.iter().find(|d| d.relative_path == path)?;
+    enclosing_definition_symbol_id(doc, line_0based).map(str::to_owned)
+}
+
 fn enclosing_definition_in_doc(doc: &Document, line_0based: i32) -> Option<String> {
     let symbol_id = enclosing_definition_symbol_id(doc, line_0based)?;
     Some(

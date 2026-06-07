@@ -269,6 +269,55 @@ pub struct SafeEditArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SymbolEditArgs {
+    /// Absolute path to the source file.
+    pub file: String,
+    /// 0-indexed line number inside the symbol's definition (its name
+    /// or anywhere in its body — LSP `documentSymbol` resolves the
+    /// enclosing symbol).
+    pub line: u32,
+    /// 0-indexed UTF-16 column within the line.
+    pub column: u32,
+    /// Replacement text (`replace_symbol_body`) or content to insert
+    /// (`insert_before_symbol` / `insert_after_symbol`). Caller
+    /// controls newlines: typically end with `\n` for inserts that
+    /// should sit on their own line.
+    pub content: String,
+    /// Other files whose published diagnostics should be snapshotted
+    /// before/after — useful when the edit may break downstream call
+    /// sites. Empty by default.
+    #[serde(default)]
+    pub related_files: Vec<String>,
+    /// Milliseconds to wait between the edit and the after-snapshot.
+    /// Defaults to 1500.
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SafeDeleteSymbolArgs {
+    /// Absolute path to the source file.
+    pub file: String,
+    /// 0-indexed line number inside the symbol's definition.
+    pub line: u32,
+    /// 0-indexed UTF-16 column within the line.
+    pub column: u32,
+    /// If true, perform the delete even when SCIP reports remaining
+    /// call sites. Defaults to false — the tool refuses with a JSON
+    /// list of refs when call sites exist.
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub related_files: Vec<String>,
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LspCodeActionRangeArgs {
     pub file: String,
     /// 0-indexed line numbers for the action's range. `end_line` /
@@ -1074,6 +1123,131 @@ impl AideServer {
             hit.enclosing_symbol = aide_scip::enclosing_definition(&index, &rel, line_0based);
         }
     }
+
+    /// Annotate every diagnostic in a `SafeEditReport` (`new_errors`,
+    /// `new_warnings`, `resolved`) with `enclosing_symbol` from the
+    /// latest Ready SCIP. Pure DRY over the three calls every
+    /// safe-edit-like tool used to make by hand.
+    async fn annotate_safe_edit_report(
+        &self,
+        root: &std::path::Path,
+        report: &mut aide_lsp::ops::SafeEditReport,
+    ) {
+        self.annotate_diagnostic_snapshots_with_scip(root, &mut report.new_errors)
+            .await;
+        self.annotate_diagnostic_snapshots_with_scip(root, &mut report.new_warnings)
+            .await;
+        self.annotate_diagnostic_snapshots_with_scip(root, &mut report.resolved)
+            .await;
+    }
+
+    /// SCIP preflight for `safe_delete_symbol`. Returns:
+    /// - `Ok(Some(refs))` — Ready SCIP found, returning the
+    ///   non-definition occurrences of the enclosing symbol at
+    ///   `(file, line)`. Empty vec means "safe to delete".
+    /// - `Ok(None)` — no Ready SCIP for this root; caller decides
+    ///   whether to refuse or force.
+    /// - `Err(_)` — SCIP exists but failed to load or the file isn't
+    ///   covered.
+    async fn scip_references_at(
+        &self,
+        root: &std::path::Path,
+        file: &std::path::Path,
+        line: u32,
+    ) -> Result<Option<Vec<aide_scip::OccurrenceHit>>, String> {
+        let root_str = root.display().to_string();
+        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
+            return Ok(None);
+        };
+        let index = aide_scip::load(&scip_path).map_err(|e| e.to_string())?;
+        let rel = relativize_path(root, &file.display().to_string());
+        let line_0based = i32::try_from(line).unwrap_or(i32::MAX);
+        let Some(symbol_id) = aide_scip::enclosing_definition_id(&index, &rel, line_0based) else {
+            return Err(format!(
+                "no SCIP definition at {}:{} — index may be stale",
+                rel,
+                line + 1
+            ));
+        };
+        let refs = aide_scip::callers(&index, &symbol_id);
+        Ok(Some(refs))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SymbolEditKind {
+    Replace,
+    InsertBefore,
+    InsertAfter,
+}
+
+impl AideServer {
+    async fn run_symbol_edit(&self, args: &SymbolEditArgs, kind: SymbolEditKind) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root.clone());
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        let related: Vec<PathBuf> = args.related_files.iter().map(PathBuf::from).collect();
+        let settle = Duration::from_millis(args.settle_ms.unwrap_or(1500));
+
+        let result = match kind {
+            SymbolEditKind::Replace => {
+                lsp_ops::replace_symbol_body(
+                    &client,
+                    &file,
+                    args.line,
+                    args.column,
+                    &args.content,
+                    &related,
+                    settle,
+                )
+                .await
+            }
+            SymbolEditKind::InsertBefore => {
+                lsp_ops::insert_before_symbol(
+                    &client,
+                    &file,
+                    args.line,
+                    args.column,
+                    &args.content,
+                    &related,
+                    settle,
+                )
+                .await
+            }
+            SymbolEditKind::InsertAfter => {
+                lsp_ops::insert_after_symbol(
+                    &client,
+                    &file,
+                    args.line,
+                    args.column,
+                    &args.content,
+                    &related,
+                    settle,
+                )
+                .await
+            }
+        };
+
+        match result {
+            Ok(mut report) => {
+                self.annotate_safe_edit_report(&root, &mut report).await;
+                to_json(&report)
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
 }
 
 /// Turn a span path reported by a build tool into a repo-relative path
@@ -1388,12 +1562,86 @@ impl AideServer {
         .await
         {
             Ok(mut report) => {
-                self.annotate_diagnostic_snapshots_with_scip(&root, &mut report.new_errors)
-                    .await;
-                self.annotate_diagnostic_snapshots_with_scip(&root, &mut report.new_warnings)
-                    .await;
-                self.annotate_diagnostic_snapshots_with_scip(&root, &mut report.resolved)
-                    .await;
+                self.annotate_safe_edit_report(&root, &mut report).await;
+                to_json(&report)
+            }
+            Err(e) => error_json(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Replace the full definition of the symbol that owns (file, line, column) with `content`. Range is resolved via LSP `documentSymbol` — the deepest symbol enclosing the position wins. Replacement covers the symbol's full extent (signature + body), so `content` must be the complete new definition. Returns the same diagnostic-delta report as `safe_edit`."
+    )]
+    async fn replace_symbol_body(&self, Parameters(args): Parameters<SymbolEditArgs>) -> String {
+        self.run_symbol_edit(&args, SymbolEditKind::Replace).await
+    }
+
+    #[tool(
+        description = "Insert `content` immediately before the start of the symbol that owns (file, line, column). Range is resolved via LSP `documentSymbol`. Caller controls newlines — typically end `content` with `\\n` so the existing symbol stays on its own line. Returns a diagnostic-delta report."
+    )]
+    async fn insert_before_symbol(&self, Parameters(args): Parameters<SymbolEditArgs>) -> String {
+        self.run_symbol_edit(&args, SymbolEditKind::InsertBefore)
+            .await
+    }
+
+    #[tool(
+        description = "Insert `content` immediately after the end of the symbol that owns (file, line, column). Range is resolved via LSP `documentSymbol`. Caller controls newlines — typically start `content` with `\\n\\n` so the new content sits on a fresh line below the existing symbol. Returns a diagnostic-delta report."
+    )]
+    async fn insert_after_symbol(&self, Parameters(args): Parameters<SymbolEditArgs>) -> String {
+        self.run_symbol_edit(&args, SymbolEditKind::InsertAfter)
+            .await
+    }
+
+    #[tool(
+        description = "Delete the full definition of the symbol that owns (file, line, column). Preflights via SCIP: if any non-self references remain in the latest Ready index, refuses with a JSON list of call sites instead of editing. Pass `force: true` to override (e.g. when refactoring so the call sites are about to disappear too, or when the index is stale). When no SCIP index is available the tool errs on the safe side and still refuses — pass `force: true` if you're sure. Returns a diagnostic-delta report on success."
+    )]
+    async fn safe_delete_symbol(
+        &self,
+        Parameters(args): Parameters<SafeDeleteSymbolArgs>,
+    ) -> String {
+        let file = PathBuf::from(&args.file);
+        let root = resolve_root(args.root);
+        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+            return error_json(format!("no language plugin claims root {}", root.display()));
+        };
+
+        if !args.force {
+            match self.scip_references_at(&root, &file, args.line).await {
+                Ok(Some(refs)) if !refs.is_empty() => {
+                    return to_json(&serde_json::json!({
+                        "status": "refused",
+                        "reason": "symbol still has call sites in the latest Ready SCIP index; pass force=true to delete anyway",
+                        "references": refs,
+                    }));
+                }
+                Ok(None) => {
+                    return to_json(&serde_json::json!({
+                        "status": "refused",
+                        "reason": "no Ready SCIP index for this root; cannot verify the symbol is unused. Pass force=true to delete anyway or call index_commit first",
+                    }));
+                }
+                Ok(Some(_)) => {}
+                Err(e) => return error_json(format!("scip preflight failed: {e}")),
+            }
+        }
+
+        let client = match self
+            .pool
+            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_json(e.to_string()),
+        };
+
+        let related: Vec<PathBuf> = args.related_files.iter().map(PathBuf::from).collect();
+        let settle = Duration::from_millis(args.settle_ms.unwrap_or(1500));
+
+        match lsp_ops::delete_symbol_range(&client, &file, args.line, args.column, &related, settle)
+            .await
+        {
+            Ok(mut report) => {
+                self.annotate_safe_edit_report(&root, &mut report).await;
                 to_json(&report)
             }
             Err(e) => error_json(e.to_string()),
