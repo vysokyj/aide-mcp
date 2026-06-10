@@ -37,6 +37,8 @@ use aide_install::{ArchiveFormat, DirectAsset, InstallError, Source, ToolSpec};
 /// Pin for Lombok. Bump together with a verified Maven Central URL.
 const LOMBOK_VERSION: &str = "1.18.36";
 
+use aide_proto::Diagnostic;
+
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
 };
@@ -129,6 +131,62 @@ impl LanguagePlugin for JavaMavenPlugin {
     fn classify_path(&self, relative_path: &str) -> &'static str {
         classify_java_path(relative_path)
     }
+
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        parse_maven_diagnostics(stdout)
+    }
+}
+
+/// Parse Maven's compiler-plugin lines:
+/// `[ERROR] /abs/path/Foo.java:[12,34] cannot find symbol`. Lines
+/// without the `File.java:[line,col]` span (build summaries, reactor
+/// noise) are skipped — they repeat what the span lines already say.
+fn parse_maven_diagnostics(output: &str) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for raw in output.lines() {
+        let line = raw.trim();
+        let (level, rest) = if let Some(r) = line.strip_prefix("[ERROR] ") {
+            ("error", r)
+        } else if let Some(r) = line.strip_prefix("[WARNING] ") {
+            ("warning", r)
+        } else {
+            continue;
+        };
+        let Some(span_start) = rest.find(".java:[") else {
+            continue;
+        };
+        let file = &rest[..span_start + ".java".len()];
+        if file.contains(' ') {
+            continue;
+        }
+        let tail = &rest[span_start + ".java:[".len()..];
+        let Some(span_end) = tail.find(']') else {
+            continue;
+        };
+        let coords = &tail[..span_end];
+        let (line_s, col_s) = coords.split_once(',').unwrap_or((coords, ""));
+        let Ok(line_no) = line_s.trim().parse::<u32>() else {
+            continue;
+        };
+        let column = col_s.trim().parse::<u32>().ok();
+        let message = tail[span_end + 1..].trim();
+        if message.is_empty() {
+            continue;
+        }
+        out.push(Diagnostic {
+            level: level.to_string(),
+            code: None,
+            message: message.to_string(),
+            file: Some(file.to_string()),
+            line_start: Some(line_no),
+            line_end: None,
+            column_start: column,
+            column_end: None,
+            enclosing_symbol: None,
+            rendered: Some(line.to_string()),
+        });
+    }
+    out
 }
 
 /// Broad path-based classification of a Java / Kotlin / Groovy source
@@ -548,5 +606,29 @@ mod tests {
         assert!(!is_java_test("src/main/java/com/example/Foo.java", "bar"));
         // Bare "test" without a suffix is a type/const, not a method.
         assert!(!is_java_test("src/main/java/com/example/Foo.java", "test"));
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::parse_maven_diagnostics;
+
+    #[test]
+    fn maven_compiler_lines_parse() {
+        let out = "[INFO] Compiling 3 source files\n\
+                   [ERROR] /home/u/proj/src/main/java/com/acme/App.java:[12,34] cannot find symbol\n\
+                   [WARNING] /home/u/proj/src/main/java/com/acme/Util.java:[3,1] deprecated API\n\
+                   [ERROR] BUILD FAILURE\n";
+        let d = parse_maven_diagnostics(out);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert_eq!(d[0].level, "error");
+        assert_eq!(
+            d[0].file.as_deref(),
+            Some("/home/u/proj/src/main/java/com/acme/App.java")
+        );
+        assert_eq!(d[0].line_start, Some(12));
+        assert_eq!(d[0].column_start, Some(34));
+        assert_eq!(d[0].message, "cannot find symbol");
+        assert_eq!(d[1].level, "warning");
     }
 }

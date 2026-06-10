@@ -17,6 +17,11 @@ use crate::{open_repo, GitError};
 /// `target` are overwritten (the caller owns the dir, typically a
 /// `TempDir`). The source repository's workdir and index are left
 /// untouched.
+///
+/// **Submodules are not initialised** — a submodule entry exports as
+/// an empty directory, so a SCIP index built from this snapshot will
+/// not cover code living inside submodules. Known limitation; revisit
+/// if a dogfooded repo actually uses them.
 pub fn export_commit(repo_root: &Path, sha: &str, target: &Path) -> Result<(), GitError> {
     let repo = open_repo(repo_root)?;
     let oid = git2::Oid::from_str(sha)?;

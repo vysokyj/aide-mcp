@@ -1,7 +1,8 @@
 # Project status snapshot
 
-Last updated: 2026-06-10 (version 0.28.0; v0.27 milestone shipped, v0.28
-contexts/modes still planned).
+Last updated: 2026-06-10 (version 0.31.0; v0.31 structured-diagnostics
+milestone shipped out of order — v0.28 contexts/modes, v0.29
+multi-project, v0.30 dashboard remain planned).
 
 ## Purpose of this file
 
@@ -62,6 +63,7 @@ decisions, roadmap, current state — is mirrored here.
 | v0.28     | Contexts and modes — `~/.aide/config.toml` gains `[context.<name>]` sections with `enabled_tools` / `disabled_tools` (glob match against tool name). Selected via `--context=<name>` CLI flag at server start, hot-reloads with the rest of the config. Lets one binary serve different client profiles (e.g. Claude Code wants the lot, a code-review bot wants only read tools). | ⏳ planned |
 | v0.29     | Multi-project query — `~/.aide/config.toml` gains `[project.<name>]` with `path =` entries; new `projects_list()` enumerates them and `query_project(name, tool, args)` runs a whitelisted read-only tool against the named project's root. Helps monorepos and cross-project navigation. Whitelist is hardcoded to read-only tools — no `safe_edit` / `run_*` / `install_package` cross-project. | ⏳ planned |
 | v0.30     | Web dashboard — minimal browser UI served by the same HTTP transport (v0.27): live tool call log (tail of recent invocations), config view (read-only), project switcher, indexer status, exec log links. Static HTML + small JS, no SPA framework. Lowest priority of the serena-parity batch; defer indefinitely if v0.23–v0.29 ship and no user asks. | ⏳ planned |
+| v0.31     | Structured diagnostics for non-Rust languages (issue #24, shipped out of order — pure parser work, no new surface). `parse_diagnostics` implemented for all six plugins: shared `textdiag::parse_colon_diagnostics` for the `file:line[:col][: level]: message` family (gcc/clang for C/C++, javac via Gradle, `go build/vet/test`), Maven's `[ERROR] File.java:[12,34]` bracket shape, tsc's `file(12,5): error TS2304:` shape for Node, and pytest/mypy summary lines + interpreter tracebacks (deepest frame paired with the trailing `SomeError:` line) for Python. `run_project` / `run_tests` now parse **stderr too** — cargo speaks JSON on stdout, but gcc/javac/go diagnose on stderr. Side fixes from the same issue: compiled-regex cache in aide-search, `export_commit` submodule limitation documented. | ✅ done |
 
 ### Why this order
 

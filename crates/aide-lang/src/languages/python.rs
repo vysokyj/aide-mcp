@@ -27,6 +27,8 @@ use std::path::Path;
 
 use aide_install::{ArchiveFormat, DirectAsset, InstallError, Source, ToolSpec};
 
+use aide_proto::Diagnostic;
+
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
 };
@@ -140,6 +142,65 @@ impl LanguagePlugin for PythonPlugin {
     fn classify_path(&self, relative_path: &str) -> &'static str {
         classify_python_path(relative_path)
     }
+
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        parse_python_diagnostics(stdout)
+    }
+}
+
+/// Parse the two diagnostic shapes Python tooling actually emits:
+///
+/// 1. `path.py:12: <message>` summary lines — pytest failure
+///    locations (`tests/test_x.py:12: AssertionError`) and mypy
+///    (`x.py:12: error: ...`). pytest's `path.py:12: in test_foo`
+///    context lines are dropped — they locate a frame, not a failure.
+/// 2. Interpreter tracebacks: the deepest `File "x.py", line 12`
+///    frame is paired with the trailing `SomeError: message` line.
+fn parse_python_diagnostics(output: &str) -> Vec<Diagnostic> {
+    let mut out = super::textdiag::parse_colon_diagnostics(output, &[".py"], false);
+    out.retain(|d| !d.message.starts_with("in "));
+
+    let mut last_frame: Option<(String, u32)> = None;
+    for raw in output.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("File \"") {
+            if let Some((file, rest)) = rest.split_once('"') {
+                if let Some(rest) = rest.strip_prefix(", line ") {
+                    let digits = &rest[..rest
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(rest.len())];
+                    if let Ok(line_no) = digits.parse::<u32>() {
+                        last_frame = Some((file.to_string(), line_no));
+                    }
+                }
+            }
+        } else if is_exception_line(line) {
+            if let Some((file, line_no)) = last_frame.take() {
+                out.push(Diagnostic {
+                    level: "error".to_string(),
+                    code: None,
+                    message: line.to_string(),
+                    file: Some(file),
+                    line_start: Some(line_no),
+                    line_end: None,
+                    column_start: None,
+                    column_end: None,
+                    enclosing_symbol: None,
+                    rendered: Some(line.to_string()),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `ValueError: ...` / `ZeroDivisionError` / `my.pkg.CustomException: ...`
+/// — a single identifier-ish head ending in Error/Exception.
+fn is_exception_line(line: &str) -> bool {
+    let head = line.split(':').next().unwrap_or("").trim();
+    !head.is_empty()
+        && !head.contains(' ')
+        && (head.ends_with("Error") || head.ends_with("Exception"))
 }
 
 /// Broad path-based classification of a Python source file. Picks the
@@ -477,5 +538,33 @@ mod tests {
         let tr = PythonPlugin.test_runner();
         assert_eq!(tr.executable, "python3");
         assert_eq!(tr.args, &["-m", "pytest"]);
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::parse_python_diagnostics;
+
+    #[test]
+    fn pytest_summary_and_traceback_parse() {
+        let out = "tests/test_math.py:7: in test_add\n\
+                   tests/test_math.py:8: AssertionError\n\
+                   Traceback (most recent call last):\n\
+                     File \"app/main.py\", line 3, in <module>\n\
+                       run()\n\
+                     File \"app/core.py\", line 9, in run\n\
+                       1 / 0\n\
+                   ZeroDivisionError: division by zero\n";
+        let d = parse_python_diagnostics(out);
+        // The `in test_add` context line is dropped; the assertion
+        // summary stays; the deepest traceback frame pairs with the
+        // exception line.
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert_eq!(d[0].file.as_deref(), Some("tests/test_math.py"));
+        assert_eq!(d[0].line_start, Some(8));
+        assert_eq!(d[0].message, "AssertionError");
+        assert_eq!(d[1].file.as_deref(), Some("app/core.py"));
+        assert_eq!(d[1].line_start, Some(9));
+        assert!(d[1].message.starts_with("ZeroDivisionError"));
     }
 }

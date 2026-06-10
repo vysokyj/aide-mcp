@@ -39,6 +39,8 @@ use std::path::Path;
 
 use aide_install::{ArchiveFormat, DirectAsset, InstallError, Source, ToolSpec};
 
+use aide_proto::Diagnostic;
+
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
 };
@@ -156,6 +158,68 @@ impl LanguagePlugin for NodePlugin {
     fn classify_path(&self, relative_path: &str) -> &'static str {
         classify_node_path(relative_path)
     }
+
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        parse_tsc_diagnostics(stdout)
+    }
+}
+
+/// Parse tsc-style lines: `src/x.ts(12,5): error TS2304: message`.
+/// This is what `npm test` / `npm run build` surface for any project
+/// whose scripts invoke `tsc` — the dominant structured shape in the
+/// Node ecosystem. Framework-specific runner output (jest, vitest) is
+/// too freeform to parse reliably and is left to the raw stdout.
+fn parse_tsc_diagnostics(output: &str) -> Vec<Diagnostic> {
+    const EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"];
+    let mut out = Vec::new();
+    for raw in output.lines() {
+        let line = raw.trim();
+        let Some(open) = line.find('(') else { continue };
+        let file = &line[..open];
+        if file.contains(' ') || !EXTS.iter().any(|e| file.ends_with(e)) {
+            continue;
+        }
+        let Some(close_rel) = line[open..].find(')') else {
+            continue;
+        };
+        let coords = &line[open + 1..open + close_rel];
+        let Some((line_s, col_s)) = coords.split_once(',') else {
+            continue;
+        };
+        let (Ok(line_no), Ok(column)) = (line_s.trim().parse::<u32>(), col_s.trim().parse::<u32>())
+        else {
+            continue;
+        };
+        let Some(rest) = line[open + close_rel + 1..].strip_prefix(':') else {
+            continue;
+        };
+        let Some((level, rest)) = rest.trim_start().split_once(' ') else {
+            continue;
+        };
+        if level != "error" && level != "warning" {
+            continue;
+        }
+        let (code, message) = match rest.split_once(':') {
+            Some((c, m)) if c.starts_with("TS") => (Some(c.to_string()), m.trim()),
+            _ => (None, rest.trim()),
+        };
+        if message.is_empty() {
+            continue;
+        }
+        out.push(Diagnostic {
+            level: level.to_string(),
+            code,
+            message: message.to_string(),
+            file: Some(file.to_string()),
+            line_start: Some(line_no),
+            line_end: None,
+            column_start: Some(column),
+            column_end: None,
+            enclosing_symbol: None,
+            rendered: Some(line.to_string()),
+        });
+    }
+    out
 }
 
 /// Broad path-based classification of a Node/TS source file. Picks the
@@ -574,5 +638,25 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         fs::write(dir.path().join("package.json"), r#"{"name":"y"}"#).unwrap();
         assert!(NodePlugin.detect(dir.path()));
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::parse_tsc_diagnostics;
+
+    #[test]
+    fn tsc_lines_parse() {
+        let out = "> fixture@1.0.0 build\n\
+                   src/index.ts(12,5): error TS2304: Cannot find name 'foo'.\n\
+                   src/util.tsx(3,1): warning TS6133: 'x' is declared but never used.\n\
+                   Found 2 errors.\n";
+        let d = parse_tsc_diagnostics(out);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert_eq!(d[0].code.as_deref(), Some("TS2304"));
+        assert_eq!(d[0].line_start, Some(12));
+        assert_eq!(d[0].column_start, Some(5));
+        assert_eq!(d[0].message, "Cannot find name 'foo'.");
+        assert_eq!(d[1].level, "warning");
     }
 }

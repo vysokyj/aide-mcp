@@ -274,7 +274,27 @@ fn build_searcher(options: &GrepOptions) -> Searcher {
         .build()
 }
 
+/// Compiled-matcher cache — agents iterating on a search re-grep the
+/// same pattern repeatedly, and regex compilation is the only non-I/O
+/// cost worth saving here. Tiny and crude on purpose: cleared wholesale
+/// when full.
+type MatcherCache =
+    std::sync::Mutex<std::collections::HashMap<(String, Option<bool>), RegexMatcher>>;
+
+static MATCHER_CACHE: std::sync::OnceLock<MatcherCache> = std::sync::OnceLock::new();
+
+const MATCHER_CACHE_CAP: usize = 32;
+
 fn build_matcher(pattern: &str, case_sensitive: Option<bool>) -> Result<RegexMatcher, SearchError> {
+    let cache =
+        MATCHER_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (pattern.to_string(), case_sensitive);
+    if let Ok(guard) = cache.lock() {
+        if let Some(m) = guard.get(&key) {
+            return Ok(m.clone());
+        }
+    }
+
     let mut b = RegexMatcherBuilder::new();
     match case_sensitive {
         Some(true) => {
@@ -287,11 +307,20 @@ fn build_matcher(pattern: &str, case_sensitive: Option<bool>) -> Result<RegexMat
             b.case_smart(true);
         }
     }
-    b.build(pattern)
+    let matcher = b
+        .build(pattern)
         .map_err(|source| SearchError::InvalidRegex {
             pattern: pattern.to_string(),
             source,
-        })
+        })?;
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= MATCHER_CACHE_CAP {
+            guard.clear();
+        }
+        guard.insert(key, matcher.clone());
+    }
+    Ok(matcher)
 }
 
 struct CollectSink<'a> {

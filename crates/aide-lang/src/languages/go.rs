@@ -32,6 +32,8 @@ use std::path::Path;
 
 use aide_install::{ArchiveFormat, Source, TargetAsset, ToolSpec};
 
+use aide_proto::Diagnostic;
+
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
 };
@@ -125,6 +127,12 @@ impl LanguagePlugin for GoPlugin {
 
     fn classify_path(&self, relative_path: &str) -> &'static str {
         classify_go_path(relative_path)
+    }
+
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        // `go build` / `go vet` / `go test` compile failures all emit
+        // `file.go:line:col: message` with no level token.
+        super::textdiag::parse_colon_diagnostics(stdout, &[".go"], false)
     }
 }
 
@@ -302,5 +310,18 @@ mod tests {
         assert!(!is_go_test("src/foo.go", "Benchmark"));
         assert!(!is_go_test("src/foo.go", "testHelper"));
         assert!(!is_go_test("src/foo.go", "RunTest"));
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    #[test]
+    fn go_build_lines_parse_through_plugin() {
+        let d = GoPlugin.parse_diagnostics("./cmd/x.go:3:1: undefined: y\nFAIL\n");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].file.as_deref(), Some("cmd/x.go"));
+        assert_eq!(d[0].line_start, Some(3));
     }
 }

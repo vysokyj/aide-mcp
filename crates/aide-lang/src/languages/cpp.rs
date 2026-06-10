@@ -38,6 +38,8 @@ use std::path::Path;
 use aide_install::{ArchiveFormat, InstallError, Source, TargetAsset, ToolSpec};
 
 use crate::languages::rust::codelldb_spec;
+use aide_proto::Diagnostic;
+
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
 };
@@ -158,6 +160,16 @@ impl LanguagePlugin for CppPlugin {
 
     fn classify_path(&self, relative_path: &str) -> &'static str {
         classify_cpp_path(relative_path)
+    }
+
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        // gcc/clang emit `file:line:col: level: message`; the explicit
+        // level requirement keeps make/cmake progress noise out.
+        super::textdiag::parse_colon_diagnostics(
+            stdout,
+            &[".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"],
+            true,
+        )
     }
 }
 
@@ -503,5 +515,20 @@ mod tests {
         assert!(is_cpp_test("src/foo.cpp", "TEST_CaseName"));
         assert!(!is_cpp_test("src/foo.cpp", "bar"));
         assert!(!is_cpp_test("src/foo.cpp", "TestimonyCollector"));
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    #[test]
+    fn gcc_lines_parse_through_plugin() {
+        let d = CppPlugin.parse_diagnostics(
+            "src/a.cpp:1:2: error: 'boom' was not declared\nmake: *** Error 2\n",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].level, "error");
+        assert_eq!(d[0].column_start, Some(2));
     }
 }

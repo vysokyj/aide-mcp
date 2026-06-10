@@ -2762,7 +2762,12 @@ impl AideServer {
         .await
         {
             Ok(mut result) => {
+                // Parse both streams — cargo speaks JSON on stdout, but
+                // gcc / javac / go put their diagnostics on stderr.
                 result.diagnostics = plugin.parse_diagnostics(&result.stdout);
+                result
+                    .diagnostics
+                    .extend(plugin.parse_diagnostics(&result.stderr));
                 self.annotate_diagnostics_with_scip(&root, &mut result.diagnostics)
                     .await;
                 to_json(&result)
@@ -2811,7 +2816,12 @@ impl AideServer {
         .await
         {
             Ok(mut result) => {
+                // Parse both streams — cargo speaks JSON on stdout, but
+                // gcc / javac / go put their diagnostics on stderr.
                 result.diagnostics = plugin.parse_diagnostics(&result.stdout);
+                result
+                    .diagnostics
+                    .extend(plugin.parse_diagnostics(&result.stderr));
                 self.annotate_diagnostics_with_scip(&root, &mut result.diagnostics)
                     .await;
                 to_json(&result)

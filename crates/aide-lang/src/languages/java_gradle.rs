@@ -13,6 +13,8 @@ use std::path::Path;
 use aide_core::AidePaths;
 use aide_install::ToolSpec;
 
+use aide_proto::Diagnostic;
+
 use crate::plugin::{
     DapSpec, LanguageId, LanguagePlugin, LspSpec, PackageManager, Runner, ScipSpec, TestRunner,
 };
@@ -114,6 +116,14 @@ impl LanguagePlugin for JavaGradlePlugin {
     fn classify_path(&self, relative_path: &str) -> &'static str {
         super::java::classify_java_path(relative_path)
     }
+
+    fn parse_diagnostics(&self, stdout: &str) -> Vec<Diagnostic> {
+        // Gradle passes javac output through verbatim:
+        // `File.java:12: error: message` (no column; the caret line
+        // below it is dropped). Kotlin's `e: file: (12, 34)` shape is
+        // left for the day a Kotlin project actually dogfoods this.
+        super::textdiag::parse_colon_diagnostics(stdout, &[".java"], true)
+    }
 }
 
 fn slug(path: &Path) -> String {
@@ -205,5 +215,19 @@ mod tests {
             JavaGradlePlugin.classify_path("src/main/java/App.java"),
             "lib",
         );
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    #[test]
+    fn javac_lines_parse_through_plugin() {
+        let d = JavaGradlePlugin
+            .parse_diagnostics("src/main/java/Foo.java:3: error: ';' expected\n1 error\n");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].line_start, Some(3));
+        assert_eq!(d[0].column_start, None);
     }
 }
