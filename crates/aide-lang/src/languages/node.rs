@@ -184,10 +184,11 @@ fn classify_node_path(relative_path: &str) -> &'static str {
 /// Node/TS test heuristic. Jest / Vitest / Mocha conventions all agree
 /// that test files live under a `__tests__/`, `test/`, or `tests/`
 /// directory OR carry a `*.test.*` / `*.spec.*` suffix; that's what we
-/// match. Name-based detection is deliberately coarse (any function
-/// whose display name starts or ends with "test") to keep pace with the
-/// range of framework-specific helpers (`it`, `describe`, `expect`)
-/// without hard-coding a closed list.
+/// match. Name-based detection covers two shapes: test-ish identifiers
+/// (`test_*`, `*_test`) and the framework entry points themselves —
+/// Jest/Mocha/Vitest tests are anonymous callbacks under `it(...)` /
+/// `describe(...)` / `test(...)`, so the enclosing symbol SCIP reports
+/// is the helper's name, not anything containing "test".
 fn is_node_test(relative_path: &str, display_name: &str) -> bool {
     let path = relative_path.to_ascii_lowercase();
     let in_test_path = path.starts_with("test/")
@@ -200,7 +201,19 @@ fn is_node_test(relative_path: &str, display_name: &str) -> bool {
     let name = display_name.to_ascii_lowercase();
     let looks_like_test =
         name.starts_with("test_") || name.starts_with("test ") || name.ends_with("_test");
-    in_test_path || has_test_suffix || looks_like_test
+    let framework_entry_point = matches!(
+        name.as_str(),
+        "it" | "test"
+            | "describe"
+            | "suite"
+            | "before"
+            | "after"
+            | "beforeeach"
+            | "beforeall"
+            | "aftereach"
+            | "afterall"
+    );
+    in_test_path || has_test_suffix || looks_like_test || framework_entry_point
 }
 
 fn has_js_test_suffix(path: &str) -> bool {
@@ -504,6 +517,19 @@ mod tests {
         assert!(is_node_test("src/foo.ts", "bar_test"));
         assert!(!is_node_test("src/foo.ts", "bar"));
         assert!(!is_node_test("src/foo.ts", "tested"));
+    }
+
+    #[test]
+    fn is_node_test_recognises_framework_entry_points() {
+        // Jest/Mocha/Vitest tests are anonymous callbacks; SCIP reports
+        // the helper (`it`, `describe`, ...) as the enclosing symbol.
+        for name in ["it", "test", "describe", "suite", "beforeEach", "afterAll"] {
+            assert!(is_node_test("src/foo.ts", name), "should match `{name}`");
+        }
+        // Identifiers merely *containing* these words must not match.
+        assert!(!is_node_test("src/foo.ts", "iterate"));
+        assert!(!is_node_test("src/foo.ts", "describeShape"));
+        assert!(!is_node_test("src/foo.ts", "afterburner"));
     }
 
     #[test]
