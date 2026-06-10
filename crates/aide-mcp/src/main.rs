@@ -29,8 +29,12 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
+            // NB: the binary target is `mcp-aide`, so this crate's
+            // tracing target is `mcp_aide` — the old `aide_mcp`
+            // directive matched nothing and silently ate every log
+            // line from the server itself.
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("aide_mcp=info,aide_lsp=info,rmcp=warn")),
+                .unwrap_or_else(|_| EnvFilter::new("mcp_aide=info,aide_lsp=info,rmcp=warn")),
         )
         .with_writer(std::io::stderr)
         .with_ansi(false)

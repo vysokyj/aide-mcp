@@ -137,6 +137,7 @@ dependencies = [
  "lsp-types",
  "nix",
  "regex",
+ "reqwest",
  "rmcp",
  "schemars 0.8.22",
  "serde",
