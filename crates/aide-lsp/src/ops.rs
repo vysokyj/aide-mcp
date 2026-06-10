@@ -479,31 +479,33 @@ async fn apply_and_snapshot(
         .collect();
     let before = snapshot_published_diagnostics(client, &all_paths).await?;
 
-    tokio::fs::write(path, &after_contents)
-        .await
-        .map_err(LspClientError::from_io)?;
-
     let uri = path_to_uri(path)?;
-    let mut docs = client.opened_documents().lock().await;
-    if let Some(doc) = docs.get_mut(&uri) {
-        doc.version += 1;
-        doc.text.clone_from(&after_contents);
-        let version = doc.version;
-        drop(docs);
-        let params = DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier {
-                uri: uri.clone(),
-                version,
-            },
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: after_contents.clone(),
-            }],
-        };
-        client.notify::<DidChangeTextDocument>(params).await?;
-    } else {
-        drop(docs);
+    // Hold the docs lock across write + version bump + notify so a
+    // concurrent ensure_document_current cannot observe the new bytes
+    // on disk and race a conflicting didChange in between.
+    {
+        let mut docs = client.opened_documents().lock().await;
+        tokio::fs::write(path, &after_contents)
+            .await
+            .map_err(LspClientError::from_io)?;
+        if let Some(doc) = docs.get_mut(&uri) {
+            doc.version += 1;
+            doc.text.clone_from(&after_contents);
+            doc.last_used = std::time::Instant::now();
+            let version = doc.version;
+            let params = DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: after_contents.clone(),
+                }],
+            };
+            client.notify::<DidChangeTextDocument>(params).await?;
+        }
     }
 
     tokio::time::sleep(settle).await;
@@ -971,6 +973,10 @@ async fn apply_edits_to_file(
     total_edits: &mut usize,
 ) -> Result<(), LspClientError> {
     let path = uri_to_path(uri)?;
+    // Hold the docs lock from before the read until after the notify —
+    // the read-modify-write plus the version bump must be atomic with
+    // respect to concurrent ensure_document_current calls.
+    let mut docs = client.opened_documents().lock().await;
     let before = tokio::fs::read_to_string(&path)
         .await
         .map_err(LspClientError::from_io)?;
@@ -981,12 +987,11 @@ async fn apply_edits_to_file(
         .await
         .map_err(LspClientError::from_io)?;
 
-    let mut docs = client.opened_documents().lock().await;
     if let Some(doc) = docs.get_mut(uri) {
         doc.version += 1;
         doc.text.clone_from(&after);
+        doc.last_used = std::time::Instant::now();
         let version = doc.version;
-        drop(docs);
         let params = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: uri.clone(),
@@ -1000,6 +1005,7 @@ async fn apply_edits_to_file(
         };
         client.notify::<DidChangeTextDocument>(params).await?;
     }
+    drop(docs);
 
     files.push(FileChange {
         path: path.display().to_string(),
@@ -1373,6 +1379,12 @@ pub async fn diagnostics(
         .collect())
 }
 
+/// Cap on documents kept open per language server. Past this the
+/// least-recently-used document is closed — servers hold per-document
+/// state (ASTs, caches), and a long-lived busy workspace would
+/// otherwise grow that set without bound.
+const MAX_OPEN_DOCS: usize = 128;
+
 async fn ensure_document_current(client: &LspClient, path: &Path) -> Result<(), LspClientError> {
     let text = tokio::fs::read_to_string(path)
         .await
@@ -1380,17 +1392,21 @@ async fn ensure_document_current(client: &LspClient, path: &Path) -> Result<(), 
     let uri = path_to_uri(path)?;
     let language_id = language_id_for(path);
 
+    // The docs lock is held across the notify so concurrent calls
+    // cannot interleave their version bumps with out-of-order
+    // didChange notifications.
     let mut docs = client.opened_documents().lock().await;
     match docs.get_mut(&uri) {
         Some(entry) if entry.text == text => {
             // Nothing changed.
+            entry.last_used = std::time::Instant::now();
             Ok(())
         }
         Some(entry) => {
             entry.version += 1;
             entry.text.clone_from(&text);
+            entry.last_used = std::time::Instant::now();
             let version = entry.version;
-            drop(docs);
             let params = DidChangeTextDocumentParams {
                 text_document: VersionedTextDocumentIdentifier { uri, version },
                 content_changes: vec![TextDocumentContentChangeEvent {
@@ -1402,14 +1418,31 @@ async fn ensure_document_current(client: &LspClient, path: &Path) -> Result<(), 
             client.notify::<DidChangeTextDocument>(params).await
         }
         None => {
+            let evict = if docs.len() >= MAX_OPEN_DOCS {
+                docs.iter()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(uri, _)| uri.clone())
+            } else {
+                None
+            };
+            if let Some(old_uri) = evict {
+                docs.remove(&old_uri);
+                let _ = client
+                    .notify::<lsp_types::notification::DidCloseTextDocument>(
+                        lsp_types::DidCloseTextDocumentParams {
+                            text_document: lsp_types::TextDocumentIdentifier { uri: old_uri },
+                        },
+                    )
+                    .await;
+            }
             docs.insert(
                 uri.clone(),
                 crate::client::OpenedDocument {
                     version: 1,
                     text: text.clone(),
+                    last_used: std::time::Instant::now(),
                 },
             );
-            drop(docs);
             let params = DidOpenTextDocumentParams {
                 text_document: TextDocumentItem {
                     uri,

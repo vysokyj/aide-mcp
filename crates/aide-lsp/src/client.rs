@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +61,10 @@ type OpenedDocs = Arc<Mutex<HashMap<Uri, OpenedDocument>>>;
 pub struct OpenedDocument {
     pub version: i32,
     pub text: String,
+    /// When a tool last touched this document — drives the LRU cap in
+    /// `ops::ensure_document_current` so a busy server does not hold
+    /// every file it ever saw open forever.
+    pub last_used: std::time::Instant,
 }
 
 /// A running LSP server connected over stdio.
@@ -72,6 +76,9 @@ pub struct LspClient {
     opened: OpenedDocs,
     child: Mutex<Child>,
     request_timeout: Duration,
+    /// Cleared when the reader task exits (server crashed or closed
+    /// stdout). The pool checks this to avoid handing out dead clients.
+    alive: Arc<AtomicBool>,
 }
 
 impl LspClient {
@@ -101,8 +108,9 @@ impl LspClient {
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: Diagnostics = Arc::new(Mutex::new(HashMap::new()));
+        let alive = Arc::new(AtomicBool::new(true));
 
-        spawn_reader(stdout, pending.clone(), diagnostics.clone());
+        spawn_reader(stdout, pending.clone(), diagnostics.clone(), alive.clone());
         if let Some(stderr) = stderr {
             spawn_stderr_drain(stderr);
         }
@@ -115,6 +123,7 @@ impl LspClient {
             opened: Arc::new(Mutex::new(HashMap::new())),
             child: Mutex::new(child),
             request_timeout: Duration::from_secs(30),
+            alive,
         };
 
         client.initialize(workspace_root).await?;
@@ -234,8 +243,33 @@ impl LspClient {
             .unwrap_or_default()
     }
 
+    /// `false` once the server's stdout reached EOF — the process
+    /// crashed or closed the transport. A dead client never recovers;
+    /// callers should drop it and spawn a fresh one.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
     /// Attempt a graceful `shutdown` → `exit` handshake, then kill the child.
     pub async fn shutdown(&self) -> Result<(), LspClientError> {
+        // Close tracked documents first — polite to servers that flush
+        // per-document state, and it keeps our map honest if the
+        // process survives the handshake longer than expected.
+        let uris: Vec<Uri> = self
+            .opened
+            .lock()
+            .await
+            .drain()
+            .map(|(uri, _)| uri)
+            .collect();
+        for uri in uris {
+            let _ = self
+                .notify_raw(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": uri.as_str()}}),
+                )
+                .await;
+        }
         let _ = self.request::<Shutdown>(()).await;
         let _ = self.notify_raw("exit", Value::Null).await;
         let _ = self.child.lock().await.kill().await;
@@ -243,7 +277,12 @@ impl LspClient {
     }
 }
 
-fn spawn_reader(stdout: tokio::process::ChildStdout, pending: Pending, diagnostics: Diagnostics) {
+fn spawn_reader(
+    stdout: tokio::process::ChildStdout,
+    pending: Pending,
+    diagnostics: Diagnostics,
+    alive: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         loop {
@@ -274,6 +313,11 @@ fn spawn_reader(stdout: tokio::process::ChildStdout, pending: Pending, diagnosti
             }
             dispatch(msg, &pending, &diagnostics).await;
         }
+        // The server is gone. Mark the client dead and fail every
+        // in-flight request immediately — dropping the senders resolves
+        // their callers to Cancelled instead of a full 30 s timeout.
+        alive.store(false, Ordering::Relaxed);
+        pending.lock().await.clear();
         tracing::debug!("lsp reader exited");
     });
 }

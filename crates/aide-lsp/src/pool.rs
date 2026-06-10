@@ -69,9 +69,23 @@ impl LspPool {
             root: root.to_path_buf(),
         };
 
-        if let Some(existing) = self.clients.lock().await.get_mut(&key) {
-            existing.last_used = Instant::now();
-            return Ok(existing.client.clone());
+        {
+            let mut clients = self.clients.lock().await;
+            if let Some(existing) = clients.get_mut(&key) {
+                if existing.client.is_alive() {
+                    existing.last_used = Instant::now();
+                    return Ok(existing.client.clone());
+                }
+                // The server died behind our back — without this check
+                // every call would burn the full request timeout on a
+                // dead process. Drop the corpse and spawn fresh below.
+                tracing::warn!(
+                    language,
+                    root = %root.display(),
+                    "cached LSP client is dead — respawning"
+                );
+                clients.remove(&key);
+            }
         }
 
         if !server_binary.exists() {
