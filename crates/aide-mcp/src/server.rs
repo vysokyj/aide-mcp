@@ -953,12 +953,28 @@ pub struct AideServer {
     /// request; existing names are refused until the caller explicitly
     /// terminates the session.
     dap_sessions: Arc<AsyncMutex<HashMap<String, Arc<DapClient>>>>,
+    /// Parsed-SCIP-index cache keyed by `.scip` file path, validated
+    /// by mtime. A parsed index for a real repo is tens of MB of
+    /// protobuf; without this every symbol-annotating tool call paid
+    /// the full read + decode again.
+    scip_cache: Arc<AsyncMutex<HashMap<PathBuf, ScipCacheEntry>>>,
     #[allow(
         dead_code,
         reason = "field is read via #[tool_handler] macro expansion"
     )]
     tool_router: ToolRouter<Self>,
 }
+
+struct ScipCacheEntry {
+    mtime: std::time::SystemTime,
+    last_used: std::time::Instant,
+    index: Arc<aide_scip::ScipIndex>,
+}
+
+/// Cap on cached parsed SCIP indexes. One session touches a handful
+/// of repos × retention commits; evicting least-recently-used past
+/// this keeps the worst case bounded without an LRU dependency.
+const SCIP_CACHE_CAP: usize = 8;
 
 /// How often the background reloader polls `~/.aide/config.toml`.
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
@@ -984,8 +1000,66 @@ impl AideServer {
             indexer,
             jobs: Arc::new(crate::jobs::Registry::new()),
             dap_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+            scip_cache: Arc::new(AsyncMutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Load a parsed SCIP index through the mtime-validated cache.
+    /// Index files are immutable once written (one file per commit),
+    /// so a hit is simply an `Arc` clone; the mtime check guards the
+    /// rare rebuild-in-place. The protobuf decode happens outside the
+    /// cache lock so a slow parse does not serialize unrelated tools.
+    async fn cached_scip_load(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Arc<aide_scip::ScipIndex>, String> {
+        let mtime = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+
+        let mut cache = self.scip_cache.lock().await;
+        if let Some(entry) = cache.get_mut(path) {
+            if entry.mtime == mtime {
+                entry.last_used = std::time::Instant::now();
+                return Ok(entry.index.clone());
+            }
+        }
+        drop(cache);
+
+        let index = Arc::new(aide_scip::load(path).map_err(|e| e.to_string())?);
+
+        let mut cache = self.scip_cache.lock().await;
+        if cache.len() >= SCIP_CACHE_CAP {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            path.to_path_buf(),
+            ScipCacheEntry {
+                mtime,
+                last_used: std::time::Instant::now(),
+                index: index.clone(),
+            },
+        );
+        Ok(index)
+    }
+
+    /// Resolve the Ready `.scip` for `(repo_root, sha)` and load it
+    /// through the cache — the one-stop shop every SCIP-backed tool
+    /// uses instead of hand-rolling resolve + load.
+    async fn load_scip_index(
+        &self,
+        repo_root: &str,
+        sha: Option<&str>,
+    ) -> Result<Arc<aide_scip::ScipIndex>, String> {
+        let path = self.resolve_scip_path(repo_root, sha).await?;
+        self.cached_scip_load(&path).await
     }
 
     /// Current exec default timeout (config is live-reloaded).
@@ -1126,7 +1200,10 @@ impl AideServer {
         let Some(index_path) = info.index_path.as_ref() else {
             return meta;
         };
-        let Ok(index) = aide_scip::load(std::path::Path::new(index_path)) else {
+        let Ok(index) = self
+            .cached_scip_load(std::path::Path::new(index_path))
+            .await
+        else {
             return meta;
         };
         for hit in hits {
@@ -1153,10 +1230,7 @@ impl AideServer {
             return;
         }
         let root_str = root.display().to_string();
-        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
-            return;
-        };
-        let Ok(index) = aide_scip::load(&scip_path) else {
+        let Ok(index) = self.load_scip_index(&root_str, None).await else {
             return;
         };
         for d in diagnostics {
@@ -1186,10 +1260,7 @@ impl AideServer {
             return;
         }
         let root_str = root.display().to_string();
-        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
-            return;
-        };
-        let Ok(index) = aide_scip::load(&scip_path) else {
+        let Ok(index) = self.load_scip_index(&root_str, None).await else {
             return;
         };
         let rel = relativize_path(root, &file.display().to_string());
@@ -1213,10 +1284,7 @@ impl AideServer {
             return;
         }
         let root_str = root.display().to_string();
-        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
-            return;
-        };
-        let Ok(index) = aide_scip::load(&scip_path) else {
+        let Ok(index) = self.load_scip_index(&root_str, None).await else {
             return;
         };
         for snap in snapshots {
@@ -1240,10 +1308,7 @@ impl AideServer {
             return;
         }
         let root_str = root.display().to_string();
-        let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
-            return;
-        };
-        let Ok(index) = aide_scip::load(&scip_path) else {
+        let Ok(index) = self.load_scip_index(&root_str, None).await else {
             return;
         };
         for hit in hits {
@@ -1291,7 +1356,7 @@ impl AideServer {
         let Ok(scip_path) = self.resolve_scip_path(&root_str, None).await else {
             return Ok(None);
         };
-        let index = aide_scip::load(&scip_path).map_err(|e| e.to_string())?;
+        let index = self.cached_scip_load(&scip_path).await?;
         let rel = relativize_path(root, &file.display().to_string());
         let line_0based = i32::try_from(line).unwrap_or(i32::MAX);
         let Some(symbol_id) = aide_scip::enclosing_definition_id(&index, &rel, line_0based) else {
@@ -2278,16 +2343,9 @@ impl AideServer {
     async fn scip_documents(&self, Parameters(args): Parameters<ScipDocumentsArgs>) -> String {
         let root = resolve_root(args.path);
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        match aide_scip::load(&index_path) {
+        match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(idx) => to_json(&aide_scip::documents(&idx)),
-            Err(e) => error_json(e.to_string()),
+            Err(e) => error_json(e),
         }
     }
 
@@ -2297,16 +2355,9 @@ impl AideServer {
     async fn scip_symbols(&self, Parameters(args): Parameters<ScipSymbolsArgs>) -> String {
         let root = resolve_root(args.path);
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        match aide_scip::load(&index_path) {
+        match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(idx) => to_json(&aide_scip::find_symbols(&idx, &args.query)),
-            Err(e) => error_json(e.to_string()),
+            Err(e) => error_json(e),
         }
     }
 
@@ -2316,16 +2367,9 @@ impl AideServer {
     async fn scip_references(&self, Parameters(args): Parameters<ScipReferencesArgs>) -> String {
         let root = resolve_root(args.path);
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        match aide_scip::load(&index_path) {
+        match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(idx) => to_json(&aide_scip::references(&idx, &args.symbol)),
-            Err(e) => error_json(e.to_string()),
+            Err(e) => error_json(e),
         }
     }
 
@@ -2335,16 +2379,9 @@ impl AideServer {
     async fn scip_callers(&self, Parameters(args): Parameters<ScipReferencesArgs>) -> String {
         let root = resolve_root(args.path);
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        match aide_scip::load(&index_path) {
+        match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(idx) => to_json(&aide_scip::callers(&idx, &args.symbol)),
-            Err(e) => error_json(e.to_string()),
+            Err(e) => error_json(e),
         }
     }
 
@@ -2354,19 +2391,12 @@ impl AideServer {
     async fn project_map(&self, Parameters(args): Parameters<ProjectMapArgs>) -> String {
         let root = resolve_root(args.path);
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        match aide_scip::load(&index_path) {
+        match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(idx) => {
                 let kinds: Vec<&str> = args.kinds.iter().map(String::as_str).collect();
                 to_json(&aide_scip::project_map(&idx, &kinds))
             }
-            Err(e) => error_json(e.to_string()),
+            Err(e) => error_json(e),
         }
     }
 
@@ -2379,16 +2409,9 @@ impl AideServer {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        let idx = match aide_scip::load(&index_path) {
+        let idx = match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(i) => i,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
         let callers = aide_scip::enclosing_defs_of_callers(&idx, &args.symbol);
         let entries: Vec<serde_json::Value> = callers
@@ -2419,21 +2442,13 @@ impl AideServer {
         let root = resolve_root(args.path);
         let repo_root = root.display().to_string();
 
-        let path1 = match self.resolve_scip_path(&repo_root, Some(&args.sha1)).await {
-            Ok(p) => p,
-            Err(e) => return error_json(format!("sha1 not Ready: {e}")),
-        };
-        let path2 = match self.resolve_scip_path(&repo_root, Some(&args.sha2)).await {
-            Ok(p) => p,
-            Err(e) => return error_json(format!("sha2 not Ready: {e}")),
-        };
-        let idx1 = match aide_scip::load(&path1) {
+        let idx1 = match self.load_scip_index(&repo_root, Some(&args.sha1)).await {
             Ok(i) => i,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(format!("sha1: {e}")),
         };
-        let idx2 = match aide_scip::load(&path2) {
+        let idx2 = match self.load_scip_index(&repo_root, Some(&args.sha2)).await {
             Ok(i) => i,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(format!("sha2: {e}")),
         };
 
         let kinds: Vec<&str> = args.kinds.iter().map(String::as_str).collect();
@@ -2488,16 +2503,9 @@ impl AideServer {
             return error_json(format!("no language plugin claims root {}", root.display()));
         };
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        let idx = match aide_scip::load(&index_path) {
+        let idx = match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(i) => i,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
         let tests: Vec<_> = aide_scip::enclosing_defs_of_callers(&idx, &args.symbol)
             .into_iter()
@@ -2530,16 +2538,9 @@ impl AideServer {
             return to_json(&Vec::<aide_scip::LocatedSymbol>::new());
         }
         let repo_root = root.display().to_string();
-        let index_path = match self
-            .resolve_scip_path(&repo_root, args.sha.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return error_json(e),
-        };
-        let idx = match aide_scip::load(&index_path) {
+        let idx = match self.load_scip_index(&repo_root, args.sha.as_deref()).await {
             Ok(i) => i,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2645,12 +2646,10 @@ impl AideServer {
         }
 
         let repo_root = root.display().to_string();
-        if let Ok(index_path) = self.resolve_scip_path(&repo_root, None).await {
-            if let Ok(idx) = aide_scip::load(&index_path) {
-                ctx["scip_symbols"] =
-                    serde_json::to_value(aide_scip::defs_in_path(&idx, &relative_str))
-                        .unwrap_or_default();
-            }
+        if let Ok(idx) = self.load_scip_index(&repo_root, None).await {
+            ctx["scip_symbols"] =
+                serde_json::to_value(aide_scip::defs_in_path(&idx, &relative_str))
+                    .unwrap_or_default();
         }
 
         to_json(&ctx)
@@ -2719,29 +2718,27 @@ impl AideServer {
             ctx["indexer_head_sha"] = serde_json::Value::String(info.sha);
         }
 
-        if let Ok(index_path) = self.resolve_scip_path(&repo_root, None).await {
-            if let Ok(idx) = aide_scip::load(&index_path) {
-                let map = aide_scip::project_map(&idx, &[]);
+        if let Ok(idx) = self.load_scip_index(&repo_root, None).await {
+            let map = aide_scip::project_map(&idx, &[]);
 
-                if let Some(plugin) = plugins.first() {
-                    let mut tests = Vec::new();
-                    for module in &map {
-                        for sym in &module.symbols {
-                            if plugin.is_test_symbol(&module.relative_path, &sym.display_name) {
-                                tests.push(serde_json::json!({
-                                    "symbol": sym.symbol,
-                                    "display_name": sym.display_name,
-                                    "kind": sym.kind,
-                                    "relative_path": module.relative_path,
-                                    "line": sym.line,
-                                }));
-                            }
+            if let Some(plugin) = plugins.first() {
+                let mut tests = Vec::new();
+                for module in &map {
+                    for sym in &module.symbols {
+                        if plugin.is_test_symbol(&module.relative_path, &sym.display_name) {
+                            tests.push(serde_json::json!({
+                                "symbol": sym.symbol,
+                                "display_name": sym.display_name,
+                                "kind": sym.kind,
+                                "relative_path": module.relative_path,
+                                "line": sym.line,
+                            }));
                         }
                     }
-                    ctx["test_entry_points"] = serde_json::Value::Array(tests);
                 }
-                ctx["project_map"] = serde_json::to_value(map).unwrap_or_default();
+                ctx["test_entry_points"] = serde_json::Value::Array(tests);
             }
+            ctx["project_map"] = serde_json::to_value(map).unwrap_or_default();
         }
 
         to_json(&ctx)
