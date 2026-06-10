@@ -43,3 +43,15 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
+
+  msrv:
+    name: check (MSRV 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The dtolnay action exports RUSTUP_TOOLCHAIN, which outranks the
+      # repo's rust-toolchain.toml (channel = stable) — without it this
+      # job would silently test stable again.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets

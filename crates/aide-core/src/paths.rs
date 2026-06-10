@@ -28,13 +28,30 @@ impl AidePaths {
     /// 1. `$AIDE_HOME` if set (explicit override — primarily for tests).
     /// 2. Otherwise `$HOME/.aide`.
     pub fn from_home() -> Result<Self, PathsError> {
-        if let Some(override_root) = std::env::var_os("AIDE_HOME") {
-            return Ok(Self::at(override_root));
+        let paths = if let Some(override_root) = std::env::var_os("AIDE_HOME") {
+            Self::at(override_root)
+        } else {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or(PathsError::NoHome)?;
+            Self::at(home.join(".aide"))
+        };
+        paths.ensure_private_root();
+        Ok(paths)
+    }
+
+    /// Create the root if missing and keep it private (0700 on unix):
+    /// `auth/` holds tokens and `logs/` captures exec output that may
+    /// echo secrets, so other local users must not be able to read
+    /// them. Best-effort — a failure here surfaces later as a clearer
+    /// error on the operation that actually needs the directory.
+    fn ensure_private_root(&self) {
+        let _ = std::fs::create_dir_all(&self.root);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700));
         }
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or(PathsError::NoHome)?;
-        Ok(Self::at(home.join(".aide")))
     }
 
     pub fn at(root: impl Into<PathBuf>) -> Self {
@@ -129,6 +146,21 @@ mod tests {
             paths.memory("home_jirka_workspace_aide-mcp"),
             Path::new("/tmp/aide-test/memory/home_jirka_workspace_aide-mcp")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_home_creates_private_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("aide-home");
+        // `from_home` reads AIDE_HOME from the process env, which is
+        // unsafe to mutate in parallel tests — exercise the same code
+        // path directly instead.
+        let paths = AidePaths::at(&root);
+        paths.ensure_private_root();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]

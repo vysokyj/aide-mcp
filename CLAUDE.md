@@ -64,6 +64,10 @@ unless there is a real reason (see below).
   body wrapping at ~72.
 - Never `--force`, never `--no-verify`. If a hook fails, fix the underlying
   issue and create a new commit.
+- Push release tags **one at a time**. GitHub Actions silently skips
+  tag-triggered workflows when a single push contains more than 3 tags
+  (hit in practice on 2026-06-09 with v0.24.0–v0.28.0). Recovery: run the
+  Release workflow manually via `gh workflow run release.yml -f tag=vX.Y.Z`.
 
 ## Scope discipline
 

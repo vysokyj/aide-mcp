@@ -2306,7 +2306,7 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Every occurrence of a SCIP symbol id across the index, with `is_definition` flag. Pair with `scip_symbols` to discover the symbol id first."
+        description = "Every occurrence of a SCIP symbol id across the index, with `is_definition` flag. Pair with `scip_symbols` to discover the symbol id first. Queries the most recently indexed Ready commit by default; pass `sha` to pin a specific (already indexed) commit."
     )]
     async fn scip_references(&self, Parameters(args): Parameters<ScipReferencesArgs>) -> String {
         let root = resolve_root(args.path);
@@ -2325,7 +2325,7 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Call sites of a SCIP symbol — every occurrence except the definition itself. Shorthand for `scip_references` filtered to non-definitions; use it when the question is 'who uses this?'."
+        description = "Call sites of a SCIP symbol — every occurrence except the definition itself. Shorthand for `scip_references` filtered to non-definitions; use it when the question is 'who uses this?'. Queries the most recently indexed Ready commit by default; pass `sha` to pin a specific (already indexed) commit."
     )]
     async fn scip_callers(&self, Parameters(args): Parameters<ScipReferencesArgs>) -> String {
         let root = resolve_root(args.path);

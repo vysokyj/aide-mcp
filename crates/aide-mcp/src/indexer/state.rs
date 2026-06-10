@@ -114,8 +114,18 @@ impl Store {
     /// Returns an [`EnqueueOutcome`] so the caller knows whether to
     /// schedule fresh work.
     pub async fn enqueue(&self, repo_root: &str, sha: &str) -> Result<EnqueueOutcome, StateError> {
+        self.enqueue_at(repo_root, sha, now_unix()).await
+    }
+
+    /// [`Self::enqueue`] with an explicit timestamp — lets tests drive
+    /// ordering without sleeping across wall-clock second boundaries.
+    async fn enqueue_at(
+        &self,
+        repo_root: &str,
+        sha: &str,
+        now: i64,
+    ) -> Result<EnqueueOutcome, StateError> {
         let repo_root = repo_key(repo_root);
-        let now = now_unix();
         let mut guard = self.inner.lock().await;
         let repo = guard.state.repos.entry(repo_root).or_default();
         repo.last_sha = Some(sha.to_string());
@@ -165,8 +175,21 @@ impl Store {
         sha: &str,
         index_path: PathBuf,
     ) -> Result<Vec<PathBuf>, StateError> {
+        self.mark_ready_at(repo_root, sha, index_path, now_unix())
+            .await
+    }
+
+    /// [`Self::mark_ready`] with an explicit timestamp — lets tests
+    /// drive ordering without sleeping across wall-clock second
+    /// boundaries.
+    async fn mark_ready_at(
+        &self,
+        repo_root: &str,
+        sha: &str,
+        index_path: PathBuf,
+        now: i64,
+    ) -> Result<Vec<PathBuf>, StateError> {
         let repo_root = repo_key(repo_root);
-        let now = now_unix();
         let path_str = index_path.display().to_string();
 
         let mut guard = self.inner.lock().await;
@@ -438,18 +461,17 @@ mod tests {
         let path = dir.path().join("state.json");
         let store = Store::load(&path, 1).unwrap();
 
-        store.enqueue("/repo", "older").await.unwrap();
+        // Explicit timestamps instead of real sleeps — ordering is what
+        // matters, not wall-clock time.
+        store.enqueue_at("/repo", "older", 100).await.unwrap();
         store
-            .mark_ready("/repo", "older", PathBuf::from("/older.scip"))
+            .mark_ready_at("/repo", "older", PathBuf::from("/older.scip"), 100)
             .await
             .unwrap();
 
-        // Sleep to get a different unix-second stamp for the second mark.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
-        store.enqueue("/repo", "newer").await.unwrap();
+        store.enqueue_at("/repo", "newer", 200).await.unwrap();
         store
-            .mark_ready("/repo", "newer", PathBuf::from("/newer.scip"))
+            .mark_ready_at("/repo", "newer", PathBuf::from("/newer.scip"), 200)
             .await
             .unwrap();
 
@@ -468,18 +490,17 @@ mod tests {
         let store = Store::load(&path, 1).unwrap();
 
         // First Ready commit — nothing to evict.
-        store.enqueue("/repo", "first").await.unwrap();
+        store.enqueue_at("/repo", "first", 100).await.unwrap();
         let evicted = store
-            .mark_ready("/repo", "first", PathBuf::from("/first.scip"))
+            .mark_ready_at("/repo", "first", PathBuf::from("/first.scip"), 100)
             .await
             .unwrap();
         assert!(evicted.is_empty());
 
         // Second Ready commit — the first one should get evicted.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        store.enqueue("/repo", "second").await.unwrap();
+        store.enqueue_at("/repo", "second", 200).await.unwrap();
         let evicted = store
-            .mark_ready("/repo", "second", PathBuf::from("/second.scip"))
+            .mark_ready_at("/repo", "second", PathBuf::from("/second.scip"), 200)
             .await
             .unwrap();
         assert_eq!(evicted, vec![PathBuf::from("/first.scip")]);

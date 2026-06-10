@@ -105,6 +105,10 @@ LSP: LSP is live, SCIP is stable with a full pre-computed call graph. If
 `index_status` is not `Ready`, these tools error — `git_status` or
 `index_commit` to nudge the worker, then poll.
 
+Every `sha?` parameter below defaults to the most recently indexed
+**Ready** commit — never a stale or still-pending one. Pass an explicit
+`sha` to pin a specific (already indexed) commit.
+
 | Tool | Replaces | What it does |
 |---|---|---|
 | `scip_documents(sha?)` | — | All paths covered by the SCIP index for a commit. |
