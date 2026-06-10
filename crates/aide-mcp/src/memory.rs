@@ -215,8 +215,16 @@ fn parse(default_name: &str, raw: &str) -> Memory {
     let mut description = None;
     let mut body_start = 0;
 
-    if let Some(rest) = raw.strip_prefix("---\n") {
-        if let Some(end_idx) = rest.find("\n---\n") {
+    // The format is portable across agents and platforms, so tolerate
+    // CRLF delimiters — a file written on Windows must parse the same
+    // as one written with plain LF.
+    let (open, close) = if raw.starts_with("---\r\n") {
+        ("---\r\n", "\r\n---\r\n")
+    } else {
+        ("---\n", "\n---\n")
+    };
+    if let Some(rest) = raw.strip_prefix(open) {
+        if let Some(end_idx) = rest.find(close) {
             let header = &rest[..end_idx];
             for line in header.lines() {
                 if let Some(v) = line.strip_prefix("name:") {
@@ -228,11 +236,13 @@ fn parse(default_name: &str, raw: &str) -> Memory {
                     }
                 }
             }
-            body_start = 4 + end_idx + 5; // "---\n" + header + "\n---\n"
+            body_start = open.len() + end_idx + close.len();
         }
     }
 
-    let body = raw[body_start..].trim_start_matches('\n').to_string();
+    let body = raw[body_start..]
+        .trim_start_matches(['\r', '\n'])
+        .to_string();
     Memory {
         name,
         description,
@@ -263,6 +273,16 @@ mod tests {
         assert_eq!(got.name, "my-note");
         assert_eq!(got.description.as_deref(), Some("a short note"));
         assert_eq!(got.content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn parse_tolerates_crlf_frontmatter() {
+        let raw =
+            "---\r\nname: win-note\r\ndescription: written on windows\r\n---\r\n\r\nbody line\r\n";
+        let m = parse("fallback", raw);
+        assert_eq!(m.name, "win-note");
+        assert_eq!(m.description.as_deref(), Some("written on windows"));
+        assert_eq!(m.content, "body line\r\n");
     }
 
     #[test]

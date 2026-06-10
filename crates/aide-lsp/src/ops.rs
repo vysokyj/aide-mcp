@@ -1072,11 +1072,15 @@ fn byte_offset(line_offsets: &[usize], text: &str, pos: Position) -> Option<usiz
 }
 
 fn uri_to_path(uri: &Uri) -> Result<std::path::PathBuf, LspClientError> {
+    // Route through url::Url so percent-encoding is decoded — servers
+    // encode spaces and non-ASCII in returned URIs (`my%20file.rs`),
+    // and a naive prefix strip would produce a path that misses on
+    // every subsequent I/O. Mirrors `path_to_uri` in client.rs.
     let s = uri.as_str();
-    let stripped = s
-        .strip_prefix("file://")
-        .ok_or_else(|| LspClientError::Uri(format!("not a file:// URI: {s}")))?;
-    Ok(std::path::PathBuf::from(stripped))
+    let url =
+        url::Url::parse(s).map_err(|e| LspClientError::Uri(format!("invalid URI {s}: {e}")))?;
+    url.to_file_path()
+        .map_err(|()| LspClientError::Uri(format!("not a file:// URI: {s}")))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1556,6 +1560,35 @@ fn marked_string_to_plain(s: &MarkedString) -> String {
         MarkedString::LanguageString(ls) => {
             format!("```{}\n{}\n```", ls.language, ls.value)
         }
+    }
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use std::str::FromStr;
+
+    use super::{uri_to_path, Uri};
+
+    #[test]
+    fn uri_to_path_decodes_percent_encoding() {
+        let uri = Uri::from_str("file:///home/u/my%20project/caf%C3%A9.rs").unwrap();
+        let path = uri_to_path(&uri).unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/home/u/my project/café.rs"));
+    }
+
+    #[test]
+    fn uri_to_path_plain_ascii_roundtrip() {
+        let uri = Uri::from_str("file:///a/b.rs").unwrap();
+        assert_eq!(
+            uri_to_path(&uri).unwrap(),
+            std::path::PathBuf::from("/a/b.rs")
+        );
+    }
+
+    #[test]
+    fn uri_to_path_rejects_non_file_scheme() {
+        let uri = Uri::from_str("https://example.com/a.rs").unwrap();
+        assert!(uri_to_path(&uri).is_err());
     }
 }
 
