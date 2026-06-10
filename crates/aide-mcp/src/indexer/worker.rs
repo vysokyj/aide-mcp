@@ -30,13 +30,19 @@ pub struct Job {
     pub sha: String,
 }
 
-pub fn spawn(paths: AidePaths, store: Store) -> mpsc::UnboundedSender<Job> {
-    let (tx, rx) = mpsc::unbounded_channel();
+/// Maximum number of jobs waiting in the worker channel. Indexing is
+/// serial and each job takes seconds-to-minutes; a queue deeper than
+/// this means something is enqueueing pathologically (agent retry
+/// loop), so `enqueue` fails fast instead of buffering without bound.
+pub const QUEUE_CAP: usize = 64;
+
+pub fn spawn(paths: AidePaths, store: Store) -> mpsc::Sender<Job> {
+    let (tx, rx) = mpsc::channel(QUEUE_CAP);
     tokio::spawn(run(paths, store, rx));
     tx
 }
 
-async fn run(paths: AidePaths, store: Store, mut rx: mpsc::UnboundedReceiver<Job>) {
+async fn run(paths: AidePaths, store: Store, mut rx: mpsc::Receiver<Job>) {
     let registry = Arc::new(Registry::builtin());
     while let Some(job) = rx.recv().await {
         process(&paths, &registry, &store, &job).await;

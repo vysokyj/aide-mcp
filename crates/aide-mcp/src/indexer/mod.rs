@@ -25,7 +25,7 @@ use self::worker::Job;
 #[derive(Clone)]
 pub struct Indexer {
     store: Store,
-    jobs: mpsc::UnboundedSender<Job>,
+    jobs: mpsc::Sender<Job>,
 }
 
 impl Indexer {
@@ -42,9 +42,13 @@ impl Indexer {
         let resume_store = store.clone();
         let resume_jobs = jobs.clone();
         tokio::spawn(async move {
-            for (repo_root, sha) in resume_store.recoverable_jobs().await {
+            // Cap recovery at one channel's worth — a crashed instance
+            // with thousands of Pending commits must not flood memory.
+            // Overflow entries are flipped to Failed by the store so a
+            // later enqueue retries them.
+            for (repo_root, sha) in resume_store.take_recoverable_jobs(worker::QUEUE_CAP).await {
                 tracing::info!(repo = %repo_root, sha = %sha, "recovering interrupted job");
-                let _ = resume_jobs.send(Job { repo_root, sha });
+                let _ = resume_jobs.send(Job { repo_root, sha }).await;
             }
         });
 
@@ -86,9 +90,27 @@ impl Indexer {
     async fn enqueue_inner(&self, repo_root: String, sha: String) -> Result<EnqueueOutcome> {
         let outcome = self.store.enqueue(&repo_root, &sha).await?;
         if outcome == EnqueueOutcome::NeedsIndexing {
-            self.jobs
-                .send(Job { repo_root, sha })
-                .map_err(|e| anyhow::anyhow!("indexer worker channel closed: {e}"))?;
+            if let Err(e) = self.jobs.try_send(Job {
+                repo_root: repo_root.clone(),
+                sha: sha.clone(),
+            }) {
+                // The entry was just marked Pending but never reached
+                // the channel; flip it to Failed so a later enqueue
+                // retries instead of deduping against a ghost.
+                let reason = match e {
+                    mpsc::error::TrySendError::Full(_) => format!(
+                        "indexer queue full ({} jobs waiting) — retry later",
+                        worker::QUEUE_CAP
+                    ),
+                    mpsc::error::TrySendError::Closed(_) => {
+                        "indexer worker channel closed".to_string()
+                    }
+                };
+                self.store
+                    .mark_failed(&repo_root, &sha, reason.clone())
+                    .await?;
+                return Err(anyhow::anyhow!(reason));
+            }
         }
         Ok(outcome)
     }

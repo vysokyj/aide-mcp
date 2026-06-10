@@ -40,6 +40,13 @@ pub enum EnqueueOutcome {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct IndexerState {
     repos: HashMap<String, RepoState>,
+    /// Index files evicted by retention but not yet deleted — they are
+    /// handed to the caller one `mark_ready` round *later*, so a query
+    /// that resolved a path just before its commit was evicted can
+    /// still finish reading the file. Persisted so a restart cannot
+    /// leak them forever.
+    #[serde(default)]
+    pending_unlink: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -167,8 +174,10 @@ impl Store {
 
     /// Flip `sha` to `Ready` with the produced index path, then evict
     /// older Ready commits per retention policy (default: keep only the
-    /// most recently enqueued one). Returns the on-disk paths of
-    /// evicted `.scip` files so the caller can delete them.
+    /// most recently enqueued one). Returns `.scip` paths that are now
+    /// safe to delete — paths evicted on a *previous* round. This
+    /// round's evictions are only stashed: a concurrent SCIP query that
+    /// already resolved one of them can still finish reading the file.
     pub async fn mark_ready(
         &self,
         repo_root: &str,
@@ -193,7 +202,7 @@ impl Store {
         let path_str = index_path.display().to_string();
 
         let mut guard = self.inner.lock().await;
-        let mut evicted: Vec<PathBuf> = Vec::new();
+        let mut evicted: Vec<String> = Vec::new();
 
         if let Some(repo) = guard.state.repos.get_mut(&repo_root) {
             if let Some(entry) = repo.commits.get_mut(sha) {
@@ -220,15 +229,19 @@ impl Store {
             {
                 if let Some(entry) = repo.commits.remove(&evict_sha) {
                     if let Some(p) = entry.index_path {
-                        evicted.push(PathBuf::from(p));
+                        evicted.push(p);
                     }
                 }
             }
         }
 
+        // Grace period: release last round's stash for deletion, stash
+        // this round's evictions for the next one.
+        let ripe = std::mem::replace(&mut guard.state.pending_unlink, evicted);
+
         let path = guard.path.clone();
         flush(&guard.state, &path)?;
-        Ok(evicted)
+        Ok(ripe.into_iter().map(PathBuf::from).collect())
     }
 
     pub async fn mark_failed(
@@ -294,20 +307,45 @@ impl Store {
             .map(|(sha, entry)| entry.to_info(sha.clone()))
     }
 
-    /// Return every (`repo_root`, sha) pair that is still `Pending` or
-    /// `InProgress`. Called on start-up so that commits interrupted by
-    /// an earlier crash get retried.
-    pub async fn recoverable_jobs(&self) -> Vec<(String, String)> {
-        let guard = self.inner.lock().await;
-        let mut out = Vec::new();
+    /// Return up to `limit` (`repo_root`, sha) pairs that are still
+    /// `Pending` or `InProgress`, most recently enqueued first. Called
+    /// on start-up so commits interrupted by an earlier crash get
+    /// retried. Anything beyond the cap is flipped to `Failed` rather
+    /// than left as-is: `enqueue` dedupes on `Pending`, so a Pending
+    /// entry that never reaches the worker channel would be stuck
+    /// forever, while a Failed one retries on the next enqueue.
+    pub async fn take_recoverable_jobs(&self, limit: usize) -> Vec<(String, String)> {
+        let mut guard = self.inner.lock().await;
+        let mut all: Vec<(String, String, i64)> = Vec::new();
         for (repo_root, repo) in &guard.state.repos {
             for (sha, entry) in &repo.commits {
                 if matches!(entry.state, IndexState::Pending | IndexState::InProgress) {
-                    out.push((repo_root.clone(), sha.clone()));
+                    all.push((repo_root.clone(), sha.clone(), entry.enqueued_at_unix));
                 }
             }
         }
-        out
+        all.sort_by_key(|(_, _, ts)| std::cmp::Reverse(*ts));
+
+        let overflow = all.split_off(limit.min(all.len()));
+        for (repo_root, sha, _) in &overflow {
+            if let Some(entry) = guard
+                .state
+                .repos
+                .get_mut(repo_root)
+                .and_then(|r| r.commits.get_mut(sha))
+            {
+                entry.state =
+                    IndexState::Failed("dropped by recovery cap — re-enqueue to retry".into());
+            }
+        }
+        if !overflow.is_empty() {
+            let path = guard.path.clone();
+            if let Err(e) = flush(&guard.state, &path) {
+                tracing::warn!(error = %e, "could not persist recovery-cap overflow");
+            }
+        }
+
+        all.into_iter().map(|(r, s, _)| (r, s)).collect()
     }
 }
 
@@ -491,25 +529,88 @@ mod tests {
 
         // First Ready commit — nothing to evict.
         store.enqueue_at("/repo", "first", 100).await.unwrap();
-        let evicted = store
+        let ripe = store
             .mark_ready_at("/repo", "first", PathBuf::from("/first.scip"), 100)
             .await
             .unwrap();
-        assert!(evicted.is_empty());
+        assert!(ripe.is_empty());
 
-        // Second Ready commit — the first one should get evicted.
+        // Second Ready commit — the first one is evicted from state but
+        // its file is only stashed (grace period for in-flight queries),
+        // not yet released for deletion.
         store.enqueue_at("/repo", "second", 200).await.unwrap();
-        let evicted = store
+        let ripe = store
             .mark_ready_at("/repo", "second", PathBuf::from("/second.scip"), 200)
             .await
             .unwrap();
-        assert_eq!(evicted, vec![PathBuf::from("/first.scip")]);
+        assert!(ripe.is_empty());
 
         // The old commit is no longer tracked; the new one remains Ready.
         assert!(store.status("/repo", Some("first")).await.is_none());
         let latest = store.status("/repo", Some("second")).await.unwrap();
         assert_eq!(latest.state, IndexState::Ready);
         assert_eq!(latest.index_path.as_deref(), Some("/second.scip"));
+
+        // Third round releases the first file for deletion.
+        store.enqueue_at("/repo", "third", 300).await.unwrap();
+        let ripe = store
+            .mark_ready_at("/repo", "third", PathBuf::from("/third.scip"), 300)
+            .await
+            .unwrap();
+        assert_eq!(ripe, vec![PathBuf::from("/first.scip")]);
+    }
+
+    #[tokio::test]
+    async fn pending_unlink_survives_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let store = Store::load(&path, 1).unwrap();
+            store.enqueue_at("/repo", "first", 100).await.unwrap();
+            store
+                .mark_ready_at("/repo", "first", PathBuf::from("/first.scip"), 100)
+                .await
+                .unwrap();
+            store.enqueue_at("/repo", "second", 200).await.unwrap();
+            // Stashes /first.scip, then the process "crashes".
+            store
+                .mark_ready_at("/repo", "second", PathBuf::from("/second.scip"), 200)
+                .await
+                .unwrap();
+        }
+        let store = Store::load(&path, 1).unwrap();
+        store.enqueue_at("/repo", "third", 300).await.unwrap();
+        let ripe = store
+            .mark_ready_at("/repo", "third", PathBuf::from("/third.scip"), 300)
+            .await
+            .unwrap();
+        assert_eq!(ripe, vec![PathBuf::from("/first.scip")]);
+    }
+
+    #[tokio::test]
+    async fn take_recoverable_jobs_caps_and_fails_overflow() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::load(&path, 1).unwrap();
+        store.enqueue_at("/repo", "oldest", 100).await.unwrap();
+        store.enqueue_at("/repo", "middle", 200).await.unwrap();
+        store.enqueue_at("/repo", "newest", 300).await.unwrap();
+
+        let jobs = store.take_recoverable_jobs(2).await;
+        assert_eq!(
+            jobs,
+            vec![
+                ("/repo/".into(), "newest".into()),
+                ("/repo/".into(), "middle".into()),
+            ]
+        );
+
+        // The overflow entry is Failed — not stuck Pending — so a later
+        // enqueue retries it instead of deduping against a ghost.
+        let info = store.status("/repo", Some("oldest")).await.unwrap();
+        assert!(matches!(info.state, IndexState::Failed(_)));
+        let outcome = store.enqueue("/repo", "oldest").await.unwrap();
+        assert_eq!(outcome, EnqueueOutcome::NeedsIndexing);
     }
 
     #[tokio::test]
@@ -535,7 +636,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut jobs = store.recoverable_jobs().await;
+        let mut jobs = store.take_recoverable_jobs(usize::MAX).await;
         jobs.sort();
         assert_eq!(
             jobs,
