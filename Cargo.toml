@@ -55,7 +55,7 @@ rmcp = { version = "1.5", features = [
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 tokio-util = { version = "0.7", default-features = false }
 clap = { version = "4", features = ["derive"] }
-scip = "0.5"
+scip = "0.6"
 protobuf = "3"
 tar = "0.4"
 tempfile = "3"
