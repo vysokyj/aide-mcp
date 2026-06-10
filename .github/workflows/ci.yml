@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The indexer integration tests need a real SCIP indexer for Rust;
+      # without it they log a skip and pass vacuously.
+      - run: rustup component add rust-analyzer
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --no-fail-fast
         timeout-minutes: 30
