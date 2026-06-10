@@ -1,6 +1,7 @@
 # Project status snapshot
 
-Last updated: 2026-06-07 (v0.27).
+Last updated: 2026-06-10 (version 0.28.0; v0.27 milestone shipped, v0.28
+contexts/modes still planned).
 
 ## Purpose of this file
 

@@ -65,6 +65,18 @@ impl LanguagePlugin for CppPlugin {
             || root.join(".clangd").is_file()
     }
 
+    fn config_files(&self) -> &'static [&'static str] {
+        &[
+            "CMakeLists.txt",
+            "compile_commands.json",
+            "meson.build",
+            "Makefile",
+            "conanfile.txt",
+            "conanfile.py",
+            ".clangd",
+        ]
+    }
+
     fn lsp(&self) -> LspSpec {
         LspSpec {
             name: "clangd",

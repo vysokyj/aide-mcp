@@ -26,6 +26,15 @@ impl LanguagePlugin for RustPlugin {
         root.join("Cargo.toml").is_file()
     }
 
+    fn config_files(&self) -> &'static [&'static str] {
+        &[
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+        ]
+    }
+
     fn lsp(&self) -> LspSpec {
         LspSpec {
             name: "rust-analyzer",

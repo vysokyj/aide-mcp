@@ -28,6 +28,16 @@ impl LanguagePlugin for JavaGradlePlugin {
         root.join("build.gradle").is_file() || root.join("build.gradle.kts").is_file()
     }
 
+    fn config_files(&self) -> &'static [&'static str] {
+        &[
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradle.properties",
+        ]
+    }
+
     fn lsp(&self) -> LspSpec {
         LspSpec {
             name: "jdtls",

@@ -1,0 +1,7 @@
+# Configuration for `cargo deny check advisories` — run by the CI
+# `audit` job. Only the advisories check is enabled; licenses/bans/
+# sources stay at cargo-deny defaults until we need them.
+
+[advisories]
+version = 2
+yanked = "deny"

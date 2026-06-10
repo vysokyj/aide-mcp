@@ -51,6 +51,10 @@ impl LanguagePlugin for GoPlugin {
         root.join("go.mod").is_file()
     }
 
+    fn config_files(&self) -> &'static [&'static str] {
+        &["go.mod", "go.sum", "go.work"]
+    }
+
     fn lsp(&self) -> LspSpec {
         LspSpec {
             name: "gopls",

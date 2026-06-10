@@ -51,6 +51,18 @@ impl LanguagePlugin for PythonPlugin {
             || root.join("requirements.txt").is_file()
     }
 
+    fn config_files(&self) -> &'static [&'static str] {
+        &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+            "Pipfile",
+            "Pipfile.lock",
+            "uv.lock",
+        ]
+    }
+
     fn lsp(&self) -> LspSpec {
         LspSpec {
             name: "pyright-langserver",

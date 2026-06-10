@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1418,57 +1418,6 @@ fn range_from_args(
     lsp_types::Range { start, end }
 }
 
-/// Well-known build / config files per language id. Used by
-/// `project_onboard` to surface "what controls this build" without
-/// asking the agent to grep for it. Polyglot repos overlap across
-/// multiple ids — `project_onboard` dedupes after collecting.
-fn known_config_files(lang_id: &str) -> &'static [&'static str] {
-    match lang_id {
-        "rust" => &[
-            "Cargo.toml",
-            "Cargo.lock",
-            "rust-toolchain.toml",
-            ".cargo/config.toml",
-        ],
-        "node" => &[
-            "package.json",
-            "package-lock.json",
-            "tsconfig.json",
-            "pnpm-lock.yaml",
-            "yarn.lock",
-            "deno.json",
-        ],
-        "python" => &[
-            "pyproject.toml",
-            "setup.py",
-            "setup.cfg",
-            "requirements.txt",
-            "Pipfile",
-            "Pipfile.lock",
-            "uv.lock",
-        ],
-        "go" => &["go.mod", "go.sum", "go.work"],
-        "java-maven" => &["pom.xml", ".mvn/maven.config"],
-        "java-gradle" => &[
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-            "gradle.properties",
-        ],
-        "cpp" => &[
-            "CMakeLists.txt",
-            "compile_commands.json",
-            "meson.build",
-            "Makefile",
-            "conanfile.txt",
-            "conanfile.py",
-            ".clangd",
-        ],
-        _ => &[],
-    }
-}
-
 /// Try a small ordered list of conventional README filenames at
 /// `root` and return the first that exists, capped at `max_bytes`
 /// UTF-8 bytes (clamped to a char boundary). Returns the relative
@@ -2731,9 +2680,11 @@ impl AideServer {
             .collect();
         ctx["languages"] = serde_json::to_value(&language_ids).unwrap_or_default();
 
+        // Polyglot repos overlap config files across plugins — dedupe
+        // after collecting.
         let mut config_files = Vec::new();
-        for lang_id in &language_ids {
-            for name in known_config_files(lang_id) {
+        for plugin in &plugins {
+            for name in plugin.config_files() {
                 if root.join(name).exists() {
                     config_files.push((*name).to_string());
                 }
@@ -3017,13 +2968,22 @@ impl AideServer {
     }
 
     #[tool(
-        description = "Read `max_bytes` from an exec log file starting at `offset`. Returns `{bytes_read, eof, content, next_offset, total_size}`. Poll a running tool by advancing `offset = next_offset` across calls; stop when `eof` is true AND the producing tool has returned."
+        description = "Read `max_bytes` from an exec log file under `~/.aide/logs/` (the `stdout_log` / `stderr_log` paths returned by exec tools) starting at `offset`. Returns `{bytes_read, eof, content, next_offset, total_size}`. Poll a running tool by advancing `offset = next_offset` across calls; stop when `eof` is true AND the producing tool has returned."
     )]
-    #[allow(clippy::unused_self, reason = "rmcp #[tool] methods must be &self")]
     async fn read_exec_log(&self, Parameters(args): Parameters<ReadExecLogArgs>) -> String {
         use std::io::{Read, Seek, SeekFrom};
         let cap = args.max_bytes.unwrap_or(64 * 1024).max(1);
         let path = PathBuf::from(&args.path);
+        // Exec logs live under ~/.aide/logs/ — refuse anything outside
+        // so this tool cannot double as an arbitrary-file reader (the
+        // HTTP transport reaches beyond the local process boundary).
+        if !path_is_under(&path, &self.paths.logs()) {
+            return error_json(format!(
+                "{} is not an exec log under {}",
+                path.display(),
+                self.paths.logs().display()
+            ));
+        }
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => return error_json(format!("open {}: {e}", path.display())),
@@ -3981,21 +3941,44 @@ fn file_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+/// `true` if `path` resolves to a location inside `root` after
+/// canonicalizing both — symlinks and `..` segments cannot escape.
+/// Either side failing to canonicalize (typically: does not exist)
+/// counts as outside.
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(p), Ok(r)) => p.starts_with(&r),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod onboard_tests {
-    use super::{known_config_files, read_readme_excerpt};
+    use super::{path_is_under, read_readme_excerpt};
     use std::fs;
     use tempfile::tempdir;
 
     #[test]
-    fn known_config_files_covers_rust() {
-        let names = known_config_files("rust");
-        assert!(names.contains(&"Cargo.toml"));
+    fn path_is_under_accepts_files_inside_root() {
+        let dir = tempdir().unwrap();
+        let inside = dir.path().join("run.stdout.log");
+        fs::write(&inside, "x").unwrap();
+        assert!(path_is_under(&inside, dir.path()));
     }
 
     #[test]
-    fn known_config_files_polyglot_empty_for_unknown() {
-        assert!(known_config_files("ada-spark").is_empty());
+    fn path_is_under_rejects_outside_and_traversal() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        let secret = dir.path().join("secret.txt");
+        fs::write(&secret, "x").unwrap();
+        assert!(!path_is_under(&secret, &logs));
+        // `..` traversal back out of the root is caught by canonicalize.
+        let sneaky = logs.join("../secret.txt");
+        assert!(!path_is_under(&sneaky, &logs));
+        // Missing files count as outside.
+        assert!(!path_is_under(&logs.join("absent.log"), &logs));
     }
 
     #[test]

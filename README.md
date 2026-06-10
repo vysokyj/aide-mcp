@@ -10,7 +10,7 @@ aide-mcp closes the gap between agents that work with `grep`/`read` primitives
 and the structured code intelligence a real IDE provides. It spawns language
 servers, builds SCIP indexes against committed snapshots, runs and debugs the
 project, and exposes git read operations — all through a single MCP server
-over stdio.
+over stdio or HTTP.
 
 ## Capabilities
 
@@ -20,16 +20,41 @@ over stdio.
   binaries for detected languages into `~/.aide/bin/`; idempotent.
 
 **LSP proxy** — live working-tree code intelligence (per-workspace server kept warm)
-- `lsp_hover`, `lsp_definition`, `lsp_references`
-- `lsp_document_symbols`, `lsp_workspace_symbols`
+- `lsp_hover`, `lsp_definition`, `lsp_declaration`, `lsp_implementations`,
+  `lsp_references`, `lsp_type_hierarchy`
+- `lsp_document_symbols`, `lsp_workspace_symbols`, `lsp_expand_macro`
 - `lsp_diagnostics`
+- semantic edits: `lsp_rename_symbol`, `lsp_list_code_actions`,
+  `lsp_apply_code_action`
 
 **SCIP index** — stable snapshots keyed by commit SHA (built in-process; no daemon)
 - `index_commit`, `index_status`, `work_last_known_state`
-- `scip_documents`, `scip_symbols`, `scip_references`
+- `scip_documents`, `scip_symbols`, `scip_references`, `scip_callers`
+
+**Search & aggregates** — git-scoped, SCIP-annotated; replaces `ls`/`find`/`grep` via Bash
+- `project_ls`, `project_grep` (+ `_at` variants pinned to a commit)
+- `project_map`, `project_onboard`, `task_context`
+
+**Semantic analysis**
+- `tests_for_symbol`, `tests_for_changed_files`
+- `impact_of_change`, `public_api_diff`
+
+**Edit primitives** — symbol-aware, diagnostics-checked
+- `safe_edit`, `safe_delete_symbol`, `replace_symbol_body`
+- `insert_before_symbol`, `insert_after_symbol`
 
 **Exec** — project lifecycle against the working tree
 - `run_project`, `run_tests`, `install_package`, `read_exec_log`
+- `job_list`, `job_info`, `job_kill`, `process_list`
+
+**Memory** — persistent agent notes under `~/.aide/memory/<repo_slug>/`,
+markdown + YAML frontmatter (portable across Claude Code, Codex, Cursor, …)
+- `memory_write`, `memory_read`, `memory_list`
+- `memory_edit`, `memory_rename`, `memory_delete`
+
+**GitHub** — token-authenticated REST client (no `gh` CLI dependency)
+- `gh_auth_status`, `gh_issue_*` (create/list/view/comment/close)
+- `gh_pr_*` (create/list/view/checks), `gh_ux_gotcha`
 
 **DAP** — debug adapter proxy over stdio
 - `dap_launch`, `dap_terminate`
@@ -90,8 +115,8 @@ cargo build --release
 ./target/release/mcp-aide
 ```
 
-aide-mcp speaks MCP over stdio. Point an MCP-capable client at the binary,
-for example Claude Code:
+aide-mcp speaks MCP over stdio by default. Point an MCP-capable client at
+the binary, for example Claude Code:
 
 ```json
 {
@@ -102,6 +127,20 @@ for example Claude Code:
   }
 }
 ```
+
+### HTTP transport
+
+Pass `--http :PORT` to serve Streamable HTTP instead of stdio:
+
+```bash
+mcp-aide --http :8000          # binds 127.0.0.1:8000
+mcp-aide --http 0.0.0.0:8000   # explicit host:port
+```
+
+One `AideServer` persists across HTTP sessions, so the indexer, LSP pool,
+DAP sessions, and job registry stay warm between connections. The default
+`allowed_hosts` whitelist (`localhost`, `127.0.0.1`, `::1`) blocks
+DNS-rebinding attacks; Ctrl-C shuts down gracefully.
 
 Then from the agent:
 
@@ -137,7 +176,7 @@ crates/
 ## MCP SDK
 
 Built on [`rmcp`](https://crates.io/crates/rmcp) 1.5 — the official Anthropic
-Rust MCP SDK. stdio transport only for now.
+Rust MCP SDK. Transports: stdio (default) and Streamable HTTP (`--http`).
 
 ## License
 

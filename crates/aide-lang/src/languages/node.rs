@@ -67,6 +67,17 @@ impl LanguagePlugin for NodePlugin {
         root.join("package.json").is_file()
     }
 
+    fn config_files(&self) -> &'static [&'static str] {
+        &[
+            "package.json",
+            "package-lock.json",
+            "tsconfig.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "deno.json",
+        ]
+    }
+
     fn lsp(&self) -> LspSpec {
         LspSpec {
             name: "typescript-language-server",

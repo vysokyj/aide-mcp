@@ -53,6 +53,13 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.target }} --bin mcp-aide
 
+      # Every matrix target runs natively on its builder, so the binary
+      # can be executed before packaging. Catches link/rpath breakage
+      # that would otherwise only surface on a user's machine.
+      - name: Smoke test binary
+        shell: bash
+        run: target/${{ matrix.target }}/release/mcp-aide --version
+
       - name: Resolve version
         id: ver
         shell: bash
@@ -97,6 +104,15 @@ jobs:
           DEB_NAME="aide-mcp_${{ steps.ver.outputs.version }}_${{ matrix.deb_arch }}.deb"
           cp "$DEB_PATH" "$DEB_NAME"
           echo "artefact=${DEB_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test .deb
+        if: matrix.deb
+        shell: bash
+        run: |
+          set -eux
+          sudo dpkg -i "${{ steps.deb.outputs.artefact }}"
+          mcp-aide --version
+          sudo dpkg -r aide-mcp
 
       - name: Upload .deb
         if: matrix.deb

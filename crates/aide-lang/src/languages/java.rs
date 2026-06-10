@@ -52,6 +52,10 @@ impl LanguagePlugin for JavaMavenPlugin {
         root.join("pom.xml").is_file()
     }
 
+    fn config_files(&self) -> &'static [&'static str] {
+        &["pom.xml", ".mvn/maven.config"]
+    }
+
     fn lsp(&self) -> LspSpec {
         LspSpec {
             name: "jdtls",

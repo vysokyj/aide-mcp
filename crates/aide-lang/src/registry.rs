@@ -71,3 +71,28 @@ impl Default for Registry {
         Self::builtin()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Registry;
+
+    #[test]
+    fn every_builtin_plugin_declares_config_files() {
+        for plugin in Registry::builtin().plugins() {
+            assert!(
+                !plugin.config_files().is_empty(),
+                "plugin `{}` declares no config files",
+                plugin.id().as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn rust_config_files_cover_cargo_toml() {
+        let registry = Registry::builtin();
+        let rust = registry
+            .get(&crate::plugin::LanguageId::new("rust"))
+            .expect("rust plugin registered");
+        assert!(rust.config_files().contains(&"Cargo.toml"));
+    }
+}

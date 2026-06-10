@@ -144,4 +144,12 @@ pub trait LanguagePlugin: Send + Sync {
         let _ = relative_path;
         "code"
     }
+
+    /// Well-known build / config files for this language, relative to
+    /// the project root. Used by `project_onboard` to surface "what
+    /// controls this build" without asking the agent to grep for it.
+    /// Default: none.
+    fn config_files(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
