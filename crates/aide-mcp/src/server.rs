@@ -971,11 +971,16 @@ impl AideServer {
         let config = Arc::new(RwLock::new(config));
         let config_path = paths.config_file();
         spawn_config_reloader(config_path, config.clone(), indexer.retention_handle());
+        let pool = Arc::new(LspPool::new());
+        // Shut down language servers idle past pool::IDLE_TTL — each
+        // holds 100-500 MB, and an agent that moved on to another repo
+        // should not pin that memory forever.
+        aide_lsp::pool::spawn_idle_reaper(pool.clone());
         Ok(Self {
             registry: Registry::builtin(),
             paths,
             config,
-            pool: Arc::new(LspPool::new()),
+            pool,
             indexer,
             jobs: Arc::new(crate::jobs::Registry::new()),
             dap_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
