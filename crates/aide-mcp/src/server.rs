@@ -1140,6 +1140,20 @@ impl AideServer {
         Some((plugin, binary, args))
     }
 
+    /// Resolve the language for `root` and return its pooled LSP
+    /// client — the one-stop shop every `lsp_*` tool uses instead of
+    /// hand-rolling `language_for` + `get_or_spawn` + error mapping.
+    /// Errors come back pre-shaped for `error_json`.
+    async fn lsp_client(&self, root: &std::path::Path) -> Result<Arc<aide_lsp::LspClient>, String> {
+        let Some((plugin, binary, lsp_args)) = self.language_for(root) else {
+            return Err(format!("no language plugin claims root {}", root.display()));
+        };
+        self.pool
+            .get_or_spawn(plugin.id().as_str(), root, &binary, &lsp_args)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Find the `.scip` file to query for `repo_root`, preferring the
     /// explicit `sha` when given, else the most recently indexed Ready
     /// commit. Returns a human-readable error message if no Ready index
@@ -1392,17 +1406,9 @@ impl AideServer {
     async fn run_symbol_edit(&self, args: &SymbolEditArgs, kind: SymbolEditKind) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root.clone());
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         let related: Vec<PathBuf> = args.related_files.iter().map(PathBuf::from).collect();
@@ -1732,17 +1738,9 @@ impl AideServer {
     async fn lsp_hover(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::hover(&client, &file, args.line, args.column).await {
@@ -1758,17 +1756,9 @@ impl AideServer {
     async fn lsp_definition(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::definition(&client, &file, args.line, args.column).await {
@@ -1787,17 +1777,9 @@ impl AideServer {
     async fn safe_edit(&self, Parameters(args): Parameters<SafeEditArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         let related: Vec<PathBuf> = args.related_files.iter().map(PathBuf::from).collect();
@@ -1853,9 +1835,12 @@ impl AideServer {
     ) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
+        // Validate the root claims a language before the SCIP preflight
+        // so an unclaimed root errors with the real reason, not a
+        // missing-index refusal.
+        if self.language_for(&root).is_none() {
             return error_json(format!("no language plugin claims root {}", root.display()));
-        };
+        }
 
         if !args.force {
             match self.scip_references_at(&root, &file, args.line).await {
@@ -1877,13 +1862,9 @@ impl AideServer {
             }
         }
 
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         let related: Vec<PathBuf> = args.related_files.iter().map(PathBuf::from).collect();
@@ -1909,17 +1890,9 @@ impl AideServer {
     ) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         let range = range_from_args(args.line, args.column, args.end_line, args.end_column);
@@ -1938,9 +1911,6 @@ impl AideServer {
     ) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
 
         let selector = if let Some(kind) = args.kind {
             lsp_ops::CodeActionSelector::Kind(kind)
@@ -1950,13 +1920,9 @@ impl AideServer {
             return error_json("one of `title` or `kind` must be set".to_string());
         };
 
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         let range = range_from_args(args.line, args.column, args.end_line, args.end_column);
@@ -1973,17 +1939,9 @@ impl AideServer {
     async fn lsp_rename_symbol(&self, Parameters(args): Parameters<LspRenameArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::rename(&client, &file, args.line, args.column, args.new_name).await {
@@ -1999,17 +1957,9 @@ impl AideServer {
     async fn lsp_expand_macro(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::expand_macro(&client, &file, args.line, args.column).await {
@@ -2025,17 +1975,9 @@ impl AideServer {
     async fn lsp_diagnostics(&self, Parameters(args): Parameters<LspFileArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::diagnostics(&client, &file, std::time::Duration::from_millis(500)).await {
@@ -2054,17 +1996,9 @@ impl AideServer {
     async fn lsp_references(&self, Parameters(args): Parameters<LspReferencesArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::references(
@@ -2091,17 +2025,9 @@ impl AideServer {
     async fn lsp_implementations(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::implementations(&client, &file, args.line, args.column).await {
@@ -2120,17 +2046,9 @@ impl AideServer {
     async fn lsp_declaration(&self, Parameters(args): Parameters<LspPositionArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::declaration(&client, &file, args.line, args.column).await {
@@ -2163,17 +2081,9 @@ impl AideServer {
             }
         };
 
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::type_hierarchy(&client, &file, args.line, args.column, direction).await {
@@ -2188,17 +2098,9 @@ impl AideServer {
     async fn lsp_document_symbols(&self, Parameters(args): Parameters<LspFileArgs>) -> String {
         let file = PathBuf::from(&args.file);
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::document_symbols(&client, &file).await {
@@ -2215,17 +2117,9 @@ impl AideServer {
         Parameters(args): Parameters<LspWorkspaceSymbolsArgs>,
     ) -> String {
         let root = resolve_root(args.root);
-        let Some((plugin, binary, lsp_args)) = self.language_for(&root) else {
-            return error_json(format!("no language plugin claims root {}", root.display()));
-        };
-
-        let client = match self
-            .pool
-            .get_or_spawn(plugin.id().as_str(), &root, &binary, &lsp_args)
-            .await
-        {
+        let client = match self.lsp_client(&root).await {
             Ok(c) => c,
-            Err(e) => return error_json(e.to_string()),
+            Err(e) => return error_json(e),
         };
 
         match lsp_ops::workspace_symbols(&client, &args.query).await {
