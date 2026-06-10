@@ -518,6 +518,11 @@ fn spawn_reader(
             }
         }
         closed.store(true, Ordering::SeqCst);
+        // Fail every in-flight request immediately — dropping the
+        // senders resolves their callers to Cancelled instead of
+        // letting each sit out the full request timeout against a
+        // dead adapter.
+        pending.lock().await.clear();
         state_notify.notify_waiters();
     });
 }
