@@ -26,6 +26,11 @@ pub enum GithubError {
     Transport(#[from] reqwest::Error),
     #[error("GitHub {status}: {body}")]
     Api { status: StatusCode, body: String },
+    #[error(
+        "GitHub rate limit exceeded — retry after {} second(s)",
+        retry_after_secs.unwrap_or(60)
+    )]
+    RateLimited { retry_after_secs: Option<u64> },
 }
 
 /// Authenticated client. Cheap to construct but holds a reused
@@ -56,10 +61,8 @@ impl GithubClient {
     pub async fn current_user_with_scopes(&self) -> Result<(User, Vec<String>), GithubError> {
         let url = format!("{}/user", self.base);
         let resp = self.build(self.http.get(&url)).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(GithubError::Api { status, body });
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
         }
         let scopes = parse_scopes_header(&resp);
         let user = resp.json::<User>().await?;
@@ -82,6 +85,10 @@ impl GithubClient {
     }
 
     /// `GET /repos/:owner/:repo/issues` with state/label/limit filters.
+    /// Follows `Link: rel="next"` pagination until `limit` issues are
+    /// collected (default 30 — GitHub's own page size), so a limit
+    /// above 100 actually returns that many instead of silently
+    /// capping at one page.
     pub async fn list_issues(
         &self,
         owner: &str,
@@ -89,18 +96,15 @@ impl GithubClient {
         filter: &IssueListFilter,
     ) -> Result<Vec<Issue>, GithubError> {
         let url = format!("{}/repos/{owner}/{repo}/issues", self.base);
-        let mut req = self.http.get(&url);
+        let limit = filter.limit.map_or(30, |l| l as usize);
+        let mut query = vec![("per_page".to_string(), limit.min(100).to_string())];
         if let Some(state) = &filter.state {
-            req = req.query(&[("state", state.as_str())]);
+            query.push(("state".to_string(), state.as_str().to_string()));
         }
         if !filter.labels.is_empty() {
-            req = req.query(&[("labels", filter.labels.join(","))]);
+            query.push(("labels".to_string(), filter.labels.join(",")));
         }
-        if let Some(limit) = filter.limit {
-            req = req.query(&[("per_page", limit.to_string())]);
-        }
-        let resp = self.build(req).send().await?;
-        self.parse(resp).await
+        self.get_paged(url, query, limit).await
     }
 
     /// `GET /repos/:owner/:repo/issues/:number` — single issue with
@@ -119,10 +123,9 @@ impl GithubClient {
     }
 
     /// `GET /repos/:owner/:repo/issues/:number/comments` — all
-    /// comments in chronological order. GitHub paginates at 30 by
-    /// default; we ask for 100 (the REST maximum) in one call and
-    /// leave multi-page fetching for the day somebody actually hits
-    /// a 100-comment issue.
+    /// comments in chronological order, following pagination. Capped
+    /// at 1000 comments as a sanity bound; nobody reads further into
+    /// a thread that long.
     pub async fn list_comments(
         &self,
         owner: &str,
@@ -133,9 +136,8 @@ impl GithubClient {
             "{}/repos/{owner}/{repo}/issues/{number}/comments",
             self.base
         );
-        let req = self.http.get(&url).query(&[("per_page", "100")]);
-        let resp = self.build(req).send().await?;
-        self.parse(resp).await
+        self.get_paged(url, vec![("per_page".to_string(), "100".to_string())], 1000)
+            .await
     }
 
     /// `POST /repos/:owner/:repo/issues/:number/comments`. Returns
@@ -227,21 +229,18 @@ impl GithubClient {
         filter: &PullRequestListFilter,
     ) -> Result<Vec<PullRequest>, GithubError> {
         let url = format!("{}/repos/{owner}/{repo}/pulls", self.base);
-        let mut req = self.http.get(&url);
+        let limit = filter.limit.map_or(30, |l| l as usize);
+        let mut query = vec![("per_page".to_string(), limit.min(100).to_string())];
         if let Some(state) = &filter.state {
-            req = req.query(&[("state", state.as_str())]);
+            query.push(("state".to_string(), state.as_str().to_string()));
         }
         if let Some(head) = &filter.head {
-            req = req.query(&[("head", head.as_str())]);
+            query.push(("head".to_string(), head.clone()));
         }
         if let Some(base) = &filter.base {
-            req = req.query(&[("base", base.as_str())]);
+            query.push(("base".to_string(), base.clone()));
         }
-        if let Some(limit) = filter.limit {
-            req = req.query(&[("per_page", limit.to_string())]);
-        }
-        let resp = self.build(req).send().await?;
-        self.parse(resp).await
+        self.get_paged(url, query, limit).await
     }
 
     /// `GET /repos/:owner/:repo`. Returns the `Repo` record — used
@@ -267,9 +266,37 @@ impl GithubClient {
             "{}/repos/{owner}/{repo}/commits/{git_ref}/check-runs",
             self.base
         );
-        let req = self.http.get(&url).query(&[("per_page", "100")]);
-        let resp = self.build(req).send().await?;
-        self.parse(resp).await
+        // Object-shaped pagination: merge `check_runs` across pages,
+        // keep `total_count` from the first response (same on every
+        // page).
+        let mut next_url = url;
+        let mut first = true;
+        let mut merged: Option<CheckRunsResponse> = None;
+        loop {
+            let mut req = self.http.get(&next_url);
+            if first {
+                req = req.query(&[("per_page", "100")]);
+                first = false;
+            }
+            let resp = self.build(req).send().await?;
+            if !resp.status().is_success() {
+                return Err(api_error(resp).await);
+            }
+            let next = parse_link_next(resp.headers());
+            let page: CheckRunsResponse = resp.json().await?;
+            match &mut merged {
+                Some(m) => m.check_runs.extend(page.check_runs),
+                None => merged = Some(page),
+            }
+            match next {
+                Some(n) => next_url = n,
+                None => break,
+            }
+        }
+        Ok(merged.unwrap_or(CheckRunsResponse {
+            total_count: 0,
+            check_runs: Vec::new(),
+        }))
     }
 
     fn build(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -282,14 +309,135 @@ impl GithubClient {
         &self,
         resp: reqwest::Response,
     ) -> Result<T, GithubError> {
-        let status = resp.status();
-        if status.is_success() {
+        if resp.status().is_success() {
             Ok(resp.json::<T>().await?)
         } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(GithubError::Api { status, body })
+            Err(api_error(resp).await)
         }
     }
+
+    /// GET a JSON-array endpoint, following `Link: rel="next"` until
+    /// `limit` items are collected or pages run out. `query` applies
+    /// to the first request only — the Link URLs GitHub hands back
+    /// already carry their own parameters.
+    async fn get_paged<T: for<'de> Deserialize<'de>>(
+        &self,
+        first_url: String,
+        query: Vec<(String, String)>,
+        limit: usize,
+    ) -> Result<Vec<T>, GithubError> {
+        let mut out: Vec<T> = Vec::new();
+        let mut url = first_url;
+        let mut first = true;
+        loop {
+            let mut req = self.http.get(&url);
+            if first {
+                req = req.query(&query);
+                first = false;
+            }
+            let resp = self.build(req).send().await?;
+            if !resp.status().is_success() {
+                return Err(api_error(resp).await);
+            }
+            let next = parse_link_next(resp.headers());
+            let page: Vec<T> = resp.json().await?;
+            out.extend(page);
+            if out.len() >= limit {
+                out.truncate(limit);
+                return Ok(out);
+            }
+            match next {
+                Some(n) => url = n,
+                None => return Ok(out),
+            }
+        }
+    }
+}
+
+/// Pull the `rel="next"` target out of a `Link` response header.
+fn parse_link_next(headers: &header::HeaderMap) -> Option<String> {
+    let link = headers.get(header::LINK)?.to_str().ok()?;
+    link.split(',').find_map(|part| {
+        let (url_part, params) = part.split_once(';')?;
+        if params.contains("rel=\"next\"") {
+            Some(
+                url_part
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    })
+}
+
+/// Shape a non-2xx response into the most useful error we can:
+/// rate limits become [`GithubError::RateLimited`] with the
+/// `Retry-After` hint, 422 bodies get their structured `errors[]`
+/// array folded into a readable message instead of raw JSON.
+async fn api_error(resp: reqwest::Response) -> GithubError {
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse().ok());
+    let remaining_zero = resp
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|h| h.to_str().ok())
+        == Some("0");
+    let body = resp.text().await.unwrap_or_default();
+
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (remaining_zero || retry_after.is_some()))
+    {
+        return GithubError::RateLimited {
+            retry_after_secs: retry_after,
+        };
+    }
+    let body = if status == StatusCode::UNPROCESSABLE_ENTITY {
+        summarize_validation(&body).unwrap_or(body)
+    } else {
+        body
+    };
+    GithubError::Api { status, body }
+}
+
+/// Fold GitHub's structured 422 payload (`{message, errors: [{resource,
+/// field, code, message?}]}`) into one readable line so the agent sees
+/// *which* field failed instead of a JSON blob.
+fn summarize_validation(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = v.get("message")?.as_str()?.to_string();
+    let errors = v.get("errors")?.as_array()?;
+    let details: Vec<String> = errors
+        .iter()
+        .map(|e| {
+            e.get("message")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(
+                    || {
+                        format!(
+                            "{}.{}: {}",
+                            e.get("resource")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?"),
+                            e.get("field")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?"),
+                            e.get("code")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?"),
+                        )
+                    },
+                    ToString::to_string,
+                )
+        })
+        .collect();
+    Some(format!("{message}: {}", details.join("; ")))
 }
 
 fn parse_scopes_header(resp: &reqwest::Response) -> Vec<String> {
@@ -631,6 +779,116 @@ mod tests {
             GithubError::Api { status, body } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
                 assert!(body.contains("Bad credentials"));
+            }
+            other => panic!("unexpected err: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_issues_follows_link_pagination() {
+        let server = MockServer::start().await;
+        let page2_url = format!("{}/repos/acme/widget/issues?page=2", server.uri());
+        let issue = |n: u64| {
+            serde_json::json!({
+                "number": n,
+                "title": format!("issue {n}"),
+                "state": "open",
+                "html_url": format!("https://github.com/acme/widget/issues/{n}")
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/issues"))
+            .and(query_param("per_page", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "link",
+                        format!("<{page2_url}>; rel=\"next\", <x>; rel=\"last\"").as_str(),
+                    )
+                    .set_body_json(serde_json::json!([issue(1), issue(2)])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/issues"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([issue(3)])))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let filter = IssueListFilter {
+            state: None,
+            labels: vec![],
+            limit: Some(150),
+        };
+        let got = client.list_issues("acme", "widget", &filter).await.unwrap();
+        assert_eq!(
+            got.iter().map(|i| i.number).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "both pages must be fetched and merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_becomes_distinct_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/issues/7"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("retry-after", "30")
+                    .set_body_string("{\"message\":\"API rate limit exceeded\"}"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let err = client.get_issue("acme", "widget", 7).await.unwrap_err();
+        match err {
+            GithubError::RateLimited { retry_after_secs } => {
+                assert_eq!(retry_after_secs, Some(30));
+            }
+            other => panic!("unexpected err: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_errors_are_summarized() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/acme/widget/issues"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Validation Failed",
+                "errors": [
+                    {"resource": "Issue", "field": "title", "code": "missing_field"},
+                    {"message": "label does not exist"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base("t".into(), server.uri()).unwrap();
+        let err = client
+            .create_issue(
+                "acme",
+                "widget",
+                &IssueCreate {
+                    title: String::new(),
+                    body: "x".into(),
+                    labels: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            GithubError::Api { status, body } => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+                assert!(
+                    body.contains("Issue.title: missing_field")
+                        && body.contains("label does not exist"),
+                    "body should carry the folded errors[]: {body}"
+                );
             }
             other => panic!("unexpected err: {other:?}"),
         }
